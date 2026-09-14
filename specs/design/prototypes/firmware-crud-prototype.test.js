@@ -177,4 +177,148 @@ assert.match(html, /function deleteSchemeDialog\(scheme\)/);
 assert.match(html, /它下面的程序位置已同步更新/);
 assert.match(html, /方案里有 \$\{count\} 个程序，会一起放进回收站/);
 
-console.log("prototype data interactions: 122 assertions passed");
+function parseApplyArgs(source, openParen) {
+  const args = [];
+  let start = openParen + 1;
+  let depth = 0;
+  for (let index = start; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (char === "'" || char === '"' || char === "`") {
+      const quote = char;
+      index += 1;
+      while (index < source.length) {
+        if (source[index] === "\\") { index += 2; continue; }
+        if (source[index] === quote) break;
+        index += 1;
+      }
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      index = source.indexOf("\n", index + 2);
+      if (index === -1) break;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      index = source.indexOf("*/", index + 2);
+      if (index === -1) break;
+      index += 1;
+      continue;
+    }
+    if (char === "(" || char === "[" || char === "{") { depth += 1; continue; }
+    if (char === ")" || char === "]" || char === "}") {
+      if (char === ")" && depth === 0) {
+        args.push(source.slice(start, index).trim());
+        return args;
+      }
+      depth -= 1;
+      continue;
+    }
+    if (char === "," && depth === 0) {
+      args.push(source.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  throw new Error("apply 调用缺少匹配的右括号");
+}
+
+const applyMatches = [...script.matchAll(/\bapply\(/g)];
+assert.equal(applyMatches.length, 16);
+assert.match(script.slice(0, applyMatches[0].index), /function\s+$/);
+const applyCalls = applyMatches.slice(1).map(match => parseApplyArgs(script, match.index + "apply".length));
+assert.equal(applyCalls.length, 15);
+const expectedUndoableByMessage = new Map([
+  ["`已改名为「${next}」`", false],
+  ["`「${a.name}」已设为本型号默认`", false],
+  ["`已新建型号「${modelNameInput.trim()}」`", false],
+  ["`型号已重命名为「${value}」`", false],
+  ["`型号「${model.name}」已删除`", true],
+  ["`已新建方案「${schemeNameInput.trim()}」`", false],
+  ["`方案已重命名为「${value}」`", false],
+  ["`方案「${scheme.name}」已放进回收站`", true],
+  ["`「${name}」已加进程序库`", false],
+  ["`${type}现在用 ${modelName(fromModel)} 的程序`", false],
+  ["`「${changes.name}」已更新`", false],
+  ['"已恢复备用副本"', false],
+  ['"已删除备用副本"', true],
+  ["`${b.type}不再用 ${modelName(b.fromModel)} 的程序`", true],
+  ["`「${a.name}」已放进回收站`", true],
+]);
+const actualUndoableByMessage = new Map();
+for (const args of applyCalls) {
+  assert.ok(args.length >= 2 && args.length <= 4, `apply 实参数量应为 2–4，实际为 ${args.length}`);
+  assert.ok(!actualUndoableByMessage.has(args[1]), `提示文案必须唯一：${args[1]}`);
+  actualUndoableByMessage.set(args[1], args[3] === "true");
+  if (args.length === 4) assert.equal(args[3], "true");
+}
+assert.deepEqual(actualUndoableByMessage, expectedUndoableByMessage);
+assert.equal([...actualUndoableByMessage.values()].filter(Boolean).length, 5);
+assert.match(script, /function apply\(mutate, message, detail = "", undoable = false\)/);
+assert.match(script, /const snap = undoable \? snapshot\(\) : null;/);
+assert.match(script, /toast\("ok", message, detail, snap \? \(\) => restore\(snap\) : null\);/);
+assert.match(script, /undo \? 5000 : 3000/);
+new Function(script);
+
+function makeUndoEnvironment() {
+  const sectionA = script.slice(script.indexOf("const snapshot = () => ({"), script.indexOf("/* ============================================================\n   5. 渲染"));
+  const sectionB = script.slice(script.indexOf("let undoLast = null;"), script.indexOf("/* ============================================================\n   7. 模态"));
+  const appended = [];
+  const timers = [];
+  let cloneCount = 0;
+  const createElement = () => ({
+    listeners: {}, children: [], className: "", innerHTML: "", textContent: "", type: "",
+    append(...children) { this.children.push(...children); },
+    remove() { this.removed = true; },
+    addEventListener(type, listener) { (this.listeners[type] ??= []).push(listener); },
+  });
+  const state = { selectedId: "before", renaming: true };
+  const assets = [{ id: "before" }];
+  const borrows = [];
+  const backups = [];
+  const models = [{ id: "model-before" }];
+  const schemes = [];
+  const createApi = new Function(
+    "render", "esc", "$", "document", "structuredClone", "setTimeout", "state", "assets", "borrows", "backups", "MODELS", "SCHEMES",
+    `${sectionA}\n${sectionB}\nreturn { apply, getAssets: () => assets, getUndoLast: () => undoLast };`,
+  );
+  const api = createApi(
+    () => {}, String, selector => {
+      assert.equal(selector, "#toasts");
+      return { append: node => appended.push(node) };
+    },
+    { createElement }, value => {
+      cloneCount += 1;
+      return JSON.parse(JSON.stringify(value));
+    },
+    (fn, ms) => (timers.push({ fn, ms }), timers.length),
+    state, assets, borrows, backups, models, schemes,
+  );
+  return { api, appended, assets, cloneCount: () => cloneCount, timers };
+}
+
+const immediate = makeUndoEnvironment();
+immediate.api.apply(() => { immediate.assets.push({ id: "added" }); }, "立即生效");
+assert.equal(immediate.cloneCount(), 0);
+assert.equal(immediate.timers[0].ms, 3000);
+assert.equal(immediate.appended[0].children.length, 0);
+assert.equal(immediate.api.getUndoLast(), null);
+
+const undoable = makeUndoEnvironment();
+const assetsBeforeUndo = JSON.parse(JSON.stringify(undoable.api.getAssets()));
+undoable.api.apply(() => { undoable.assets.push({ id: "deleted" }); }, "删除程序", "", true);
+assert.equal(undoable.cloneCount(), 5);
+assert.equal(undoable.timers[0].ms, 5000);
+const undoToast = undoable.appended[0];
+const undoButton = undoToast.children[0];
+assert.equal(undoToast.children.length, 1);
+assert.notEqual(undoButton, undoToast);
+assert.equal(undoButton.textContent, "撤销");
+undoButton.listeners.click[0]();
+assert.deepEqual(undoable.api.getAssets(), assetsBeforeUndo);
+assert.equal(undoable.api.getUndoLast(), null);
+assert.equal(undoable.appended.length, 2);
+assert.match(undoable.appended[1].innerHTML, /已撤销上一步操作/);
+const vendorManagement = script.slice(script.indexOf("function settingsDialog()"), script.indexOf("/* ============================================================\n   10. 事件"));
+assert.doesNotMatch(vendorManagement, /\bapply\(/);
+
+console.log("prototype data interactions: 122 existing assertions and undo-scope assertions passed");
