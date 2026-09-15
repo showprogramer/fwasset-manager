@@ -48,6 +48,12 @@ WorkspaceLayout = Literal[
     "invalid",  # 不可读，或混合/无法归类的内容
 ]
 
+WorkspaceState = Literal[
+    "clean",
+    "operation_in_progress",
+    "recovery_required",
+]
+
 
 class ServiceResult(TypedDict):
     ok: bool
