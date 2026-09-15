@@ -8,7 +8,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -19,8 +19,17 @@ from fwasset.core.managed_paths import (
     is_managed_root_owned,
     managed_root,
 )
-from fwasset.core.path_guard import PathGuardError, normalize_workspace_path
-from fwasset.core.types import ManagedPathReason, WorkspaceState
+from fwasset.core.path_guard import (
+    PathGuardError,
+    assert_within_workspace,
+    normalize_workspace_path,
+)
+from fwasset.core.types import (
+    ManagedPathReason,
+    OperationLog,
+    OperationProduct,
+    WorkspaceState,
+)
 
 _STATE_FILENAME = "workspace-state.json"
 _GENERATION_FILENAME = "generation.json"
@@ -146,11 +155,81 @@ def _write_generation(workspace_root: str | Path, generation: int) -> None:
     )
 
 
-def _write_operation(workspace_root: str | Path, operation: str, phase: str) -> None:
-    _write_json_atomically(
-        _state_root(workspace_root) / _OPERATION_FILENAME,
-        {"operation": operation, "phase": phase, "started_at": time.time()},
-    )
+def _merge_details(
+    current: dict[str, Any], updates: Mapping[str, Any]
+) -> dict[str, Any]:
+    """深合并操作日志负载：嵌套字典递归合并，其余新值覆盖。"""
+    merged = dict(current)
+    for key, value in updates.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_details(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _normalized_product_path(path: str) -> str:
+    return os.path.normcase(path)
+
+
+def load_operation_log(workspace_root: str | Path) -> OperationLog | None:
+    """读取并校验操作日志；仅文件缺失返回 ``None``，存在但无效一律拒绝。
+
+    旧格式（无 ``products`` / ``details``）按空列表 / 空字典补默认；
+    供崩溃恢复与「删除本次产物」原语读取，调用方应先持锁。
+    """
+    path = _state_root(workspace_root) / _OPERATION_FILENAME
+    try:
+        raw = _retry_sharing_conflicts(lambda: _read_json_file(path))
+    except FileNotFoundError:
+        return None
+    except PermissionError as exc:
+        raise WorkspaceRecoveryRequiredError(
+            f"工作区操作日志持续无法读取（可能被其他程序占用）：{path}"
+        ) from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WorkspaceRecoveryRequiredError(f"工作区操作日志无法读取：{path}") from exc
+    if not isinstance(raw, dict):
+        raise WorkspaceRecoveryRequiredError(f"工作区操作日志格式无效：{path}")
+    operation = raw.get("operation")
+    if not isinstance(operation, str) or not operation.strip():
+        raise WorkspaceRecoveryRequiredError("工作区操作日志无效：操作名称缺失")
+    phase = raw.get("phase", "prepared")
+    if not isinstance(phase, str):
+        raise WorkspaceRecoveryRequiredError("工作区操作日志无效：阶段字段损坏")
+    started_at = raw.get("started_at", 0.0)
+    if isinstance(started_at, bool) or not isinstance(started_at, (int, float)):
+        raise WorkspaceRecoveryRequiredError("工作区操作日志无效：开始时间损坏")
+    raw_products = raw.get("products", [])
+    if not isinstance(raw_products, list):
+        raise WorkspaceRecoveryRequiredError("工作区操作日志无效：产物清单损坏")
+    products: list[OperationProduct] = []
+    for item in raw_products:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("path"), str)
+            or not isinstance(item.get("manifest"), str)
+        ):
+            raise WorkspaceRecoveryRequiredError("工作区操作日志无效：产物条目损坏")
+        products.append({"path": item["path"], "manifest": item["manifest"]})
+    details = raw.get("details", {})
+    if not isinstance(details, dict):
+        raise WorkspaceRecoveryRequiredError("工作区操作日志无效：负载字段损坏")
+    return {
+        "operation": operation,
+        "phase": phase,
+        "started_at": float(started_at),
+        "products": products,
+        "details": details,
+    }
+
+
+def workspace_lock_is_held(workspace_root: str | Path) -> bool:
+    """当前进程是否持有该工作区的写锁（staging 等受管写入的进程内守卫）。"""
+    try:
+        return _mutex_name(workspace_root) in _held_mutexes
+    except (PathGuardError, ValueError):
+        return False
 
 
 def _owned_root_or_raise(workspace_root: str | Path, kind: ManagedPathReason) -> Path:
@@ -358,7 +437,12 @@ class WorkspaceLock:
 
 
 class WorkspaceTransaction:
-    """一次待接入 CRUD 的写事务骨架。"""
+    """一次待接入 CRUD 的写事务骨架。
+
+    操作日志（``operation.json``）在事务存续期以内存镜像 ``_log`` 为真源，
+    每次变更（阶段、负载、产物）都原子落盘——崩溃后磁盘日志始终是最新
+    现场，``products`` 供「删除本次产物」原语做身份校验（D1.4c）。
+    """
 
     def __init__(self, workspace_root: str | Path, *, operation: str) -> None:
         if not operation.strip():
@@ -369,6 +453,70 @@ class WorkspaceTransaction:
         self.status = WorkspaceStatus("clean", 0, None)
         self._committed = False
         self._entered = False
+        self._log: OperationLog = {
+            "operation": operation,
+            "phase": "prepared",
+            "started_at": 0.0,
+            "products": [],
+            "details": {},
+        }
+
+    @property
+    def is_active(self) -> bool:
+        """已进入且未提交（staging 分配等受管写入的前置条件）。"""
+        return self._entered and not self._committed
+
+    @property
+    def workspace_root(self) -> Path:
+        """事务所属的工作区根（staging 等受管操作的工作区绑定校验）。"""
+        return self._workspace_root
+
+    @property
+    def products(self) -> tuple[OperationProduct, ...]:
+        """本事务已记录产物的只读镜像（与落盘一致）。"""
+        return tuple(self._log["products"])
+
+    def _persist_log(self) -> None:
+        _write_json_atomically(
+            _state_root(self._workspace_root) / _OPERATION_FILENAME,
+            dict(self._log),
+        )
+
+    def set_phase(self, phase: str, *, details: Mapping[str, Any] | None = None) -> None:
+        """更新操作阶段并深合并自定义负载，原子落盘。"""
+        if not self.is_active:
+            raise WorkspaceTransactionError("事务尚未开始或已经完成")
+        if not phase.strip():
+            raise WorkspaceTransactionError("阶段名称不能为空")
+        self._log["phase"] = phase
+        if details:
+            self._log["details"] = _merge_details(self._log["details"], details)
+        self._persist_log()
+
+    def record_product(self, path: str | Path, manifest: str) -> None:
+        """记录本操作产物（绝对路径 + manifest 哈希）；同路径覆盖、幂等。
+
+        产物路径必须是位于本事务工作区内的绝对路径——它是「删除本次
+        产物」的受信身份来源，工作区外或相对路径一律拒绝记录。
+        """
+        if not self.is_active:
+            raise WorkspaceTransactionError("事务尚未开始或已经完成")
+        try:
+            assert_within_workspace(path, self._workspace_root)
+        except PathGuardError as exc:
+            raise WorkspaceTransactionError(
+                f"产物路径必须位于工作区内，已拒绝记录：{path}"
+            ) from exc
+        entry: OperationProduct = {"path": str(path), "manifest": manifest}
+        normalized = _normalized_product_path(entry["path"])
+        retained = [
+            product
+            for product in self._log["products"]
+            if _normalized_product_path(product["path"]) != normalized
+        ]
+        retained.append(entry)
+        self._log["products"] = retained
+        self._persist_log()
 
     def __enter__(self) -> WorkspaceTransaction:
         self._lock.__enter__()
@@ -382,8 +530,15 @@ class WorkspaceTransaction:
                 or self.status.operation is not None
             ):
                 raise WorkspaceRecoveryRequiredError("工作区存在待恢复的中断操作")
+            self._log = {
+                "operation": self._operation,
+                "phase": "prepared",
+                "started_at": time.time(),
+                "products": [],
+                "details": {},
+            }
             _write_state(self._workspace_root, "operation_in_progress")
-            _write_operation(self._workspace_root, self._operation, "prepared")
+            self._persist_log()
             self.status = WorkspaceStatus(
                 "operation_in_progress", self.status.generation, self._operation
             )
@@ -395,11 +550,12 @@ class WorkspaceTransaction:
 
     def begin_product_write(self) -> None:
         """在调用方首次改动产品数据前持久化 odd generation。"""
-        if not self._entered or self._committed:
+        if not self.is_active:
             raise WorkspaceTransactionError("事务尚未开始或已经完成")
         if self.status.generation % 2:
             return
-        _write_operation(self._workspace_root, self._operation, "writing")
+        self._log["phase"] = "writing"
+        self._persist_log()
         generation = self.status.generation + 1
         _write_generation(self._workspace_root, generation)
         self.status = WorkspaceStatus("operation_in_progress", generation, self._operation)

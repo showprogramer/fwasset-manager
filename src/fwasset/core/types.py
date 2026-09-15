@@ -54,6 +54,34 @@ WorkspaceState = Literal[
     "recovery_required",
 ]
 
+# ---------------------------------------------------------------------------
+# 工作区事务操作日志（TASK-20260915-atomic-dir-primitives，父规格 D8.3）
+# ---------------------------------------------------------------------------
+
+
+class OperationProduct(TypedDict):
+    """本操作创建或提升的产物（D1.4c 删除产物原语的身份来源）。
+
+    ``path`` 为绝对路径字符串；``manifest`` 为提升时记录的目录 manifest 哈希。
+    """
+
+    path: str
+    manifest: str
+
+
+class OperationLog(TypedDict):
+    """持久化操作日志（``operation.json``）的形状。
+
+    旧格式缺少 ``products`` / ``details`` 时按空列表 / 空字典读取；
+    ``details`` 承载各操作自定义负载（plan 摘要、旧/新路径等）。
+    """
+
+    operation: str
+    phase: str
+    started_at: float
+    products: list[OperationProduct]
+    details: dict[str, Any]
+
 
 class ServiceResult(TypedDict):
     ok: bool

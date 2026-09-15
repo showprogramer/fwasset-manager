@@ -1,5 +1,7 @@
-"""TASK-20260915 隔离场景验证：新增事务、写入期硬退出、恢复与阻写。
+"""TASK-20260915 系列任务隔离场景验证。
 
+场景 1–5（事务状态基础）：新增事务、写入期硬退出、中断/恢复阻写。
+场景 6（原子目录原语）：staging 分配 → 原子提升 → 产物记录 → 删除产物。
 在独立临时目录中执行，不触碰真实工作区。本模块无 UI 入口，按无 UI
 等效规则以脚本完成场景验证，供人工复核与回归复跑。
 """
@@ -7,14 +9,21 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+from fwasset.core.staging_io import (
+    allocate_staging_area,
+    delete_recorded_product,
+    promote_staging,
+)
 from fwasset.core.workspace_transaction import (
     WorkspaceRecoveryRequiredError,
     WorkspaceTransaction,
+    load_operation_log,
     load_workspace_status,
     recover_interrupted_workspace,
 )
@@ -82,6 +91,45 @@ def main() -> None:
 
     message = expect_blocked(workspace, "verify-blocked-2")
     print(f"场景5 recovery_required 下写事务仍被阻止: {message}")
+
+    second = base / "workspace2"
+    second.mkdir()
+    with WorkspaceTransaction(second, operation="verify-atomic") as tx:
+        area = allocate_staging_area(second, tx)
+        (area / "main.rom").write_bytes(b"ROM")
+        (area / "子").mkdir()
+        (area / "子" / "extra.pkg").write_bytes(b"PKG")
+
+        target = second / "通用" / "主板" / "demo"
+        target.parent.mkdir(parents=True)
+        tx.begin_product_write()
+        promote_staging(tx, second, area, target)
+
+        assert (target / "main.rom").read_bytes() == b"ROM"
+        assert not area.exists()
+
+        log = load_operation_log(second)
+        assert log is not None
+        recorded = [
+            product
+            for product in log["products"]
+            if os.path.normcase(product["path"]) == os.path.normcase(str(target))
+        ]
+        assert len(recorded) == 1
+        assert recorded[0]["manifest"]
+        print(f"场景6 提升后日志产物: {recorded[0]}")
+
+        delete_recorded_product(tx, second, target)
+        assert not target.exists()
+        target.parent.rmdir()
+        target.parent.parent.rmdir()
+        tx.commit()
+
+    status = load_workspace_status(second)
+    print(f"场景6 删除产物并提交后: {status}")
+    assert status.state == "clean"
+    assert status.generation == 2
+    assert status.operation is None
 
     print("全部断言通过")
 

@@ -22,10 +22,13 @@ from fwasset.core.workspace_transaction import (
     WorkspaceLock,
     WorkspaceRecoveryRequiredError,
     WorkspaceTransaction,
+    WorkspaceTransactionError,
     capture_workspace_preview,
+    load_operation_log,
     load_workspace_status,
     preview_token_is_current,
     recover_interrupted_workspace,
+    workspace_lock_is_held,
 )
 
 
@@ -367,3 +370,103 @@ def test_marker_write_failure_rolls_back_own_marker_only(
     state_root = managed_root(workspace, "workspace_state")
     assert not (state_root / MANAGED_OWNER_MARKER).exists()
     assert state_root.is_dir()
+
+
+def test_operation_log_records_phase_details_and_products(tmp_path) -> None:
+    target = tmp_path / "通用" / "demo"
+
+    with WorkspaceTransaction(tmp_path, operation="import_asset") as transaction:
+        transaction.set_phase("validated", details={"plan": {"kind": "import"}})
+        transaction.record_product(target, "abc")
+        transaction.record_product(target, "abc2")
+        transaction.record_product(tmp_path / "通用" / "other", "def")
+
+        log = load_operation_log(tmp_path)
+        assert log is not None
+        assert log["phase"] == "validated"
+        assert log["details"] == {"plan": {"kind": "import"}}
+        assert len(log["products"]) == 2
+
+        assert os.path.normcase(transaction.products[0]["path"]) == os.path.normcase(
+            str(target)
+        )
+        assert transaction.products[0]["manifest"] == "abc2"
+
+        transaction.commit()
+
+
+def test_transaction_mutations_rejected_outside_or_after_commit(tmp_path) -> None:
+    with WorkspaceTransaction(tmp_path, operation="import_asset") as transaction:
+        transaction.commit()
+        with pytest.raises(WorkspaceTransactionError):
+            transaction.set_phase("late")
+        with pytest.raises(WorkspaceTransactionError):
+            transaction.record_product(tmp_path / "x", "m")
+
+    idle = WorkspaceTransaction(tmp_path, operation="import_asset")
+    with pytest.raises(WorkspaceTransactionError):
+        idle.set_phase("early")
+    with pytest.raises(WorkspaceTransactionError):
+        idle.record_product(tmp_path / "x", "m")
+
+
+def test_load_operation_log_reads_legacy_and_rejects_invalid_shape(tmp_path) -> None:
+    assert load_operation_log(tmp_path) is None
+
+    with pytest.raises(RuntimeError, match="保留日志"):
+        with WorkspaceTransaction(tmp_path, operation="legacy_op"):
+            (managed_root(tmp_path, "workspace_state") / "operation.json").write_text(
+                '{"operation":"legacy_op","phase":"prepared","started_at":1.0}',
+                encoding="utf-8",
+            )
+            raise RuntimeError("保留日志")
+
+    log = load_operation_log(tmp_path)
+    assert log is not None
+    assert log["operation"] == "legacy_op"
+    assert log["phase"] == "prepared"
+    assert log["started_at"] == 1.0
+    assert log["products"] == []
+    assert log["details"] == {}
+
+    (managed_root(tmp_path, "workspace_state") / "operation.json").write_text(
+        '{"operation":123}', encoding="utf-8"
+    )
+    with pytest.raises(WorkspaceRecoveryRequiredError):
+        load_operation_log(tmp_path)
+
+
+def test_load_operation_log_rejects_empty_existing_file(tmp_path) -> None:
+    """存在但为空对象的日志必须报告无效，不得当作缺失返回 None。"""
+    with pytest.raises(RuntimeError, match="保留日志"):
+        with WorkspaceTransaction(tmp_path, operation="empty_log"):
+            (managed_root(tmp_path, "workspace_state") / "operation.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            raise RuntimeError("保留日志")
+
+    with pytest.raises(WorkspaceRecoveryRequiredError):
+        load_operation_log(tmp_path)
+
+
+def test_record_product_rejects_paths_outside_workspace(tmp_path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    with WorkspaceTransaction(workspace, operation="import_asset") as transaction:
+        with pytest.raises(WorkspaceTransactionError):
+            transaction.record_product(outside / "x", "m")
+        with pytest.raises(WorkspaceTransactionError):
+            transaction.record_product("相对路径/x", "m")
+
+        assert transaction.products == ()
+
+
+def test_workspace_lock_is_held_reflects_lock_state(tmp_path) -> None:
+    assert not workspace_lock_is_held(tmp_path)
+    with WorkspaceLock(tmp_path):
+        assert workspace_lock_is_held(tmp_path)
+    assert not workspace_lock_is_held(tmp_path)
+    assert not workspace_lock_is_held("")
