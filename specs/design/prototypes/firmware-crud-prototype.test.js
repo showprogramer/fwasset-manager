@@ -255,7 +255,9 @@ assert.deepEqual(actualUndoableByMessage, expectedUndoableByMessage);
 assert.equal([...actualUndoableByMessage.values()].filter(Boolean).length, 5);
 assert.match(script, /function apply\(mutate, message, detail = "", undoable = false\)/);
 assert.match(script, /const snap = undoable \? snapshot\(\) : null;/);
-assert.match(script, /toast\("ok", message, detail, snap \? \(\) => restore\(snap\) : null\);/);
+assert.match(script, /function removedSince\(snap\)/);
+assert.match(script, /const record = snap \? archiveDeleted\(message, removedSince\(snap\)\) : null;/);
+assert.match(script, /record \? \(\) => undoRecycleRecord\(record.id\) : null/);
 assert.match(script, /undo \? 5000 : 3000/);
 new Function(script);
 
@@ -265,6 +267,7 @@ function makeUndoEnvironment() {
   const appended = [];
   const timers = [];
   let cloneCount = 0;
+  let recycled = null;
   const createElement = () => ({
     listeners: {}, children: [], className: "", innerHTML: "", textContent: "", type: "",
     append(...children) { this.children.push(...children); },
@@ -278,7 +281,7 @@ function makeUndoEnvironment() {
   const models = [{ id: "model-before" }];
   const schemes = [];
   const createApi = new Function(
-    "render", "esc", "$", "document", "structuredClone", "setTimeout", "state", "assets", "borrows", "backups", "MODELS", "SCHEMES",
+    "render", "esc", "$", "document", "structuredClone", "setTimeout", "state", "assets", "borrows", "backups", "MODELS", "SCHEMES", "RECYCLE_COLLECTIONS", "recycleCollection", "archiveDeleted", "restoreRecycleRecord",
     `${sectionA}\n${sectionB}\nreturn { apply, getAssets: () => assets, getUndoLast: () => undoLast };`,
   );
   const api = createApi(
@@ -292,6 +295,10 @@ function makeUndoEnvironment() {
     },
     (fn, ms) => (timers.push({ fn, ms }), timers.length),
     state, assets, borrows, backups, models, schemes,
+    ["assets", "borrows", "backups", "models", "schemes"],
+    collection => ({ assets, borrows, backups, models, schemes }[collection]),
+    (message, removed) => { recycled = removed; return { id: "undo-record" }; },
+    () => { assets.push(...recycled.assets); return { ok: true }; },
   );
   return { api, appended, assets, cloneCount: () => cloneCount, timers };
 }
@@ -305,7 +312,7 @@ assert.equal(immediate.api.getUndoLast(), null);
 
 const undoable = makeUndoEnvironment();
 const assetsBeforeUndo = JSON.parse(JSON.stringify(undoable.api.getAssets()));
-undoable.api.apply(() => { undoable.assets.push({ id: "deleted" }); }, "删除程序", "", true);
+undoable.api.apply(() => { undoable.assets.splice(0, 1); }, "删除程序", "", true);
 assert.equal(undoable.cloneCount(), 5);
 assert.equal(undoable.timers[0].ms, 5000);
 const undoToast = undoable.appended[0];
@@ -320,5 +327,49 @@ assert.equal(undoable.appended.length, 2);
 assert.match(undoable.appended[1].innerHTML, /已撤销上一步操作/);
 const vendorManagement = script.slice(script.indexOf("function settingsDialog()"), script.indexOf("/* ============================================================\n   10. 事件"));
 assert.doesNotMatch(vendorManagement, /\bapply\(/);
+
+// 修订二十二：原型内置回收站 —— 默认保留 24 小时、可还原或彻底删除、到期移至 Windows 回收站
+assert.match(html, /const RECYCLE_RETENTION_MS = 24 \* 60 \* 60 \* 1000;/);
+assert.match(html, /openRecycleBin/);
+assert.match(html, /<div class="top-actions">\s*<button class="button" id="openRecycleBin"[\s\S]*?<button class="button" id="btnSettings"[\s\S]*?<\/div>/);
+assert.match(html, /\.top-actions \{ display: flex; align-items: center; gap: 8px; flex: 0 0 auto; \}/);
+assert.match(html, /\.crumb \{ min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;/);
+assert.match(html, /回收站（/);
+assert.match(html, /已删除项目/);
+assert.match(html, /还原/);
+assert.match(html, /彻底删除/);
+assert.match(html, /24 小时后会移至 Windows 回收站/);
+assert.match(script, /function recycleBinDialog\(\)[\s\S]*?purgeExpiredRecycleBin\(\)/);
+assert.match(script, /restoreRecycleRecord\(button.dataset.id\)/);
+assert.match(script, /discardRecycleRecord\(button.dataset.id\)/);
+
+// 修订二十三：回收站记录必须可在 24 小时内安全还原、彻底删除或到期清理。
+const recycleApi = createApi()();
+const recycleNow = 1_700_000_000_000;
+const restoredAsset = { id: "recycle-asset", model: "model-r", name: "误删程序" };
+const restorableRecord = recycleApi.archiveDeleted("误删程序", { assets: [restoredAsset] }, recycleNow);
+assert.equal(restorableRecord.expiresAt, recycleNow + 24 * 60 * 60 * 1000);
+assert.equal(recycleApi.recycleBinItems().length, 1);
+assert.deepEqual(recycleApi.restoreRecycleRecord(restorableRecord.id, recycleNow), { ok: true });
+assert.equal(recycleApi.asset(restoredAsset.id).name, "误删程序");
+assert.equal(recycleApi.recycleBinItems().length, 0);
+
+const conflictRecord = recycleApi.archiveDeleted("冲突程序", {
+  assets: [{ id: restoredAsset.id, model: "model-r", name: "错误版本" }],
+}, recycleNow + 1);
+assert.deepEqual(recycleApi.restoreRecycleRecord(conflictRecord.id, recycleNow + 1), { ok: false, reason: "conflict" });
+assert.equal(recycleApi.asset(restoredAsset.id).name, "误删程序");
+
+const disposableRecord = recycleApi.archiveDeleted("临时副本", {
+  backups: [{ id: "recycle-backup", asset: restoredAsset.id }],
+}, recycleNow + 2);
+assert.equal(recycleApi.discardRecycleRecord(disposableRecord.id), true);
+assert.equal(recycleApi.recycleBinItems().some(item => item.id === disposableRecord.id), false);
+
+const expiredRecord = recycleApi.archiveDeleted("过期副本", {
+  backups: [{ id: "expired-backup", asset: restoredAsset.id }],
+}, recycleNow - 24 * 60 * 60 * 1000 - 1);
+assert.equal(recycleApi.purgeExpiredRecycleBin(recycleNow), 1);
+assert.equal(recycleApi.recycleBinItems().some(item => item.id === expiredRecord.id), false);
 
 console.log("prototype data interactions: 122 existing assertions and undo-scope assertions passed");

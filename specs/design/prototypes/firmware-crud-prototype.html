@@ -79,7 +79,8 @@ button { cursor: pointer; }
 
 .main { min-width: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); }
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; height: 54px; padding: 0 20px; background: var(--surface); border-bottom: 1px solid var(--line); }
-.crumb { color: var(--muted); font-size: 12px; }
+.crumb { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
+.top-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .crumb strong { color: var(--ink); font-size: 15px; }
 .workspace { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding: 16px 20px 18px; }
 
@@ -220,6 +221,10 @@ select.field { padding: 0 8px; }
 .preview-line b { color: var(--ink); }
 .note { padding: 9px 11px; margin: 10px 0; background: var(--warning-soft); border-left: 3px solid #d39524; color: var(--warning); font-size: 12px; }
 .note.danger { color: #8c2219; background: var(--danger-soft); border-left-color: var(--danger); }
+.recycle-row { display: flex; align-items: center; gap: 9px; padding: 9px 0; border-bottom: 1px solid #eef2f4; }
+.recycle-row:last-child { border-bottom: 0; }
+.recycle-row b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.recycle-empty { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
 .use-list { margin: 8px 0 0; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
 .use { padding: 8px 10px; border-bottom: 1px solid #eef2f4; }
 .use:last-child { border-bottom: 0; }
@@ -305,7 +310,10 @@ select.field { padding: 0 8px; }
   <section class="main">
     <header class="topbar">
       <div class="crumb"><strong id="crumbTitle">程序列表</strong><span id="crumbPath"></span></div>
-      <button class="button" id="btnSettings" type="button">⚙ 设置</button>
+      <div class="top-actions">
+        <button class="button" id="openRecycleBin" type="button">回收站（0）</button>
+        <button class="button" id="btnSettings" type="button">⚙ 设置</button>
+      </div>
     </header>
 
     <div class="workspace">
@@ -391,9 +399,65 @@ let assets = [];
 let borrows = [];
 let backups = [];
 
+/** 内置回收站：删除项先暂存在这里，保留 24 小时，到期移至 Windows 回收站；不设容量上限。 */
+const RECYCLE_RETENTION_MS = 24 * 60 * 60 * 1000;
+let recycleBin = [];
+
 function nextId(prefix) { return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`; }
 
 function assetFor(id) { return assets.find(asset => asset.id === id) || null; }
+
+const RECYCLE_COLLECTIONS = ["assets", "borrows", "backups", "models", "schemes"];
+
+function recycleCollection(name) {
+  if (name === "assets") return assets;
+  if (name === "borrows") return borrows;
+  if (name === "backups") return backups;
+  if (name === "models") return MODELS;
+  if (name === "schemes") return SCHEMES;
+  return null;
+}
+
+function archiveDeleted(name, removed, now = Date.now()) {
+  const archived = Object.fromEntries(RECYCLE_COLLECTIONS
+    .filter(collection => Array.isArray(removed[collection]) && removed[collection].length)
+    .map(collection => [collection, structuredClone(removed[collection])]));
+  if (!Object.keys(archived).length) return null;
+  const record = { id: nextId("recycle"), name, removed: archived, deletedAt: now, expiresAt: now + RECYCLE_RETENTION_MS };
+  recycleBin.push(record);
+  return record;
+}
+
+function recycleBinItems() { return structuredClone(recycleBin); }
+
+function discardRecycleRecord(id) {
+  const index = recycleBin.findIndex(record => record.id === id);
+  if (index < 0) return false;
+  recycleBin.splice(index, 1);
+  return true;
+}
+
+function purgeExpiredRecycleBin(now = Date.now()) {
+  const retained = recycleBin.filter(record => record.expiresAt > now);
+  const removedCount = recycleBin.length - retained.length;
+  recycleBin = retained;
+  return removedCount;
+}
+
+function restoreRecycleRecord(id, now = Date.now()) {
+  purgeExpiredRecycleBin(now);
+  const record = recycleBin.find(item => item.id === id);
+  if (!record) return { ok: false, reason: "missing" };
+  const collision = Object.entries(record.removed).some(([collection, items]) =>
+    recycleCollection(collection).some(item => items.some(archived => archived.id === item.id)));
+  if (collision) return { ok: false, reason: "conflict" };
+  RECYCLE_COLLECTIONS.forEach(collection => {
+    const items = record.removed[collection];
+    if (items) recycleCollection(collection).push(...structuredClone(items));
+  });
+  discardRecycleRecord(id);
+  return { ok: true };
+}
 
 /** 测试与脚本用：直接放进运行态的程序（模拟“从文件夹添加”落地） */
 function createAsset(fields = {}) {
@@ -544,7 +608,7 @@ function selectedBorrowId(candidates, currentId, presetId = "") {
 }
 
 function prototypeDataApi() {
-  return { asset: assetFor, backupsFor, createAsset, createModel, createScheme, createVendor, deleteBackup, deleteModel, deleteScheme, renameModel, renameScheme, resolveBorrow, restoreBackup, selectedBorrowId, updateAsset };
+  return { asset: assetFor, backupsFor, createAsset, createModel, createScheme, createVendor, deleteBackup, deleteModel, deleteScheme, renameModel, renameScheme, resolveBorrow, restoreBackup, selectedBorrowId, updateAsset, archiveDeleted, recycleBinItems, restoreRecycleRecord, discardRecycleRecord, purgeExpiredRecycleBin };
 }
 
 const state = {
@@ -668,25 +732,48 @@ function restore(snap) {
   toast("info", "已撤销上一步操作");
 }
 
-/** 只有删除类操作可撤销（放进回收站可以拿回来）；其它写操作立即生效，靠反向操作纠正。 */
+function removedSince(snap) {
+  return Object.fromEntries(RECYCLE_COLLECTIONS
+    .map(collection => {
+      const live = recycleCollection(collection);
+      const removed = snap[collection].filter(item => !live.some(current => current.id === item.id));
+      return [collection, removed];
+    })
+    .filter(([, removed]) => removed.length));
+}
+
+function undoRecycleRecord(id) {
+  const result = restoreRecycleRecord(id);
+  if (!result.ok) {
+    toast("warn", result.reason === "conflict" ? "无法还原：原位置已有同 ID 项目，已保留回收站记录。" : "无法还原：项目已过期或不存在。");
+    return;
+  }
+  render();
+  toast("info", "已撤销上一步操作");
+}
+
+/** 只有删除类操作可撤销；每次只归档本次删除的对象，避免回滚后续编辑。 */
 function apply(mutate, message, detail = "", undoable = false) {
   const snap = undoable ? snapshot() : null;
   mutate();
+  const record = snap ? archiveDeleted(message, removedSince(snap)) : null;
   state.renaming = false;
   render();
-  toast("ok", message, detail, snap ? () => restore(snap) : null);
+  toast("ok", message, detail, record ? () => undoRecycleRecord(record.id) : null);
 }
 
 /* ============================================================
    5. 渲染
    ============================================================ */
 function render() {
+  purgeExpiredRecycleBin();
   renderModelPicker();
   renderScopes();
   renderChips();
   renderTable();
   renderInspector();
   $("#btnAdd").disabled = !state.model;
+  $("#openRecycleBin").textContent = `回收站（${recycleBin.length}）`;
   $("#crumbTitle").textContent = state.model ? modelName(state.model) : "程序列表";
   $("#crumbPath").textContent = !state.model ? "　/　还没有型号"
     : state.scope === "all" ? "　/　全部程序"
@@ -1709,6 +1796,40 @@ function usbDialog(a) {
 }
 
 /* ---------- 设置：程序文件夹 + 归属厂商 + 软件修复 ---------- */
+function recycleBinDialog() {
+  purgeExpiredRecycleBin();
+  const rows = recycleBin.map(item => `
+    <div class="recycle-row">
+      <b>${esc(item.name)}</b>
+      <button class="button small" type="button" data-act="restoreRecycled" data-id="${item.id}">还原</button>
+      <button class="button small danger" type="button" data-act="purgeRecycled" data-id="${item.id}">彻底删除</button>
+    </div>`).join("");
+  const overlay = modal("回收站", `
+    <p class="note">已删除项目在回收站保留 24 小时后会移至 Windows 回收站。</p>
+    <p class="section-title">已删除项目</p>
+    ${rows || `<p class="recycle-empty">回收站是空的。</p>`}
+  `, `<button class="button" data-close type="button">关闭</button>`);
+  overlay.querySelectorAll("[data-act]").forEach(button => button.addEventListener("click", () => {
+    const record = recycleBin.find(item => item.id === button.dataset.id);
+    if (!record) return;
+    if (button.dataset.act === "restoreRecycled") {
+      const result = restoreRecycleRecord(button.dataset.id);
+      if (!result.ok) {
+        toast("warn", "无法还原：原位置已有同 ID 项目，为避免覆盖已保留回收站记录。");
+        return;
+      }
+      closeModal();
+      render();
+      toast("ok", `已还原「${record.name}」`);
+      return;
+    }
+    discardRecycleRecord(button.dataset.id);
+    closeModal();
+    render();
+    toast("info", `「${record.name}」已移至 Windows 回收站`);
+  }));
+}
+
 function settingsDialog() {
   const overlay = modal("设置", `
     <div class="form-row">
@@ -1900,6 +2021,7 @@ $("#chips").addEventListener("click", e => {
 $("#search").addEventListener("input", e => { state.query = e.target.value.trim().toLocaleLowerCase(); renderTable(); renderInspector(); });
 $("#btnAdd").addEventListener("click", () => { if (state.model) addDialog(); });
 $("#btnSettings").addEventListener("click", settingsDialog);
+$("#openRecycleBin").addEventListener("click", recycleBinDialog);
 
 /* 表格 */
 $("#rows").addEventListener("click", e => {
