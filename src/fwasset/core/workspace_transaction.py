@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import json
 import os
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -45,7 +46,11 @@ _WAIT_ABANDONED = 0x80
 _WAIT_TIMEOUT = 0x102
 _SHARING_RETRY_BUDGET_SECONDS: float = 2.0
 _SHARING_RETRY_DELAY_SECONDS: float = 0.01
-_held_mutexes: set[str] = set()
+#: 锁名 → 持有线程 ident。裸 ``set[str]`` 只记录「本进程有人持有」，同进程
+#: 另一线程会被误判为「已持有」而跳过真正的 ``WaitForSingleObject``——
+#: Windows 命名互斥体本身按线程记录所有权，能让不同线程真正互斥等待，
+#: 只有**同一线程**重入自己已持有的锁才需要 fail-fast（等待会自锁死）。
+_held_mutexes: dict[str, int] = {}
 
 
 class WorkspaceTransactionError(RuntimeError):
@@ -225,9 +230,14 @@ def load_operation_log(workspace_root: str | Path) -> OperationLog | None:
 
 
 def workspace_lock_is_held(workspace_root: str | Path) -> bool:
-    """当前进程是否持有该工作区的写锁（staging 等受管写入的进程内守卫）。"""
+    """**当前线程**是否持有该工作区的写锁（staging 等受管写入的线程内守卫）。
+
+    只认「本线程持有」，不认「本进程有人持有」——``WorkspaceTransaction``
+    / ``WorkspaceLock`` 都是在单个调用栈里进入退出的线程本地状态，另一
+    线程即便在同一进程也没有这份状态，不能被当作已持锁放行。
+    """
     try:
-        return _mutex_name(workspace_root) in _held_mutexes
+        return _held_mutexes.get(_mutex_name(workspace_root)) == threading.get_ident()
     except (PathGuardError, ValueError):
         return False
 
@@ -397,7 +407,13 @@ def _mutex_name(workspace_root: str | Path) -> str:
 
 
 class WorkspaceLock:
-    """Windows 命名互斥体；进程异常退出后由系统自动释放。"""
+    """Windows 命名互斥体；进程异常退出后由系统自动释放。
+
+    ``_held_mutexes`` 按线程记录所有权：同一线程重入自己已持有的锁会
+    fail-fast（等待会自锁死）；同进程**另一线程**请求同一把锁会走真正
+    的 ``WaitForSingleObject`` 排队等待，而不是被误判为「已持有」直接
+    放行——命名互斥体本身按线程记录所有权，天然支持这种跨线程互斥。
+    """
 
     def __init__(self, workspace_root: str | Path, *, timeout_seconds: float = 2.0) -> None:
         self._name = _mutex_name(workspace_root)
@@ -408,8 +424,8 @@ class WorkspaceLock:
     def __enter__(self) -> WorkspaceLock:
         if os.name != "nt":
             raise OSError("工作区跨进程锁目前仅支持 Windows")
-        if self._name in _held_mutexes:
-            raise WorkspaceBusyError("当前进程已持有该工作区锁，禁止重入")
+        if _held_mutexes.get(self._name) == threading.get_ident():
+            raise WorkspaceBusyError("当前线程已持有该工作区锁，禁止重入")
         kernel32 = _kernel32()
         handle = kernel32.CreateMutexW(None, False, self._name)
         if not handle:
@@ -423,7 +439,7 @@ class WorkspaceLock:
             raise OSError(ctypes.get_last_error(), "无法获取工作区锁")
         self._handle = int(handle)
         self.was_abandoned = result == _WAIT_ABANDONED
-        _held_mutexes.add(self._name)
+        _held_mutexes[self._name] = threading.get_ident()
         return self
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> Literal[False]:
@@ -432,7 +448,8 @@ class WorkspaceLock:
             kernel32.ReleaseMutex(self._handle)
             kernel32.CloseHandle(self._handle)
             self._handle = None
-            _held_mutexes.discard(self._name)
+            if _held_mutexes.get(self._name) == threading.get_ident():
+                del _held_mutexes[self._name]
         return False
 
 

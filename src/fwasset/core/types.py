@@ -83,6 +83,43 @@ class OperationLog(TypedDict):
     details: dict[str, Any]
 
 
+# ---------------------------------------------------------------------------
+# 隔离区记录（TASK-20260916，父规格 D2.5）
+# ---------------------------------------------------------------------------
+
+QuarantineKind = Literal[
+    "undoable_delete",  # D10.1 各删除操作，保留撤销窗口
+    "transactional_retire",  # update / 改类型的旧程序退位，仅供失败补偿
+]
+
+QuarantineStatus = Literal[
+    "moving",  # 已落盘登记、内容尚未移入隔离区（崩溃恢复的中间态）
+    "pending",  # 撤销窗口内（仅 undoable_delete）或等待送出（transactional_retire）
+    "committed",  # 撤销窗口已过 / retire 已确认，待异步送系统回收站
+    "sent",  # 已送达系统回收站，记录可清理
+    "send_failed",  # 送出失败，保留清单供启动恢复重试
+]
+
+
+class QuarantineRecord(TypedDict):
+    """一条隔离操作清单条目（持久化于 ``workspace_state`` 受管根）。
+
+    ``manifest`` 复用 :func:`fwasset.core.manifest.directory_manifest_hash`
+    （不含 mtime）；``expires_at`` 仅 ``undoable_delete`` 有意义，
+    ``transactional_retire`` 恒为 0（不展示、不承诺撤销）。
+    """
+
+    id: str
+    kind: QuarantineKind
+    workspace_root: str
+    original_path: str
+    quarantine_path: str
+    manifest: str
+    status: QuarantineStatus
+    created_at: float
+    expires_at: float
+
+
 class ServiceResult(TypedDict):
     ok: bool
     code: str
