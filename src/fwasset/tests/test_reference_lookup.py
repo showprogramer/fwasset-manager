@@ -17,6 +17,7 @@ from fwasset.core.reference_lookup import (
     check_reference_gate,
     find_dangling_anchors,
     find_references_to,
+    owner_model_root_for,
 )
 
 
@@ -557,3 +558,44 @@ def test_catalog_unavailable_fail_closed(ws: Path, monkeypatch):
         str(ws), ws, ws / "L36程序" / "通用" / "快捷键" / "贝乐", "asset"
     )
     assert res["ok"] is False and res["code"] == "invalid_target"
+
+
+# ---------------------------------------------------------------------------
+# CSC-001：owner_model_root_for 最深匹配（最近祖先）语义
+# enumerate_model_roots 真实布局下型号根互不嵌套，这里人工构造嵌套根直接单测。
+# ---------------------------------------------------------------------------
+
+
+def test_owner_model_root_for_prefers_deepest_nested_root(tmp_path: Path):
+    """roots=[R, R/N] 时 R/N 下的路径归属最深的 R/N（最近祖先）。"""
+    root = tmp_path / "ws"
+    nested = root / "Nested"
+    deep = nested / "x" / "mod"
+    deep.mkdir(parents=True)
+    # 无论迭代顺序如何，最深根都胜出
+    assert owner_model_root_for(deep, [root, nested]) == nested
+    assert owner_model_root_for(deep, [nested, root]) == nested
+    # 候选就是型号根本身：归属更深的 R/N（rel.parts 为空）
+    assert owner_model_root_for(nested, [root, nested]) == nested
+
+
+def test_owner_model_root_for_sibling_under_outer_root(tmp_path: Path):
+    """R 下非 N 子路径归属 R；单根行为不变。"""
+    root = tmp_path / "ws"
+    nested = root / "Nested"
+    nested.mkdir(parents=True)
+    other = root / "Other" / "mod"
+    other.mkdir(parents=True)
+    assert owner_model_root_for(other, [root, nested]) == root
+    # 单根：候选在根下即归属该根
+    assert owner_model_root_for(other, [root]) == root
+
+
+def test_owner_model_root_for_outside_all_roots_returns_none(tmp_path: Path):
+    """不属于任何型号根 → None。"""
+    root = tmp_path / "ws"
+    (root / "x").mkdir(parents=True)
+    outside = tmp_path / "elsewhere" / "a"
+    outside.mkdir(parents=True)
+    assert owner_model_root_for(outside, [root]) is None
+    assert owner_model_root_for(outside, []) is None

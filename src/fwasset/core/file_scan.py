@@ -2,7 +2,7 @@ import os
 import re
 import threading
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, cast, get_args
 
 from fwasset.core.firmware_catalog import (
     DEFAULT_FIRMWARE_CATALOG_PATH,
@@ -11,6 +11,10 @@ from fwasset.core.firmware_catalog import (
 )
 from fwasset.core.managed_paths import should_exclude_managed_path
 from fwasset.core.path_guard import assert_within_workspace
+from fwasset.core.platform_config import (
+    PLATFORM_CONFIG_FILENAME,
+    load_platform_config_strict,
+)
 from fwasset.core.scheme_config import discover_schemes, scheme_for_path
 from fwasset.core.settings import (
     SCAN_EXCLUDE_DIR_KEYWORDS,
@@ -21,13 +25,16 @@ from fwasset.core.settings import (
     SCAN_ROM_EXTENSIONS,
     SCAN_VERSION_PATTERNS,
 )
-from fwasset.core.types import FirmwareAsset, HandcontrolFolder
+from fwasset.core.types import ChassisType, FirmwareAsset, HandcontrolFolder, ScanIssue
 
 # 通用/定制 的一级目录名
 _COMMON_DIR = "通用"
 _CUSTOM_DIR = "定制"
 # 双机芯平台的专属子目录名（在通用区内部）
 _DUAL_CORE_DIR = "双机芯-上3D-下2D"
+
+# 型号机芯类型枚举值集合（D0.1）：`平台配置.toml` 单块 name 命中才写入
+_CHASSIS_TYPE_VALUES: frozenset[str] = frozenset(get_args(ChassisType))
 
 
 def _match_first_group(text: str, patterns: list[str]) -> str:
@@ -220,15 +227,41 @@ def _load_scan_context(
     return type_configs, discover_schemes(root_path)
 
 
+def _chassis_type_for_model_root(
+    model_root: Path,
+) -> tuple[ChassisType | Literal[""], ScanIssue | None]:
+    """型号根 → (机芯类型, warning 级 issue)。严格读取 `平台配置.toml`（D0.1a）。
+
+    - 恰好一个块且 ``name`` 属于 :data:`ChassisType` 枚举 → 写入该 name；
+    - ``missing``、多块、非枚举 name → ``""`` 且无 issue；
+    - ``parse_error`` / ``parser_missing`` → ``""`` 且产生 warning 级
+      :class:`ScanIssue`（不阻断索引对账），``path`` 记 `平台配置.toml`
+      完整路径。
+    """
+    platforms, status, error = load_platform_config_strict(model_root)
+    if status in ("parse_error", "parser_missing"):
+        detail = error or status
+        return "", {
+            "severity": "warning",
+            "message": f"平台配置读取失败（{status}），机芯类型留空：{detail}",
+            "path": str(model_root / PLATFORM_CONFIG_FILENAME),
+        }
+    if status == "ok" and len(platforms) == 1:
+        name = platforms[0].platform_name
+        if name in _CHASSIS_TYPE_VALUES:
+            return cast(ChassisType, name), None
+    return "", None
+
+
 def scan_firmware_assets(
     root: str,
     catalog_path: str | Path | None = None,
     last_scan_at: float | None = None,
     cancel_event: "threading.Event | None" = None,
-) -> tuple[list[FirmwareAsset], list[str]]:
+) -> tuple[list[FirmwareAsset], list[ScanIssue]]:
     """
     Scan root using catalog-configured directory keywords and file extensions.
-    Returns recognized assets plus explicit directory read errors.
+    Returns recognized assets plus explicit scan issues (severity-graded).
 
     If last_scan_at is provided, directories whose mtime is older than
     last_scan_at will be skipped (incremental mode).
@@ -247,7 +280,7 @@ def scan_firmware_subtree(
     subtree_root: str,
     catalog_path: str | Path | None = None,
     cancel_event: "threading.Event | None" = None,
-) -> tuple[list[FirmwareAsset], list[str]]:
+) -> tuple[list[FirmwareAsset], list[ScanIssue]]:
     """局部子树扫描（REVIEW-20260728 R3）：仅遍历 ``subtree_root``。
 
     - 归属推导（category/platform/scheme_name/scheme_path/model_directory）
@@ -277,21 +310,54 @@ def _scan_assets(
     schemes: list,
     last_scan_at: float | None,
     cancel_event: "threading.Event | None",
-) -> tuple[list[FirmwareAsset], list[str]]:
+) -> tuple[list[FirmwareAsset], list[ScanIssue]]:
     """从 ``walk_root`` 遍历扫描，归属按 ``context_root`` 推导。"""
+    # 函数内导入：reference_lookup 顶层依赖本模块（_is_excluded_dir），
+    # 顶层互导会成环；归属规则单一真源在 reference_lookup（D0.1a 规则 1）。
+    from fwasset.core.reference_lookup import (
+        enumerate_model_roots,
+        owner_model_root_for,
+    )
+
     root_path = context_root
     results: list[FirmwareAsset] = []
-    errors: list[str] = []
+    issues: list[ScanIssue] = []
 
     def _on_walk_error(exc: OSError) -> None:
         if exc.filename:
-            errors.append(f"{exc.filename}: {exc.strerror}")
+            issues.append(
+                {
+                    "severity": "error",
+                    "message": f"{exc.filename}: {exc.strerror}",
+                    "path": exc.filename,
+                }
+            )
         else:
-            errors.append(str(exc))
+            issues.append({"severity": "error", "message": str(exc), "path": ""})
+
+    # 型号根按 context_root（工作区根）单次枚举；chassis 配置按型号根缓存，
+    # 同一型号根单次扫描只读一次盘（D0.1a 规则 4/7）。
+    model_roots = enumerate_model_roots(root_path)
+    chassis_cache: dict[str, tuple[ChassisType | Literal[""], ScanIssue | None]] = {}
+    chassis_issues: dict[str, ScanIssue] = {}
+
+    def _chassis_for_folder(folder: Path) -> ChassisType | Literal[""]:
+        owner = owner_model_root_for(folder, model_roots)
+        if owner is None:
+            return ""
+        cache_key = str(owner)
+        cached = chassis_cache.get(cache_key)
+        if cached is None:
+            cached = _chassis_type_for_model_root(owner)
+            chassis_cache[cache_key] = cached
+            if cached[1] is not None:
+                # 同一型号根的损坏配置只告警一次（诊断对象是配置文件本身）
+                chassis_issues[cache_key] = cached[1]
+        return cached[0]
 
     for dirpath, dirnames, filenames in os.walk(walk_root, onerror=_on_walk_error):
         if cancel_event is not None and cancel_event.is_set():
-            errors.append("扫描已被用户取消")
+            issues.append({"severity": "error", "message": "扫描已被用户取消", "path": ""})
             break
 
         if last_scan_at is not None and dirpath != str(walk_root):
@@ -322,6 +388,7 @@ def _scan_assets(
         series = guess_series_from_model_or_path(model, str(model_directory))
         files = _visible_asset_files(dirpath, filenames, root_path)
         label = f"{model}  {version or '-'}  [{folder_path.name}]  {cfg['label']}"
+        chassis_type = _chassis_for_folder(folder_path)
 
         # --- 推断 category / platform / scheme ---
         category, platform, scheme_name, scheme_path = _infer_asset_context(
@@ -354,11 +421,14 @@ def _scan_assets(
                 "platform": platform,
                 "scheme_name": scheme_name,
                 "scheme_path": scheme_path,
+                "chassis_type": chassis_type,
             }
         )
 
     results.sort(key=lambda item: (item["path"], item["firmware_type"]))
-    return results, errors
+    # chassis 警告按型号根去重后统一追加（排序保证全量/子树诊断确定性）
+    issues.extend(chassis_issues[key] for key in sorted(chassis_issues))
+    return results, issues
 
 
 def _infer_asset_context(
@@ -494,5 +564,5 @@ def find_handcontrol_folders(root: str) -> list[HandcontrolFolder]:
     Recursively scan root and find folders containing both configured ROM and PKG files.
     Priority: ROM filename -> folder/path fallback.
     """
-    assets, _errors = scan_firmware_assets(root)
+    assets, _issues = scan_firmware_assets(root)
     return handcontrol_folders_from_assets(assets)

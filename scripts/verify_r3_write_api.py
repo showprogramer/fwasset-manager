@@ -32,6 +32,7 @@ from fwasset.core.asset_index import (
 )
 from fwasset.core.asset_reconcile import reconcile_subtree
 from fwasset.core.file_scan import scan_firmware_assets, scan_firmware_subtree
+from fwasset.core.types import ScanIssue
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCENARIO = REPO_ROOT / ".scenario" / "r3"
@@ -79,6 +80,15 @@ def drop_fail_trigger() -> None:
         conn.close()
 
 
+def error_messages(issues: list[ScanIssue]) -> list[str]:
+    """TASK-20260916 分级语义：只有 error 级 issue 才视为扫描失败。"""
+    return [
+        str(issue.get("message"))
+        for issue in issues
+        if issue.get("severity") == "error"
+    ]
+
+
 def main() -> int:
     if SCENARIO.exists():
         shutil.rmtree(SCENARIO)
@@ -89,8 +99,8 @@ def main() -> int:
     l50 = WS / "L50主板程序" / "主板程序_v1"
     write_bin(v1 / "ITE_NOR_L36_v1.0.0.bin")
     write_bin(l50 / "ITE_NOR_L50_v1.0.0.bin")
-    assets, errors = scan_firmware_assets(str(WS))
-    assert not errors, errors
+    assets, issues = scan_firmware_assets(str(WS))
+    assert not error_messages(issues), issues
     save_assets(assets, str(WS), DB, scanned_at=1000.0)
     print(f"准备：工作区 {WS}")
     print(f"      索引库 {DB}（播种 {len(assets)} 行）")
@@ -99,8 +109,8 @@ def main() -> int:
     print("\n场景 1：新增程序目录 → 子树扫描 → upsert_asset")
     v2 = WS / "L36主板程序" / "主板程序_v2"
     write_bin(v2 / "ITE_NOR_L36_v2.0.0.bin")
-    sub_assets, sub_errors = scan_firmware_subtree(str(WS), str(WS / "L36主板程序"))
-    check("子树扫描无错误", not sub_errors)
+    sub_assets, sub_issues = scan_firmware_subtree(str(WS), str(WS / "L36主板程序"))
+    check("子树扫描无错误", not error_messages(sub_issues))
     new_asset = next(a for a in sub_assets if a["path"] == str(v2))
     upsert_asset(new_asset, path=DB)
     check("新行已入库（字段级）", new_asset in load_assets(DB))
@@ -161,8 +171,11 @@ def main() -> int:
     )
     drop_fail_trigger()
     reconcile_subtree(str(WS), str(WS / "L50主板程序"), path=DB)
-    full_scan, full_errors = scan_firmware_assets(str(WS))
-    check("对账后整库与磁盘一致（字段级）", not full_errors and load_assets(DB) == full_scan)
+    full_scan, full_issues = scan_firmware_assets(str(WS))
+    check(
+        "对账后整库与磁盘一致（字段级）",
+        not error_messages(full_issues) and load_assets(DB) == full_scan,
+    )
 
     # ---- 汇总 ----
     print("\n========== 验证结果 ==========")

@@ -28,6 +28,10 @@ FirmwareType = Literal[
 FlashMode = Literal["auto_usb", "tool_launch", "manual_doc", "disabled"]
 UsbFlow = Literal["paired_files", "directory_copy", ""]
 
+# 型号机芯类型（TASK-20260916，父规格 D0.1）：`平台配置.toml` 的单个
+# ``[[platform]]`` 块 name 属于此枚举时写入 ``FirmwareAsset.chassis_type``。
+ChassisType = Literal["单3D", "单2D", "双2D", "上3D下2D"]
+
 # ---------------------------------------------------------------------------
 # 受管路径与工作区布局（TASK-20260905，父规格 D4.3 / D8.2 / D9.0）
 # ---------------------------------------------------------------------------
@@ -182,6 +186,20 @@ class ToolRegistration(TypedDict):
     directory: str
 
 
+class ScanIssue(TypedDict):
+    """扫描诊断条目（TASK-20260916，父规格 D0.1a 第 5 条）。
+
+    ``severity`` 分级：目录读取失败 / 用户取消 → ``error``；chassis 配置
+    ``parse_error`` / ``parser_missing`` → ``warning``（不阻断索引对账）。
+    ``path`` 为关联路径，无关联路径留空串；chassis 警告记 ``平台配置.toml``
+    完整路径。
+    """
+
+    severity: Literal["warning", "error"]
+    message: str
+    path: str
+
+
 class FirmwareAsset(TypedDict):
     series: str
     firmware_type: FirmwareType
@@ -202,9 +220,11 @@ class FirmwareAsset(TypedDict):
     label: str
     # --- L36 新目录结构字段（向后兼容：旧目录留空字符串）---
     category: Literal["common", "custom", ""]  # 通用 / 定制
-    platform: str  # 整机平台，如 "双机芯-上3D-下2D"；默认平台留 ""
+    platform: str  # legacy：整机平台（如 "双机芯-上3D-下2D"），仅保留旧数据读取；默认平台留 ""
     scheme_name: str  # 定制方案名，如 "以色列-Royal-Z9"；通用区为 ""
     scheme_path: str  # 定制方案根目录绝对路径；通用区为 ""
+    # --- 型号机芯类型（D0.1）：必填，legacy / 未识别留 "" ---
+    chassis_type: ChassisType | Literal[""]
 
 
 # ---------------------------------------------------------------------------

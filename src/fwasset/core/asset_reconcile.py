@@ -4,8 +4,10 @@
 以磁盘扫描结果为准重建该子树的索引行。对账是冷接口——由上层 CRUD 动作在
 失败恢复时显式调用，不自动重试。
 
-防误删纪律（规格 TASK-20260901-r3-index-write-api）：
-- 扫描 errors 非空或被取消 → 禁止写库（不完整扫描不得当作权威快照）；
+防误删纪律（规格 TASK-20260901-r3-index-write-api；severity 分级见
+TASK-20260916 父规格 D0.1a）：
+- 扫描存在 ``severity == "error"`` 的 issue 或被取消 → 禁止写库
+  （不完整扫描不得当作权威快照）；warning 级放行；
 - 子树已不存在 → 视为空快照，允许清空其旧索引行（支撑删除恢复）；
 - 工作区根不存在、子树存在但不是目录 → 报错不改库。
 """
@@ -66,18 +68,23 @@ def reconcile_subtree(
     else:
         if not sub_path.is_dir():
             raise AssetIndexError(f"子树不是目录，拒绝对账：{subtree_root}")
-        assets, errors = scan_firmware_subtree(
+        assets, issues = scan_firmware_subtree(
             workspace_root,
             subtree_root,
             catalog_path=catalog_path,
             cancel_event=cancel_event,
         )
-        # 不完整扫描（目录读错误 / 用户取消）不得当作权威快照，禁止写库。
+        # 不完整扫描（目录读错误 / 用户取消）不得当作权威快照，禁止写库；
+        # warning 级（如 chassis 配置损坏）放行（TASK-20260916，父规格 D0.1a）。
         if cancel_event is not None and cancel_event.is_set():
             raise AssetIndexError("扫描已被取消，本次对账未写库")
-        if errors:
+        blocking = [
+            issue for issue in issues if str(issue.get("severity")) == "error"
+        ]
+        if blocking:
             raise AssetIndexError(
-                "子树扫描存在错误，禁止对账写库：\n" + "\n".join(errors)
+                "子树扫描存在错误，禁止对账写库：\n"
+                + "\n".join(str(issue.get("message")) for issue in blocking)
             )
 
     bulk_reindex_subtree(workspace_root, subtree_root, assets, path=path)

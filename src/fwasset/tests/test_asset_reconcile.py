@@ -104,12 +104,38 @@ def test_reconcile_scan_errors_do_not_write(seeded_ws, monkeypatch) -> None:
     before = load_assets(db_path)
 
     def broken_scan(*args, **kwargs):
-        return [], [f"{args[0]}: boom"]
+        return [], [
+            {"severity": "error", "message": f"{args[0]}: boom", "path": ""}
+        ]
 
     monkeypatch.setattr(asset_reconcile, "scan_firmware_subtree", broken_scan)
     with pytest.raises(AssetIndexError, match="禁止对账写库"):
         reconcile_subtree(str(ws), str(subtree), path=db_path)
     assert load_assets(db_path) == before
+
+
+def test_reconcile_scan_warnings_allow_write(seeded_ws, monkeypatch) -> None:
+    """warning 级 issue（如 chassis 配置损坏）放行对账写库（TASK-20260916）。"""
+    ws, subtree, db_path = seeded_ws
+
+    def warned_scan(*args, **kwargs):
+        assets, _issues = real_scan_firmware_subtree(*args, **kwargs)
+        return assets, [
+            {
+                "severity": "warning",
+                "message": "平台配置读取失败（parse_error），机芯类型留空",
+                "path": str(subtree / "平台配置.toml"),
+            }
+        ]
+
+    real_scan_firmware_subtree = asset_reconcile.scan_firmware_subtree
+    monkeypatch.setattr(asset_reconcile, "scan_firmware_subtree", warned_scan)
+    reconcile_subtree(str(ws), str(subtree), path=db_path)  # 不因 warning 阻止
+    scanned_sub, _ = scan_firmware_subtree(str(ws), str(subtree))
+    db_sub = [a for a in load_assets(db_path) if a["path"].startswith(str(subtree))]
+    assert sorted(db_sub, key=lambda a: (a["path"], a["firmware_type"])) == sorted(
+        scanned_sub, key=lambda a: (a["path"], a["firmware_type"])
+    )
 
 
 def test_reconcile_cancelled_does_not_write(seeded_ws, monkeypatch) -> None:
@@ -121,7 +147,9 @@ def test_reconcile_cancelled_does_not_write(seeded_ws, monkeypatch) -> None:
     cancel_event.set()
 
     def cancelled_scan(*args, **kwargs):
-        return [], ["扫描已被用户取消"]
+        return [], [
+            {"severity": "error", "message": "扫描已被用户取消", "path": ""}
+        ]
 
     monkeypatch.setattr(asset_reconcile, "scan_firmware_subtree", cancelled_scan)
     with pytest.raises(AssetIndexError, match="未写库"):

@@ -15,17 +15,30 @@ def build_scan_result(
 ) -> ServiceResult:
     try:
         log_fn(f"扫描中: {root}")
-        assets, errors = scan_firmware_assets(
+        assets, issues = scan_firmware_assets(
             root,
             cancel_event=cancel_event,
         )
+        # 诊断分级（D0.1a）：errors 只含 error 级（目录读取失败 / 取消），
+        # warnings 只含 warning 级（chassis 配置损坏），message 文案不变。
+        errors = [
+            issue["message"] for issue in issues if issue.get("severity") == "error"
+        ]
+        warnings = [
+            issue["message"] for issue in issues if issue.get("severity") == "warning"
+        ]
 
         if cancel_event is not None and cancel_event.is_set():
             return {
                 "ok": True,
                 "code": "cancelled",
                 "message": "扫描已被用户取消",
-                "payload": {"assets": [], "folders": [], "errors": errors},
+                "payload": {
+                    "assets": [],
+                    "folders": [],
+                    "errors": errors,
+                    "warnings": warnings,
+                },
             }
 
         # 从本次 assets 派生，避免 find_handcontrol_folders 再扫一整遍树
@@ -42,6 +55,7 @@ def build_scan_result(
                 "assets": assets,
                 "folders": folders,
                 "errors": errors,
+                "warnings": warnings,
             },
         }
     except Exception as exc:
@@ -53,6 +67,7 @@ def build_scan_result(
                 "assets": [],
                 "folders": [],
                 "errors": [],
+                "warnings": [],
             },
         }
 
@@ -68,11 +83,12 @@ def build_cached_scan_result(log_fn: Callable[..., None] = print) -> ServiceResu
                 "code": "index_empty",
                 "message": "本地资产索引为空，请首次扫描根目录",
                 "payload": {
-                    "assets": [],
-                    "folders": [],
-                    "errors": [],
-                    "scan_meta": meta,
-                    "asset_count": 0,
+                "assets": [],
+                "folders": [],
+                "errors": [],
+                "warnings": [],  # 缓存读取无新扫描 warning（与 build_scan_result 对齐）
+                "scan_meta": meta,
+                "asset_count": 0,
                 },
             }
 
@@ -85,6 +101,7 @@ def build_cached_scan_result(log_fn: Callable[..., None] = print) -> ServiceResu
                 "assets": [],
                 "folders": [],
                 "errors": [],
+                "warnings": [],  # 缓存读取无新扫描 warning（与 build_scan_result 对齐）
                 "scan_meta": meta,
                 "asset_count": asset_count,
             },
@@ -99,6 +116,7 @@ def build_cached_scan_result(log_fn: Callable[..., None] = print) -> ServiceResu
                 "assets": [],
                 "folders": [],
                 "errors": [str(exc)],
+                "warnings": [],  # 与 build_scan_result 对齐；缓存读取无新扫描 warning
                 "scan_meta": [],
             },
         }

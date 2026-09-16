@@ -400,10 +400,11 @@ def test_scan_with_cancel_event(tmp_path: Path):
     cancel_event = threading.Event()
     cancel_event.set()
 
-    assets, errors = scan_firmware_assets(str(tmp_path), cancel_event=cancel_event)
+    assets, issues = scan_firmware_assets(str(tmp_path), cancel_event=cancel_event)
 
     assert len(assets) == 0
-    assert any("取消" in e for e in errors)
+    assert any("取消" in issue["message"] for issue in issues)
+    assert all(issue["severity"] == "error" for issue in issues)
 
 
 def test_scan_with_last_scan_at_skips_unchanged(tmp_path: Path):

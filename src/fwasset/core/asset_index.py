@@ -17,7 +17,7 @@ from fwasset.core.path_guard import (
 )
 from fwasset.core.settings import ASSET_INDEX_PATH
 from fwasset.core.sort_config import SortKey, apply_sort
-from fwasset.core.types import FirmwareAsset
+from fwasset.core.types import ChassisType, FirmwareAsset
 
 SCHEMA_VERSION = 3
 HiddenItemType = Literal["model_directory", "firmware_type", "asset"]
@@ -836,4 +836,10 @@ def _row_to_asset(row: sqlite3.Row) -> FirmwareAsset:
         "platform": str(row["platform"]) if "platform" in keys else "",
         "scheme_name": str(row["scheme_name"]) if "scheme_name" in keys else "",
         "scheme_path": str(row["scheme_path"]) if "scheme_path" in keys else "",
+        # chassis_type（D0.1）尚未进索引列（D6.4 与 vendor 同批提升 schema_version，
+        # 本片零 schema 变化）：读路径按 FirmwareAsset 契约补 ""，与扫描快照字段级一致。
+        "chassis_type": cast(
+            "ChassisType | Literal['']",
+            str(row["chassis_type"]) if "chassis_type" in keys else "",
+        ),
     }

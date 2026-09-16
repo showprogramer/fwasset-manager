@@ -935,6 +935,7 @@ def _make_asset(
         "platform": platform,
         "scheme_name": scheme_name,
         "scheme_path": "",
+        "chassis_type": "",
     }
 
 
@@ -1481,6 +1482,7 @@ def _asset(path: Path, *, model_root: Path, model_name: str) -> FirmwareAsset:
         "platform": "",
         "scheme_name": "",
         "scheme_path": "",
+        "chassis_type": "",
     }
 
 

@@ -50,7 +50,7 @@ from fwasset.core.file_scan import scan_firmware_assets
 
 def build_model(root: Path) -> tuple[SchemeWorkbenchModel, str]:
     db = Path(tempfile.mkdtemp()) / "spike.db"
-    assets, _errors = scan_firmware_assets(str(root))
+    assets, _issues = scan_firmware_assets(str(root))
     save_assets(assets, str(root), path=db)
     model = SchemeWorkbenchModel()
     model.bind(db, root)

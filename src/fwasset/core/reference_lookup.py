@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,6 +45,7 @@ __all__ = [
     "find_dangling_anchors",
     "find_references_to",
     "is_blocking_issue",
+    "owner_model_root_for",
 ]
 
 BLOCKING_ISSUE_CATEGORIES = frozenset(
@@ -874,17 +876,38 @@ def _relative_parts(candidate: Path, ws: Path) -> tuple[str, ...] | None:
         return None
 
 
-def _owner_root_for(candidate: Path, entries: list[_ModelEntry]) -> _ModelEntry | None:
-    """候选路径所属型号根（最深匹配）。"""
+def owner_model_root_for(
+    candidate: Path, model_roots: Iterable[Path]
+) -> Path | None:
+    """候选路径所属型号根（规则 1 最深匹配语义，归属规则单一真源）。
+
+    在 ``model_roots``（一般来自 :func:`enumerate_model_roots`）中返回作为
+    ``candidate`` 最深祖先的型号根；不属于任何型号根返回 None。
+    供本模块反查与扫描链（file_scan 的 ``chassis_type`` 归属）共同复用，
+    归属规则不得在调用方复制第二套。
+    """
     resolved = candidate.resolve()
-    best: _ModelEntry | None = None
-    best_len = -1
-    for entry in entries:
+    best: Path | None = None
+    best_rel_len: int | None = None
+    for root in model_roots:
         try:
-            rel = resolved.relative_to(Path(entry.root).resolve())
+            rel = resolved.relative_to(Path(root).resolve())
         except ValueError:
             continue
-        if len(rel.parts) > best_len:
-            best = entry
-            best_len = len(rel.parts)
+        # 最深匹配 = rel.parts 最少（型号根是 candidate 的最近祖先）；
+        # 平局保持首个出现的根（真实布局下型号根互不嵌套，不会出现平局）。
+        if best_rel_len is None or len(rel.parts) < best_rel_len:
+            best = Path(root)
+            best_rel_len = len(rel.parts)
     return best
+
+
+def _owner_root_for(candidate: Path, entries: list[_ModelEntry]) -> _ModelEntry | None:
+    """候选路径所属型号根（最深匹配），委托 :func:`owner_model_root_for`。"""
+    best_root = owner_model_root_for(candidate, (entry.root for entry in entries))
+    if best_root is None:
+        return None
+    for entry in entries:
+        if same_path_identity(Path(entry.root), best_root):
+            return entry
+    return None

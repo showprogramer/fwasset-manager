@@ -117,8 +117,13 @@ def test_subtree_scan_respects_cancel_event(tmp_path: Path) -> None:
     root = make_tree(tmp_path)
     cancel_event = threading.Event()
     cancel_event.set()
-    sub, errors = scan_firmware_subtree(str(tmp_path), str(root), cancel_event=cancel_event)
-    assert errors == ["扫描已被用户取消"]
+    sub, issues = scan_firmware_subtree(
+        str(tmp_path), str(root), cancel_event=cancel_event
+    )
+    assert issues == [
+        {"severity": "error", "message": "扫描已被用户取消", "path": ""}
+    ]
+    assert sub == []
 
 
 def test_subtree_scan_excludes_configured_keywords(tmp_path: Path) -> None:
@@ -160,7 +165,7 @@ def test_subtree_scan_passes_custom_catalog(tmp_path: Path) -> None:
 
 
 def test_subtree_scan_reports_walk_errors(tmp_path: Path, monkeypatch) -> None:
-    """目录读取失败经 onerror 汇入 errors 返回，不抛异常。"""
+    """目录读取失败经 onerror 汇入 error 级 issue 返回，不抛异常。"""
     root = make_tree(tmp_path)
     real_walk = os.walk
 
@@ -169,8 +174,10 @@ def test_subtree_scan_reports_walk_errors(tmp_path: Path, monkeypatch) -> None:
         yield from real_walk(start, *args, **kwargs)
 
     monkeypatch.setattr(file_scan.os, "walk", failing_walk)
-    sub, errors = scan_firmware_subtree(str(tmp_path), str(root))
-    assert len(errors) == 1
-    assert "Permission denied" in errors[0]
-    assert "受保护目录" in errors[0]
+    sub, issues = scan_firmware_subtree(str(tmp_path), str(root))
+    assert len(issues) == 1
+    assert issues[0]["severity"] == "error"
+    assert "Permission denied" in issues[0]["message"]
+    assert "受保护目录" in issues[0]["message"]
+    assert issues[0]["path"] == str(root / "受保护目录")
     assert isinstance(sub, list)
