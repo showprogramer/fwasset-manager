@@ -50,7 +50,7 @@ name = "标准单机芯3D"
 """
 
 SCHEME_CONFIG = """\
-name = "葡萄牙-凡强"
+name = "葡萄牙-小明"
 platform = "标准单机芯3D"
 """
 
@@ -109,9 +109,9 @@ def build_tree(root: Path, platform_config: str, *, with_custom: bool) -> None:
     _write_file(root / "通用" / "手控UI" / "中文-通用_默认" / "L36_V1.0.pkg", b"fw")
     _write_file(root / "通用" / "蓝牙程序" / "中文-通用_默认" / "L36_V1.0.bin", b"fw")
     if with_custom:
-        _write_file(root / "定制" / "葡萄牙-凡强" / "方案配置.toml", SCHEME_CONFIG)
+        _write_file(root / "定制" / "葡萄牙-小明" / "方案配置.toml", SCHEME_CONFIG)
         _write_file(
-            root / "定制" / "葡萄牙-凡强" / "主板程序" / "定制板_V1.0" / "PT_V1.0.bin",
+            root / "定制" / "葡萄牙-小明" / "主板程序" / "定制板_V1.0" / "PT_V1.0.bin",
             b"fw",
         )
     print(f"[tree] 已构建 {root}")
@@ -147,7 +147,7 @@ def _checklist(items: list[str]) -> None:
 
 
 PHASE1_STEPS = [
-    "资产树出现：通用模块（主板程序：量产_默认/备用_V2.1、手控UI、蓝牙程序）、定制方案「葡萄牙-凡强」",
+    "资产树出现：通用模块（主板程序：量产_默认/备用_V2.1、手控UI、蓝牙程序）、定制方案「葡萄牙-小明」",
     "「量产_默认」行显示 ★默认 徽章（平台配置默认变体）",
     "右键「量产_默认」→ 菜单**不含**「设为默认」项（已默认），只含「登记共享来源…」",
     "右键「主板程序 / 备用_V2.1」→ 菜单包含「设为…默认版本」和「登记共享来源…」",

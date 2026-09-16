@@ -879,7 +879,7 @@ class SchemeWorkbenchModel:
         格式:
         {
             "common": {"主板程序": 6, "手控UI": 17, ...},
-            "custom": ["以色列-Royal-Z9", "葡萄牙-凡强", ...]
+            "custom": ["以色列-Royal-Z9", "葡萄牙-小明", ...]
         }
         """
         if not model_name:
