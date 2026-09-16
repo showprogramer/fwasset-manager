@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from fwasset.core.model_config import (
+    MODEL_CONFIG_FILENAME,
     SharedModuleRef,
     save_model_id,
     save_shared_module,
@@ -352,3 +353,207 @@ def test_follow_asset_registered_and_resolved(ws: Path):
     )
     hits = [h for h in _result(res["payload"]).hits if h.kind == "shared_follow_asset"]
     assert len(hits) == 1
+
+
+# ---------------------------------------------------------------------------
+# owner 限定、语义命中与领域校验
+# ---------------------------------------------------------------------------
+
+
+def test_defaults_module_hit_not_cross_model(ws: Path):
+    """L50 有同名 canonical defaults，查 L36 模块不得命中 L50。"""
+    save_platform_config(
+        ws / "L50程序", [PlatformDefaults("标准双2D", {"快捷键程序": "别的"})]
+    )
+    res = find_references_to(
+        str(ws), ws, ws / "L36程序" / "通用" / "快捷键", "module"
+    )
+    hits = [h for h in res["payload"]["result"].hits if h.kind == "platform_default"]
+    assert {Path(h.owner_root).name for h in hits} == {"L36程序"}
+
+
+def test_dangling_follow_default_semantic_hit_on_module(ws: Path):
+    """follow_default 默认缺失时，module 级仍按来源根+canonical 语义命中。"""
+    _borrow(
+        ws / "L50程序",
+        "快捷键程序",
+        "L36程序/通用/快捷键",
+        mode="follow_default",
+    )
+    res = find_references_to(
+        str(ws), ws, ws / "L36程序" / "通用" / "快捷键", "module"
+    )
+    hits = [h for h in res["payload"]["result"].hits if h.kind == "shared_follow_default"]
+    assert len(hits) == 1
+
+
+def test_follow_default_semantic_hit_requires_source_model_id(ws: Path):
+    """路径首段指向 L36 但 id 写成 L50 的损坏引用 → 不算命中。"""
+    _borrow(
+        ws / "L50程序",
+        "快捷键程序",
+        "L36程序/通用/快捷键",
+        mode="follow_default",
+        sid="l50",
+    )
+    res = find_references_to(
+        str(ws), ws, ws / "L36程序" / "通用" / "快捷键", "module"
+    )
+    hits = [h for h in res["payload"]["result"].hits if h.kind == "shared_follow_default"]
+    assert hits == []
+
+
+def test_variant_container_rejected_as_asset(ws: Path):
+    res = find_references_to(
+        str(ws), ws, ws / "L36程序" / "通用" / "快捷键", "asset"
+    )
+    assert res["ok"] is False and res["code"] == "invalid_target"
+
+
+def test_variant_accepted_as_asset(ws: Path):
+    res = find_references_to(
+        str(ws), ws, ws / "L36程序" / "通用" / "快捷键" / "贝乐", "asset"
+    )
+    assert res["ok"] is True
+
+
+def test_strict_loader_flags_illegal_mode_and_platform(ws: Path):
+    cfg = ws / "L50程序" / MODEL_CONFIG_FILENAME
+    text = cfg.read_text(encoding="utf-8")
+    cfg.write_text(
+        text
+        + '\n[shared_modules."主板程序"]\n'
+        'source_model_id = "l36"\n'
+        'source_group = "l36"\n'
+        'source_module = "主板程序"\n'
+        'source_relative_path = "L36程序/通用/主板程序/v1"\n'
+        'mode = "follow_asst"\n',
+        encoding="utf-8",
+    )
+    res = find_references_to(
+        str(ws), ws, ws / "L36程序" / "通用" / "快捷键", "module"
+    )
+    issues = res["payload"]["result"].issues
+    assert any(i.category == "invalid_shared_entry" for i in issues)
+
+
+def test_strict_loader_flags_follow_asset_with_platform(ws: Path):
+    _borrow(
+        ws / "L50程序",
+        "主板程序",
+        "L36程序/通用/主板程序/v1",
+        mode="follow_asset",
+        source_platform="标准单机芯3D",
+    )
+    res = find_references_to(
+        str(ws), ws, ws / "L36程序" / "通用" / "快捷键", "module"
+    )
+    issues = res["payload"]["result"].issues
+    assert any(i.category == "invalid_shared_entry" for i in issues)
+
+
+# ---------------------------------------------------------------------------
+# junction 与 catalog 判定
+# ---------------------------------------------------------------------------
+
+
+def test_junction_physical_descendant_hit(ws: Path, tmp_path: Path):
+    """锚点经 junction 指向真实模块子目录：module 反查仍命中。"""
+    link_parent = tmp_path / "links"
+    link_parent.mkdir()
+    link = link_parent / "快捷键alias"
+    real = ws / "L36程序" / "通用" / "快捷键"
+    import subprocess
+
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(real)],
+        check=True,
+        capture_output=True,
+    )
+    _borrow(ws / "L50程序", "快捷键程序", "L36程序/通用/快捷键/贝乐")
+    # 通过 junction 的路径作为锚点（词法上与真实模块无前缀关系）
+    junction_rel = f"../{link.parent.name}/{link.name}/贝乐"
+    cfg = ws / "L50程序" / MODEL_CONFIG_FILENAME
+    text = cfg.read_text(encoding="utf-8").replace(
+        "L36程序/通用/快捷键/贝乐", junction_rel
+    )
+    cfg.write_text(text, encoding="utf-8")
+    res = find_references_to(str(ws), ws, real, "module")
+    hits = [h for h in res["payload"]["result"].hits if h.kind.startswith("shared_")]
+    assert len(hits) == 1
+
+
+def test_unknown_dir_under_module_rejected_as_asset(ws: Path, monkeypatch):
+    """合法 label 下无匹配文件的子目录 → invalid_target（不猜 asset 身份）。"""
+    empty = ws / "L36程序" / "通用" / "快捷键" / "空目录"
+    empty.mkdir(parents=True)
+    res = find_references_to(str(ws), ws, empty, "asset")
+    assert res["ok"] is False and res["code"] == "invalid_target"
+
+
+def test_variant_with_matching_file_accepted(ws: Path):
+    res = find_references_to(
+        str(ws), ws, ws / "L36程序" / "通用" / "快捷键" / "贝乐", "asset"
+    )
+    assert res["ok"] is True
+
+
+def test_dir_keyword_module_accepted(ws: Path):
+    """`主板` 是 mainboard 的 dir_keywords：scanner 与反查都接受该模块。"""
+    variant = ws / "L36程序" / "通用" / "主板" / "v3"
+    _write(variant / "rom.bin")
+    res = find_references_to(str(ws), ws, variant, "asset")
+    assert res["ok"] is True
+
+
+def test_ascii_case_keyword_module_accepted(ws: Path):
+    """`MP3` 是 music_files 的 dir_keywords：ASCII 大小写不影响判定。"""
+    from fwasset.core.file_scan import _match_catalog_type
+    from fwasset.core.firmware_catalog import enabled_firmware_types
+
+    types = enabled_firmware_types()
+    variant = ws / "L36程序" / "通用" / "MP3" / "v1"
+    _write(variant / "song.mp3")
+    # scanner 层接受
+    assert (
+        _match_catalog_type(str(variant), ["song.mp3"], types) is not None
+    )
+    # 反查层同样接受（keyword 小写 vs 模块名原大写不得误拒）
+    res = find_references_to(str(ws), ws, variant, "asset")
+    assert res["ok"] is True
+
+
+def test_handcontrol_requires_rom_and_pkg(ws: Path):
+    """仓库硬约束：handcontrol_ui 必须同时有 .rom 与 .pkg。"""
+    from fwasset.core.file_scan import _match_catalog_type
+    from fwasset.core.firmware_catalog import enabled_firmware_types
+
+    types = enabled_firmware_types()
+    rom_only = ws / "L36程序" / "通用" / "手控UI" / "只有rom"
+    _write(rom_only / "fw.rom")
+    pkg_only = ws / "L36程序" / "通用" / "手控UI" / "只有pkg"
+    _write(pkg_only / "fw.pkg")
+    both = ws / "L36程序" / "通用" / "手控UI" / "齐全"
+    _write(both / "fw.rom")
+    _write(both / "fw.pkg")
+
+    # file_scan 层：缺任一不误认，齐全才命中
+    assert _match_catalog_type(str(rom_only), ["fw.rom"], types) is None
+    assert _match_catalog_type(str(pkg_only), ["fw.pkg"], types) is None
+    assert _match_catalog_type(str(both), ["fw.rom", "fw.pkg"], types) is not None
+
+    # 反查层：缺任一 invalid_target，齐全接受
+    for p, ok in ((rom_only, False), (pkg_only, False), (both, True)):
+        res = find_references_to(str(ws), ws, p, "asset")
+        assert res["ok"] is ok, (p, res["code"] if not ok else "")
+
+
+def test_catalog_unavailable_fail_closed(ws: Path, monkeypatch):
+    """catalog 不可用 → invalid_target（fail-closed，不降级为纯结构判断）。"""
+    import fwasset.core.reference_lookup as rl
+
+    monkeypatch.setattr(rl, "_catalog_context", lambda: None)
+    res = find_references_to(
+        str(ws), ws, ws / "L36程序" / "通用" / "快捷键" / "贝乐", "asset"
+    )
+    assert res["ok"] is False and res["code"] == "invalid_target"
