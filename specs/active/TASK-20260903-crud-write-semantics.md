@@ -5,7 +5,7 @@
 | 项 | 状态 |
 | --- | --- |
 | 类型 | 写语义定稿（规则决策，不改产品代码） |
-| 当前状态 | 规则已定稿，型号 CRUD 与空工作区规则已确认；实现子 TASK 待立项 |
+| 当前状态 | 规则已定稿；实现子任务 1（公共事务基础）已完成，2–8 待实施 |
 | 前置 | ✅ R5 路径守卫、✅ R1/R10 写入门闩、✅ R3 索引行级写、✅ R8 引用反查与级联 |
 | 父任务 | CRUD 准入（`docs/code-review/REVIEW-20260728-pre-crud-readiness.md`） |
 | 分支 | `feature/pyside6-migration` |
@@ -715,7 +715,11 @@ scanner / USB 用 `should_exclude_managed_path`；软件修复用 `managed_path_
 0. **原型收窄**（可与第 1 项并行）：按 D10.3 去掉非删除类操作的撤销回调，同步更新 `TASK-20260806-independent-crud-web-prototype.md` 的规则与验收。
 1. **公共事务基础**：读写锁、generation seqlock 与操作日志（D8、D8.1）、`WorkspaceState`（D8.4）、事务协调器（D8.3）、「删除本次产物」原语（D1.4c）、内部目录所有权与专用守卫（D8.2）、staging 与受管候选区、原子提升（D7.1）、隔离区两类记录与撤销（D2.5）、`managed_path_reason` / `should_exclude_managed_path`（D4.3）+ USB `ignore` 修复（D4.5）、`WorkspaceLayout` 判定（D9.0）。
 
-   已完成 1a：受管路径判定与布局识别（`TASK-20260905-managed-paths-and-layout`，人工验证通过；任务文件未入库）。剩余事务基础与受管根创建归 1b，子任务 1 整体尚未完成。
+   **已完成（2026-09-16 统筹收口）**，切片：1a 受管路径判定与布局识别（`TASK-20260905-managed-paths-and-layout`，人工验证通过，任务文件未入库）；1b 事务状态基础（`TASK-20260915-workspace-transaction-foundation`）；原子目录原语（`TASK-20260915-atomic-dir-primitives`）；隔离区记录与撤销（`TASK-20260916-quarantine-records-undo`）。D4.3 / D4.5 已核对在 `core/managed_paths.py` 与 `core/usb_ops.py` 落地，不单独立项。
+
+   **收口裁决（2026-09-16 统筹）**：
+   - 候选区（D7.5 下放项）：物理位置为工作区内 `.fwasset/incomplete`（1b 受管根），`managed_path_reason` 返回 `incomplete_candidate`（1a）。**无 TTL、不做自动清理**——候选项只能由用户补齐提升或删除（D10.1c 可撤销）离开候选区；读写入口限定为子任务 5 的「补充文件」服务与 `scan_incomplete_imports`。
+   - 启动恢复顺序（D8.2 下放项）：先 `recover_interrupted_workspace` 收敛工作区状态（`recovery_required` 时阻写），再 `recover_on_startup` 处理隔离清单，最后用 `cleanup_staging_area` 清理 staging 残留会话；编排调用归子任务 8。
 2. **元数据与 schema**：`ChassisType` 真源与 `chassis_type` 生产链（D0.1、D0.1a）、`vendor` 与 `程序信息.toml` 读写、厂商名单（D6）、`schema_version` 提升与重扫引导（D6.4）。
 3. **准入与导入原语**：新路径准入（D3）、导入成形与边界防护（D7.1–D7.4）、目录层级规范（D0.2）。
 3a. **旧工作区布局迁移**：依赖子 TASK 1–3，将旧单型号根归入型号子目录（D9.3），完成路径引用、受管记录适配与全工作区对账；作为旧布局开放型号 CRUD 的前置。
@@ -764,17 +768,17 @@ scanner / USB 用 `should_exclude_managed_path`；软件修复用 `managed_path_
 
 ## Task DoD
 
-- [ ] D0 `platform` 语义裁决、`chassis_type` 生产链、目录层级与布局归一已定稿
-- [ ] D1 改类型/改范围复合操作 + 普通 update 落点矩阵 + 崩溃恢复已定稿
-- [ ] D2 型号/方案/程序创建、重命名、删除事务与撤销已定稿
-- [ ] D3 新路径准入校验已定稿
-- [ ] D4 `旧版本/` 落点、排除、借用与恢复已定稿
-- [ ] D5 机芯类型映射与存量归一已定稿
-- [ ] D6 厂商名单落点与资产字段已定稿
-- [ ] D7 导入与目录成形已定稿
-- [ ] D8 工作区读写锁、generation 与内部目录所有权已定稿
+- [x] D0 `platform` 语义裁决、`chassis_type` 生产链、目录层级与布局归一已定稿
+- [x] D1 改类型/改范围复合操作 + 普通 update 落点矩阵 + 崩溃恢复已定稿
+- [x] D2 型号/方案/程序创建、重命名、删除事务与撤销已定稿
+- [x] D3 新路径准入校验已定稿
+- [x] D4 `旧版本/` 落点、排除、借用与恢复已定稿
+- [x] D5 机芯类型映射与存量归一已定稿
+- [x] D6 厂商名单落点与资产字段已定稿
+- [x] D7 导入与目录成形已定稿
+- [x] D8 工作区读写锁、generation 与内部目录所有权已定稿
 - [x] D9 型号 CRUD、空工作区与空白型号规则已确认，旧布局迁移纳入子 TASK 3a
-- [ ] D10 撤销范围已定稿，原型与其任务文件已同步收窄
+- [x] D10 撤销范围已定稿，原型与其任务文件已同步收窄
 - [x] REVIEW-20260728 gate 状态已同步
 - [x] 实现子 TASK 拆分与顺序已列出
 - [x] 下放到实现子 TASK 的不变量已列出并明确归属

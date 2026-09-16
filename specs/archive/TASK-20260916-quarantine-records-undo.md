@@ -73,7 +73,3 @@ D4.3（`managed_path_reason` / `should_exclude_managed_path`）与 D4.5（USB `i
 3. 重复步骤 1 后，在原路径手工放一个同名目录再 `undo_delete` → 确认返回 `undo_conflict`，隔离内容仍在、未被删除。
 4. 重复步骤 1 后等待超过 5 秒调用 `sweep_expired` → 确认内容送入系统回收站、清单条目清除。
 5. 把工作区放在卷根（如 `X:\`）调用 `register_delete` → 确认返回 `trash_unavailable`，不回退跨卷复制。
-
-## 待决事项
-
-父规格第 1 项仍把 D4.3 / D4.5 列为未完成，实际已交付；本任务完成后由统筹一并收口该行，不单独立项。
