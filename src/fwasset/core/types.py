@@ -225,6 +225,8 @@ class FirmwareAsset(TypedDict):
     scheme_path: str  # 定制方案根目录绝对路径；通用区为 ""
     # --- 型号机芯类型（D0.1）：必填，legacy / 未识别留 "" ---
     chassis_type: ChassisType | Literal[""]
+    # --- 归属厂商（D6.2/D6.3）：必填，legacy / 元数据缺失留 "" ---
+    vendor: str
 
 
 # ---------------------------------------------------------------------------

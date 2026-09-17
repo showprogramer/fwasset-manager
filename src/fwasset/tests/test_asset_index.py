@@ -4,6 +4,7 @@ import pytest
 
 from fwasset.core.asset_index import (
     CONNECT_TIMEOUT_SEC,
+    FIRMWARE_ASSET_KEYS,
     SCHEMA_VERSION,
     AssetIndexError,
     active_workspace_root,
@@ -61,6 +62,7 @@ def make_asset(
         "scheme_name": scheme_name,
         "scheme_path": scheme_path,
         "chassis_type": "",
+        "vendor": "",
     }
 
 
@@ -71,6 +73,83 @@ def test_init_asset_index_creates_schema_and_version(tmp_path: Path):
 
     assert db_path.exists()
     assert schema_version(db_path) == SCHEMA_VERSION
+
+
+def test_firmware_asset_keys_includes_vendor_and_chassis_type():
+    """D6.4：vendor / chassis_type 均为必填键，缺键会被行级写入拒绝。"""
+    assert "vendor" in FIRMWARE_ASSET_KEYS
+    assert "chassis_type" in FIRMWARE_ASSET_KEYS
+
+
+def test_save_and_load_assets_roundtrip_vendor_and_chassis(tmp_path: Path):
+    """schema v4：vendor / chassis_type 两列 roundtrip，读路径直接读列。"""
+    db_path = tmp_path / "fwasset.db"
+    asset = make_asset(tmp_path)
+    asset["chassis_type"] = "单3D"
+    asset["vendor"] = "摩众"
+
+    save_assets([asset], str(tmp_path), db_path, scanned_at=1000.0)
+
+    loaded = load_assets(db_path)
+    assert loaded == [asset]
+    assert loaded[0]["chassis_type"] == "单3D"
+    assert loaded[0]["vendor"] == "摩众"
+
+
+def test_schema_version_three_requires_rescan_without_alter(tmp_path: Path):
+    """v3 库打开报「请重新扫描生成」且零 ALTER（D6.4 不匹配即要求重扫）。"""
+    db_path = tmp_path / "fwasset.db"
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO schema_meta(key, value) VALUES('schema_version', '3');
+            CREATE TABLE assets (
+                path TEXT PRIMARY KEY,
+                series TEXT NOT NULL,
+                model TEXT NOT NULL,
+                model_directory_name TEXT NOT NULL,
+                model_directory_path TEXT NOT NULL,
+                firmware_type TEXT NOT NULL,
+                firmware_label TEXT NOT NULL,
+                flash_mode TEXT NOT NULL,
+                usb_flow TEXT NOT NULL DEFAULT '',
+                version TEXT NOT NULL,
+                directory_name TEXT NOT NULL,
+                files_json TEXT NOT NULL,
+                modified_time REAL NOT NULL,
+                scanned_at REAL NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_path TEXT NOT NULL,
+                tool_dir TEXT NOT NULL,
+                label TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                platform TEXT NOT NULL DEFAULT '',
+                scheme_name TEXT NOT NULL DEFAULT '',
+                scheme_path TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+
+    with pytest.raises(AssetIndexError, match="重新扫描生成"):
+        init_asset_index(db_path)
+
+    # 零 ALTER：新列不得被补建，schema_meta 仍是 3
+    with sqlite3.connect(db_path) as conn:
+        columns = [
+            row[1] for row in conn.execute("PRAGMA table_info(assets)").fetchall()
+        ]
+        version = conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+    assert "chassis_type" not in columns
+    assert "vendor" not in columns
+    assert version == "3"
 
 
 def test_connect_asset_index_uses_extended_busy_timeout(
@@ -323,8 +402,8 @@ def test_schema_version_mismatch_raises_chinese_recovery_message(tmp_path: Path)
         init_asset_index(db_path)
 
 
-def test_schema_version_one_migrates_to_v3(tmp_path: Path):
-    """v1 database (no usb_flow, no category/platform/scheme) should auto-migrate to v3."""
+def test_schema_version_one_requires_rescan(tmp_path: Path):
+    """v1 库（无 usb_flow/category/platform/scheme）打开报「请重新扫描生成」。"""
     db_path = tmp_path / "fwasset.db"
     import sqlite3
 
@@ -358,22 +437,12 @@ def test_schema_version_one_migrates_to_v3(tmp_path: Path):
             """
         )
 
-    init_asset_index(db_path)
-
-    assert schema_version(db_path) == SCHEMA_VERSION
-    with sqlite3.connect(db_path) as conn:
-        columns = [
-            row[1] for row in conn.execute("PRAGMA table_info(assets)").fetchall()
-        ]
-    assert "usb_flow" in columns
-    assert "category" in columns
-    assert "platform" in columns
-    assert "scheme_name" in columns
-    assert "scheme_path" in columns
+    with pytest.raises(AssetIndexError, match="重新扫描生成"):
+        init_asset_index(db_path)
 
 
-def test_schema_version_two_migrates_to_v3(tmp_path: Path):
-    """v2 database (has usb_flow but no category/platform/scheme) should auto-migrate to v3."""
+def test_schema_version_two_requires_rescan(tmp_path: Path):
+    """v2 库（有 usb_flow、无 category/platform/scheme）打开报「请重新扫描生成」。"""
     db_path = tmp_path / "fwasset.db"
     import sqlite3
 
@@ -408,17 +477,97 @@ def test_schema_version_two_migrates_to_v3(tmp_path: Path):
             """
         )
 
-    init_asset_index(db_path)
+    with pytest.raises(AssetIndexError, match="重新扫描生成"):
+        init_asset_index(db_path)
 
+
+def _create_v3_index(db_path: Path) -> None:
+    """构造 v3 旧库（assets/scan_meta/schema_meta/hidden_items 齐全，无数据行）。"""
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO schema_meta(key, value) VALUES('schema_version', '3');
+            CREATE TABLE assets (
+                path TEXT PRIMARY KEY,
+                series TEXT NOT NULL,
+                model TEXT NOT NULL,
+                model_directory_name TEXT NOT NULL,
+                model_directory_path TEXT NOT NULL,
+                firmware_type TEXT NOT NULL,
+                firmware_label TEXT NOT NULL,
+                flash_mode TEXT NOT NULL,
+                usb_flow TEXT NOT NULL DEFAULT '',
+                version TEXT NOT NULL,
+                directory_name TEXT NOT NULL,
+                files_json TEXT NOT NULL,
+                modified_time REAL NOT NULL,
+                scanned_at REAL NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_path TEXT NOT NULL,
+                tool_dir TEXT NOT NULL,
+                label TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                platform TEXT NOT NULL DEFAULT '',
+                scheme_name TEXT NOT NULL DEFAULT '',
+                scheme_path TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE scan_meta (
+                root_dir TEXT PRIMARY KEY,
+                last_scan_at REAL NOT NULL,
+                schema_version INTEGER NOT NULL
+            );
+            CREATE TABLE hidden_items (
+                path TEXT PRIMARY KEY,
+                hide_type TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            """
+        )
+
+
+def test_save_assets_rebuilds_incompatible_index(tmp_path: Path):
+    """v3 旧库全量重扫：save_assets 自动重建缓存而非报「版本不兼容」。"""
+    import sqlite3
+
+    db_path = tmp_path / "fwasset.db"
+    _create_v3_index(db_path)
+
+    asset = make_asset(tmp_path)
+    save_assets([asset], str(tmp_path), db_path)
+
+    assert load_assets(db_path) == [asset]
     assert schema_version(db_path) == SCHEMA_VERSION
     with sqlite3.connect(db_path) as conn:
         columns = [
             row[1] for row in conn.execute("PRAGMA table_info(assets)").fetchall()
         ]
-    assert "category" in columns
-    assert "platform" in columns
-    assert "scheme_name" in columns
-    assert "scheme_path" in columns
+    assert "chassis_type" in columns
+    assert "vendor" in columns
+
+
+def test_save_assets_rebuild_keeps_hidden_items(tmp_path: Path):
+    """v3 旧库重建保留 hidden_items：用户隐藏状态不随缓存重建丢失。"""
+    import sqlite3
+
+    db_path = tmp_path / "fwasset.db"
+    _create_v3_index(db_path)
+
+    asset = make_asset(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO hidden_items(path, hide_type, created_at) VALUES(?, 'asset', 1.0)",
+            (asset["path"],),
+        )
+
+    save_assets([asset], str(tmp_path), db_path)
+
+    assert load_hidden_items(db_path) == {asset["path"]: "asset"}
 
 
 def test_query_assets_by_category_and_scheme(tmp_path: Path):

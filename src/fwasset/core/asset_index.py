@@ -19,7 +19,7 @@ from fwasset.core.settings import ASSET_INDEX_PATH
 from fwasset.core.sort_config import SortKey, apply_sort
 from fwasset.core.types import ChassisType, FirmwareAsset
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 HiddenItemType = Literal["model_directory", "firmware_type", "asset"]
 
 # FirmwareAsset 全键集合：行级写入前校验调用方传入完整资产（TypedDict 在
@@ -31,13 +31,13 @@ _ASSET_COLUMNS = (
     "path, series, model, model_directory_name, model_directory_path, "
     "firmware_type, firmware_label, flash_mode, usb_flow, version, directory_name, "
     "files_json, modified_time, scanned_at, tool_name, tool_path, tool_dir, label, "
-    "category, platform, scheme_name, scheme_path"
+    "category, platform, scheme_name, scheme_path, chassis_type, vendor"
 )
 _ASSET_BINDINGS = (
     ":path, :series, :model, :model_directory_name, :model_directory_path, "
     ":firmware_type, :firmware_label, :flash_mode, :usb_flow, :version, :directory_name, "
     ":files_json, :modified_time, :scanned_at, :tool_name, :tool_path, :tool_dir, :label, "
-    ":category, :platform, :scheme_name, :scheme_path"
+    ":category, :platform, :scheme_name, :scheme_path, :chassis_type, :vendor"
 )
 _INSERT_ASSET_SQL = (
     f"INSERT INTO assets ({_ASSET_COLUMNS}) VALUES ({_ASSET_BINDINGS})"
@@ -123,7 +123,9 @@ def init_asset_index(path: str | Path | None = None) -> None:
                     category TEXT NOT NULL DEFAULT '',
                     platform TEXT NOT NULL DEFAULT '',
                     scheme_name TEXT NOT NULL DEFAULT '',
-                    scheme_path TEXT NOT NULL DEFAULT ''
+                    scheme_path TEXT NOT NULL DEFAULT '',
+                    chassis_type TEXT NOT NULL DEFAULT '',
+                    vendor TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_assets_type ON assets(firmware_type);
                 CREATE INDEX IF NOT EXISTS idx_assets_model ON assets(model);
@@ -210,6 +212,20 @@ def schema_version(path: str | Path | None = None) -> int:
         return int(row["value"])
 
 
+def _rebuild_incompatible_index(path: str | Path | None) -> None:
+    # 版本不兼容的全量重扫：真源是目录树 + TOML，缓存可整体重建。
+    # 只重建 assets / scan_meta / schema_meta；hidden_items 是用户隐藏状态，原样保留。
+    with connect_asset_index(path) as conn:
+        conn.executescript(
+            """
+            DROP TABLE IF EXISTS assets;
+            DROP TABLE IF EXISTS scan_meta;
+            DROP TABLE IF EXISTS schema_meta;
+            """
+        )
+    init_asset_index(path)
+
+
 def save_assets(
     assets: Iterable[FirmwareAsset],
     root_dir: str,
@@ -223,7 +239,10 @@ def save_assets(
       「多行 scan_meta + 单表 assets」被误读成多根并存。
     - 换根再次扫描会丢弃上一工作区的资产与 meta，这是切换工作区，不是 bug。
     """
-    init_asset_index(path)
+    try:
+        init_asset_index(path)
+    except AssetIndexError:
+        _rebuild_incompatible_index(path)
     now = float(scanned_at if scanned_at is not None else time.time())
     asset_rows = [_asset_to_row(asset, now) for asset in assets]
     with connect_asset_index(path) as conn:
@@ -800,6 +819,8 @@ def _asset_to_row(asset: FirmwareAsset, scanned_at: float) -> dict[str, object]:
         "platform": str(asset.get("platform", "")),
         "scheme_name": str(asset.get("scheme_name", "")),
         "scheme_path": str(asset.get("scheme_path", "")),
+        "chassis_type": str(asset.get("chassis_type", "")),
+        "vendor": str(asset.get("vendor", "")),
     }
 
 
@@ -836,10 +857,10 @@ def _row_to_asset(row: sqlite3.Row) -> FirmwareAsset:
         "platform": str(row["platform"]) if "platform" in keys else "",
         "scheme_name": str(row["scheme_name"]) if "scheme_name" in keys else "",
         "scheme_path": str(row["scheme_path"]) if "scheme_path" in keys else "",
-        # chassis_type（D0.1）尚未进索引列（D6.4 与 vendor 同批提升 schema_version，
-        # 本片零 schema 变化）：读路径按 FirmwareAsset 契约补 ""，与扫描快照字段级一致。
+        # chassis_type / vendor（D0.1 / D6，schema v4 起进索引列）直接读列。
         "chassis_type": cast(
             "ChassisType | Literal['']",
-            str(row["chassis_type"]) if "chassis_type" in keys else "",
+            str(row["chassis_type"]),
         ),
+        "vendor": str(row["vendor"]),
     }

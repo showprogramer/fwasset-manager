@@ -58,6 +58,8 @@ def make_asset(
         "platform": "",
         "scheme_name": "",
         "scheme_path": "",
+        "chassis_type": "",
+        "vendor": "",
     }
 
 
@@ -105,6 +107,7 @@ def _make_asset(
         "scheme_name": "",
         "scheme_path": "",
         "chassis_type": "",
+        "vendor": "",
     }
 
 
@@ -150,6 +153,7 @@ def _asset(path: Path, label: str = "快捷键程序") -> FirmwareAsset:
         scheme_name="",
         scheme_path="",
         chassis_type="",
+        vendor="",
     )
 
 

@@ -637,10 +637,17 @@ def test_model_dropdown_always_present_with_all_models(qapp) -> None:
     assert combos[0].count() == 6
 
 
-def test_model_switch_is_debounced_and_prefix_safe(qapp) -> None:
+def test_model_switch_is_debounced_and_prefix_safe(
+    qapp, tmp_path, monkeypatch
+) -> None:
     """切型号经防抖确认：键入途中命中前缀型号（L36 是 L36双机芯-… 的前缀）
     会被后续输入覆盖，最终只切到用户真正选中的型号。"""
     from fwasset.ui_qt.workbench_window import WorkbenchInterface
+
+    # 隔离默认索引库：bind(None) 会解析到本机真实 .runtime/fwasset.db
+    monkeypatch.setattr(
+        "fwasset.core.asset_index.ASSET_INDEX_PATH", tmp_path / "fwasset.db"
+    )
 
     w = WorkbenchInterface()
     w.current_selection.model_name = "M8"

@@ -5,7 +5,7 @@
 | 项 | 状态 |
 | --- | --- |
 | 类型 | 写语义定稿（规则决策，不改产品代码） |
-| 当前状态 | 规则已定稿；实现子任务 1（公共事务基础）已完成，2–8 待实施 |
+| 当前状态 | 规则已定稿；实现子任务 1（公共事务基础）、2（元数据与 schema）已完成，3–8 待实施 |
 | 前置 | ✅ R5 路径守卫、✅ R1/R10 写入门闩、✅ R3 索引行级写、✅ R8 引用反查与级联 |
 | 父任务 | CRUD 准入（`docs/code-review/REVIEW-20260728-pre-crud-readiness.md`） |
 | 分支 | `feature/pyside6-migration` |
@@ -721,6 +721,8 @@ scanner / USB 用 `should_exclude_managed_path`；软件修复用 `managed_path_
    - 候选区（D7.5 下放项）：物理位置为工作区内 `.fwasset/incomplete`（1b 受管根），`managed_path_reason` 返回 `incomplete_candidate`（1a）。**无 TTL、不做自动清理**——候选项只能由用户补齐提升或删除（D10.1c 可撤销）离开候选区；读写入口限定为子任务 5 的「补充文件」服务与 `scan_incomplete_imports`。
    - 启动恢复顺序（D8.2 下放项）：先 `recover_interrupted_workspace` 收敛工作区状态（`recovery_required` 时阻写），再 `recover_on_startup` 处理隔离清单，最后用 `cleanup_staging_area` 清理 staging 残留会话；编排调用归子任务 8。
 2. **元数据与 schema**：`ChassisType` 真源与 `chassis_type` 生产链（D0.1、D0.1a）、`vendor` 与 `程序信息.toml` 读写、厂商名单（D6）、`schema_version` 提升与重扫引导（D6.4）。
+
+   **已完成（2026-09-17 统筹收口）**，切片：`chassis_type` 生产链（`a380695`）；vendor 元数据生产链与索引 schema v4（`TASK-20260917-vendor-metadata-schema`，人工验证通过）。全量重扫遇旧版本库自动重建缓存并保留隐藏项（`hidden_items`）；厂商名单写入口与 `vendor` 查询消费归子任务 8。
 3. **准入与导入原语**：新路径准入（D3）、导入成形与边界防护（D7.1–D7.4）、目录层级规范（D0.2）。
 3a. **旧工作区布局迁移**：依赖子 TASK 1–3，将旧单型号根归入型号子目录（D9.3），完成路径引用、受管记录适配与全工作区对账；作为旧布局开放型号 CRUD 的前置。
 4. **型号/方案 CRUD**：创建、重命名、删除与事务回滚（D2）、空白型号显示、最后一个型号删除及撤销、零型号工作区新增（D9）、机芯类型写入（D5.1–D5.3）；旧布局入口接入子 TASK 3a。

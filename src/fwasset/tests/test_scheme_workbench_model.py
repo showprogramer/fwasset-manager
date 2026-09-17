@@ -936,6 +936,7 @@ def _make_asset(
         "scheme_name": scheme_name,
         "scheme_path": "",
         "chassis_type": "",
+        "vendor": "",
     }
 
 
@@ -1483,6 +1484,7 @@ def _asset(path: Path, *, model_root: Path, model_name: str) -> FirmwareAsset:
         "scheme_name": "",
         "scheme_path": "",
         "chassis_type": "",
+        "vendor": "",
     }
 
 
@@ -1740,7 +1742,7 @@ def test_load_model_ids_skips_mapping_on_out_of_workspace(tmp_path: Path):
     other = tmp_path.parent / f"{tmp_path.name}_外"
     other.mkdir(exist_ok=True)
     model = SchemeWorkbenchModel()
-    model.bind(None, root, other)  # 配置根与扫描根不同
+    model.bind(tmp_path / "index.db", root, other)  # 配置根与扫描根不同
     model._load_model_ids()
     # 门闩拒绝：不建立映射
     assert model._model_id_by_dir == {}

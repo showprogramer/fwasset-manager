@@ -4,12 +4,19 @@ import threading
 from pathlib import Path
 from typing import Literal, cast, get_args
 
+from fwasset.core.asset_info import (
+    load_asset_info_with_status,
+    vendor_from_asset_info,
+)
 from fwasset.core.firmware_catalog import (
     DEFAULT_FIRMWARE_CATALOG_PATH,
     FirmwareTypeConfig,
     enabled_firmware_types,
 )
-from fwasset.core.managed_paths import should_exclude_managed_path
+from fwasset.core.managed_paths import (
+    ASSET_METADATA_FILENAME,
+    should_exclude_managed_path,
+)
 from fwasset.core.path_guard import assert_within_workspace
 from fwasset.core.platform_config import (
     PLATFORM_CONFIG_FILENAME,
@@ -253,6 +260,29 @@ def _chassis_type_for_model_root(
     return "", None
 
 
+def _vendor_for_asset_dir(
+    asset_dir: Path,
+) -> tuple[str, ScanIssue | None]:
+    """资产目录 → (厂商, warning 级 issue)。读取目录内 `程序信息.toml`（D6.2）。
+
+    - ``ok`` 且 vendor 为非空 str → 该值；``missing`` / 值缺失 → ``""`` 无 issue；
+    - ``parse_error`` / ``parser_missing`` → ``""`` 且产生 warning 级
+      :class:`ScanIssue`（不阻断索引对账），``path`` 记 `程序信息.toml`
+      完整路径。
+    """
+    data, status, error = load_asset_info_with_status(asset_dir)
+    if status in ("parse_error", "parser_missing"):
+        detail = error or status
+        return "", {
+            "severity": "warning",
+            "message": f"程序信息读取失败（{status}），厂商留空：{detail}",
+            "path": str(asset_dir / ASSET_METADATA_FILENAME),
+        }
+    if status == "ok":
+        return vendor_from_asset_info(data), None
+    return "", None
+
+
 def scan_firmware_assets(
     root: str,
     catalog_path: str | Path | None = None,
@@ -340,6 +370,9 @@ def _scan_assets(
     model_roots = enumerate_model_roots(root_path)
     chassis_cache: dict[str, tuple[ChassisType | Literal[""], ScanIssue | None]] = {}
     chassis_issues: dict[str, ScanIssue] = {}
+    # 程序信息.toml 按资产目录一对一（D6.2），os.walk 每目录只到一次，
+    # 天然每资产单次读盘、每资产至多一条 warning。
+    vendor_issues: dict[str, ScanIssue] = {}
 
     def _chassis_for_folder(folder: Path) -> ChassisType | Literal[""]:
         owner = owner_model_root_for(folder, model_roots)
@@ -389,6 +422,10 @@ def _scan_assets(
         files = _visible_asset_files(dirpath, filenames, root_path)
         label = f"{model}  {version or '-'}  [{folder_path.name}]  {cfg['label']}"
         chassis_type = _chassis_for_folder(folder_path)
+        vendor, vendor_issue = _vendor_for_asset_dir(folder_path)
+        if vendor_issue is not None:
+            # 同一资产目录的损坏文件只告警一次（诊断对象是文件本身）
+            vendor_issues[str(folder_path)] = vendor_issue
 
         # --- 推断 category / platform / scheme ---
         category, platform, scheme_name, scheme_path = _infer_asset_context(
@@ -422,12 +459,14 @@ def _scan_assets(
                 "scheme_name": scheme_name,
                 "scheme_path": scheme_path,
                 "chassis_type": chassis_type,
+                "vendor": vendor,
             }
         )
 
     results.sort(key=lambda item: (item["path"], item["firmware_type"]))
-    # chassis 警告按型号根去重后统一追加（排序保证全量/子树诊断确定性）
+    # chassis / vendor 警告按各自去重键排序后统一追加（保证全量/子树诊断确定性）
     issues.extend(chassis_issues[key] for key in sorted(chassis_issues))
+    issues.extend(vendor_issues[key] for key in sorted(vendor_issues))
     return results, issues
 
 

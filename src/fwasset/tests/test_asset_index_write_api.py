@@ -60,6 +60,7 @@ def make_asset(
         "scheme_name": "",
         "scheme_path": "",
         "chassis_type": "",
+        "vendor": "",
     }
 
 

@@ -140,11 +140,47 @@ def _resolve_path(value: object, default: str = "") -> str:
 _cfg, CONFIG_LOAD_STATUS, CONFIG_LOAD_ERROR = load_toml_config(CONFIG_PATH)
 CONFIG_LOAD_SOURCE = str(CONFIG_PATH)
 
+# 归属厂商候选名单缺省值（D6.1）：设置页可追加，config.toml 顶层 `vendors` 覆盖。
+DEFAULT_VENDORS: list[str] = ["摩众", "国瑞", "亿微", "明锐"]
+
 DEFAULT_ROOT = str(_cfg_get(_cfg, "paths", "root_dir", _DEFAULTS["paths"]["root_dir"]))
 TOOL_ROOT = _resolve_path(
     _cfg_get(_cfg, "paths", "tool_root", _DEFAULTS["paths"]["tool_root"]),
     _DEFAULTS["paths"]["tool_root"],
 )
+
+
+def normalize_vendor_list(values: list[str]) -> list[str]:
+    """厂商名单规范化（D6.1）：trim 后非空 + casefold 去重保留首次展示大小写。"""
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        text = str(raw).strip()
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def load_vendor_candidates() -> list[str]:
+    """读取 config.toml 顶层 ``vendors`` 名单（D6.1）。
+
+    - 键缺失 / 非列表 / 含非字符串项 / 配置损坏 → 回退缺省名单，**不写盘**；
+    - 显式空列表按原样返回空（用户可清空候选）；
+    - 名单增删写入口归设置页（子任务 8），本函数只读。
+    """
+    if CONFIG_LOAD_STATUS != "ok":
+        return list(DEFAULT_VENDORS)
+    raw = _cfg.get("vendors")
+    if not isinstance(raw, list):
+        return list(DEFAULT_VENDORS)
+    if any(not isinstance(item, str) for item in raw):
+        return list(DEFAULT_VENDORS)
+    return normalize_vendor_list(raw)
 
 # USB 扫描常量（硬编码，不再从用户配置读取）
 SCAN_ROM_EXTENSIONS: list[str] = [".rom"]
