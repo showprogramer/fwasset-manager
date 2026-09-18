@@ -55,6 +55,10 @@ from fwasset.core.reference_lookup import (
     check_reference_gate,
     is_blocking_issue,
 )
+from fwasset.core.scheme_config import (
+    SCHEME_CONFIG_FILENAME,
+    serialize_scheme_config,
+)
 from fwasset.core.shared_module_resolver import resolve_shared_module
 from fwasset.core.types import RewriteRequest, ServiceResult
 
@@ -99,6 +103,14 @@ class RewritePlan:
 
 
 _PLAN_SALT = secrets.token_hex(16)
+
+#: 计划条目类型 → 期望文件名（D3 修订：新增 scheme_config，由 dict 查表
+#: 取代原先的二选一三元表达式，_validate_plan_for_apply 与 build 侧共用）。
+_PLAN_ENTRY_FILENAMES: dict[str, str] = {
+    "model_config": MODEL_CONFIG_FILENAME,
+    "platform_config": PLATFORM_CONFIG_FILENAME,
+    "scheme_config": SCHEME_CONFIG_FILENAME,
+}
 
 
 def _plan_token(plan: RewritePlan) -> str:
@@ -694,6 +706,29 @@ def _assemble_plan(
                 changes=[c[5] for c in bucket["changes"]],
             )
         )
+
+    # 方案自身 方案配置.toml 的 name 字段随改名同步（统筹裁决：R8 内部扩展，
+    # 见规格「对 reference_service 的改动」）——只在方案改名时生成，型号
+    # 改名没有独立于目录名之外的「显示名」字段（own_moved 已覆盖型号侧）。
+    if is_rename and request.target_kind == "scheme":
+        pre_path = old_path / SCHEME_CONFIG_FILENAME
+        post_path = new_path / SCHEME_CONFIG_FILENAME
+        original_bytes = pre_path.read_bytes() if pre_path.exists() else None
+        new_content = serialize_scheme_config(new_path.name)
+        plan.files.append(
+            FileRewrite(
+                kind="scheme_config",
+                pre_path=pre_path,
+                post_path=post_path,
+                owner_root=str(old_path),
+                original_bytes=original_bytes,
+                original_sha256=_sha256(original_bytes) if original_bytes is not None else "",
+                new_content=new_content,
+                new_sha256=_sha256(new_content.encode("utf-8")),
+                changes=[f"name: {old_path.name} → {new_path.name}"],
+            )
+        )
+
     plan.token = _plan_token(plan)
     return plan
 
@@ -748,14 +783,12 @@ def _validate_plan_for_apply(plan: RewritePlan) -> ServiceResult | None:
     if not ws:
         return _error_result("invalid_plan", "计划缺少工作区根")
     for item in plan.files:
-        if item.kind not in ("model_config", "platform_config"):
+        expected_name = _PLAN_ENTRY_FILENAMES.get(item.kind)
+        if expected_name is None:
             return _error_result(
                 "invalid_plan", f"未知计划条目类型：{item.kind}",
                 payload={"path": str(item.pre_path)},
             )
-        expected_name = (
-            MODEL_CONFIG_FILENAME if item.kind == "model_config" else PLATFORM_CONFIG_FILENAME
-        )
         for label, p in (("pre", item.pre_path), ("post", item.post_path)):
             if p.name != expected_name:
                 return _error_result(

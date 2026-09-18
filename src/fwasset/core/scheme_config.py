@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from fwasset.core.config_io import atomic_write_text
+
 try:
     import tomllib
 except ImportError:
@@ -13,6 +15,35 @@ except ImportError:
 
 _CUSTOM_DIR_NAME = "定制"
 _SCHEME_CONFIG_FILENAME = "方案配置.toml"
+SCHEME_CONFIG_FILENAME = _SCHEME_CONFIG_FILENAME
+
+_SCHEME_CONFIG_HEADER = "# 本文件由 fwasset 管理（方案名）。用户无需手写。\n"
+
+
+def _toml_str(value: str) -> str:
+    """Serialize a string as a TOML basic string (quotes/backslash escaped)."""
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def serialize_scheme_config(name: str) -> str:
+    """方案配置规范格式序列化：固定文件头 + ``name`` 字段（R8 级联改写计划用）。
+
+    风格对齐 ``model_config._serialize_model_config``：固定文件头注释 +
+    单行内容。不写 ``platform`` 字段（D2.2/D5.3）。
+    """
+    return f"{_SCHEME_CONFIG_HEADER}\nname = {_toml_str(name)}\n"
+
+
+def save_scheme_config(scheme_root: Path, name: str) -> Path:
+    """把方案配置整体重写为 ``name = "..."``（应用托管该文件）。
+
+    经同目录临时文件 + ``os.replace`` 原子落盘；供 D2.2 新建方案与
+    D2.3 方案改名的 R8 计划落地复用。返回写入的文件路径。
+    """
+    toml_path = Path(scheme_root) / _SCHEME_CONFIG_FILENAME
+    atomic_write_text(toml_path, serialize_scheme_config(name))
+    return toml_path
 
 
 @dataclass

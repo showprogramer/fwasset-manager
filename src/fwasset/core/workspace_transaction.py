@@ -578,7 +578,17 @@ class WorkspaceTransaction:
         self.status = WorkspaceStatus("operation_in_progress", generation, self._operation)
 
     def commit(self) -> None:
-        """结束 seqlock，并仅在成功路径清除操作日志。"""
+        """结束 seqlock，并仅在成功路径清除操作日志。
+
+        未调用 ``begin_product_write()``（或已调用但调用方已自行确认本次
+        操作确实零产物）时的空提交是**受支持的正常退出路径**：把 generation
+        收敛为偶数、状态写回 ``clean``、清空操作日志——不要求本次事务真的
+        改动过磁盘。子任务 4（型号/方案 CRUD）的多处失败分支依赖这条契约：
+        锁内重验失败（未 ``begin_product_write``，见 MSC-001）、撤销流程里
+        ``UndoConflictError`` 与 ``ManifestError`` 分支（已 ``begin_product_write``
+        但调用方已确认未发生任何磁盘写入，见 MSC-005/MSC-008）——只要调用方
+        能确认磁盘状态已经稳定，就可以安全提交，不必回退到 ``recovery_required``。
+        """
         if not self._entered or self._committed:
             raise WorkspaceTransactionError("事务尚未开始或已经完成")
         generation = self.status.generation

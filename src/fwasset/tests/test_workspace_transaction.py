@@ -464,6 +464,34 @@ def test_record_product_rejects_paths_outside_workspace(tmp_path) -> None:
         assert transaction.products == ()
 
 
+def test_commit_without_product_write_is_a_safe_empty_commit(tmp_path) -> None:
+    """MSC-007：从未 begin_product_write 的空提交收敛为 clean 且 generation 保持偶数。"""
+    with WorkspaceTransaction(tmp_path, operation="noop") as transaction:
+        assert transaction.status.generation % 2 == 0
+        transaction.commit()
+
+    status = load_workspace_status(tmp_path)
+    assert status.state == "clean"
+    assert status.generation % 2 == 0
+    assert status.operation is None
+
+
+def test_commit_after_confirmed_zero_product_write_still_converges_to_even(
+    tmp_path,
+) -> None:
+    """MSC-007：已 begin_product_write 但确认零产物时，commit 仍收敛为偶数 + clean。"""
+    with WorkspaceTransaction(tmp_path, operation="noop") as transaction:
+        transaction.begin_product_write()
+        assert transaction.status.generation % 2 == 1
+        assert transaction.products == ()
+        transaction.commit()
+
+    status = load_workspace_status(tmp_path)
+    assert status.state == "clean"
+    assert status.generation % 2 == 0
+    assert status.operation is None
+
+
 def test_workspace_lock_is_held_reflects_lock_state(tmp_path) -> None:
     assert not workspace_lock_is_held(tmp_path)
     with WorkspaceLock(tmp_path):
