@@ -143,6 +143,27 @@ def _match_catalog_type(
     return None
 
 
+def classify_staged_content(
+    target_dir: str | Path,
+    filenames: list[str],
+    catalog_path: str | Path | None = None,
+) -> FirmwareTypeConfig | None:
+    """按 catalog 判定一批文件名在 ``target_dir`` 语境下是否构成完整程序（D7.5 A1）。
+
+    ``target_dir`` 不要求已存在——``_match_catalog_type`` 只按路径文本做
+    ``dir_keywords`` 匹配（模块名段），不读盘；``filenames`` 是调用方自行
+    汇总的候选文件名清单（如 staging 会话或候选目录内容）。命中某个 catalog
+    条目即完整（``handcontrol_ui`` 天然要求同时有 ``.rom`` 与 ``.pkg``，
+    这条硬约束已在 ``_match_catalog_type`` 内，不需要调用方另判）；未命中
+    任何条目即不完整。服务层据此判据分流「新增程序」与「待补齐候选区」，
+    不得直接调用私有 ``_match_catalog_type``。
+    """
+    type_configs = enabled_firmware_types(
+        Path(catalog_path) if catalog_path else DEFAULT_FIRMWARE_CATALOG_PATH
+    )
+    return _match_catalog_type(str(target_dir), filenames, type_configs)
+
+
 def _extract_model_version(dirpath: str, filenames: list[str]) -> tuple[str, str]:
     for name in filenames:
         model, version = parse_rom_filename(name)
