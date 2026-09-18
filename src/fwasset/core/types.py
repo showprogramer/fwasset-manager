@@ -132,6 +132,13 @@ class QuarantineRecord(TypedDict):
     ``manifest`` 复用 :func:`fwasset.core.manifest.directory_manifest_hash`
     （不含 mtime）；``expires_at`` 仅 ``undoable_delete`` 有意义，
     ``transactional_retire`` 恒为 0（不展示、不承诺撤销）。
+
+    ``removed_containers``（父规格 D10.1b）记录本次删除时**由应用自动
+    ``rmdir`` 掉的空父容器**，自外向内排列（先祖在前），撤销时按逆序重建
+    后才能把内容移回。只登记应用自己删掉的目录——不能在撤销时按
+    ``original_path`` 逆推并无条件 ``mkdir``，那样分不清「本次删掉的空容器」
+    与「用户此前就手工删掉的目录」，会凭空造出用户没要的容器。旧记录缺该
+    键读为 ``[]``，撤销时不重建任何容器（与扩字段前行为一致）。
     """
 
     id: str
@@ -143,6 +150,7 @@ class QuarantineRecord(TypedDict):
     status: QuarantineStatus
     created_at: float
     expires_at: float
+    removed_containers: list[str]
 
 
 class ServiceResult(TypedDict):

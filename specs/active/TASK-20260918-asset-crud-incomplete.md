@@ -283,15 +283,13 @@ D10.1c 明文：incomplete **不是** `FirmwareAsset`，不能调 `find_referenc
 - `create_asset` 提升成功、索引之前中断 → `recovery_required`，磁盘侧资产完整，补一次对账后收敛；
 - `delete_asset` 隔离登记成功、容器 `rmdir` 之前中断 → 资产已移走，容器残留，状态 `recovery_required`，撤销仍可用。
 
-## 待裁决问题
+## 已裁决问题（2026-09-18 用户确认）
 
-**Q1（低）**：补齐完成后 `import_state` 是**删除该键**还是**置 `complete`**？
-倾向**删除键**——「候选项只能由补齐提升或删除离开候选区」（父规格第 733 行），置 `complete` 会让候选区出现一个既不是 incomplete 也没离开的中间态，`scan_incomplete_imports` 还得多认一种值。删除键则语义干净：有 `import_state` 就是待补齐，没有就是普通程序信息。
-**若无异议按删除键实现。**
+**Q1**：补齐完成后 `import_state` **删除该键**，不置 `complete`。
+理由：「候选项只能由补齐提升或删除离开候选区」（父规格第 733 行），置 `complete` 会让候选区出现既不是 incomplete 也没离开的中间态，`scan_incomplete_imports` 还得多认一种值。删除键语义干净——**有 `import_state` 就是待补齐，没有就是普通程序信息**。`intended_firmware_type` 同时删除（它只服务于候选期的类型提示）。
 
-**Q2（低）**：`create_asset` 的 `asset_name` 是用户输入还是从来源推导？
-倾向**用户输入必填**——来源可能是散选文件（没有目录名可用）、或 zip 内层目录名不可控。UI 上给个从来源推导的默认值即可（子任务 8）。
-**若无异议按必填实现。**
+**Q2**：`create_asset` 的 `asset_name` **由用户输入，必填**。
+理由：来源可能是散选文件（没有目录名可用）或 zip 内层目录名不可控。服务层空串即 `invalid_name` 拒绝，不做任何来源推导兜底；UI 上给一个从来源推导的默认值供用户修改（子任务 8）。
 
 ## DoD
 

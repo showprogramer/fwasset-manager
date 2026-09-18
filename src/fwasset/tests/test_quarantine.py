@@ -869,3 +869,146 @@ def test_workspace_lock_allows_a_different_thread_to_wait_and_acquire(tmp_path) 
 
     assert thread_b_saw_lock_from_inside[0] is True
     assert not workspace_lock_is_held(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# D10.1b：removed_containers —— 删除最后一个变体后撤销需重建模块容器
+# ---------------------------------------------------------------------------
+
+
+def _locked_register_delete_with_containers(
+    workspace_root: Path, source: Path, containers
+):
+    with WorkspaceLock(workspace_root):
+        return register_delete(
+            workspace_root, source, removed_containers=containers
+        )
+
+
+def test_removed_containers_rebuilt_before_restore(tmp_path) -> None:
+    """D10.1b：登记的空模块容器在撤销时先重建，内容才能移回原位。"""
+    _init_workspace(tmp_path)
+    container = tmp_path / "通用" / "主板程序"
+    container.mkdir(parents=True)
+    asset = _make_asset(container, "v1")
+
+    record = _locked_register_delete_with_containers(
+        tmp_path, asset, [str(tmp_path / "通用"), str(container)]
+    )
+    # 模拟 delete_asset 步骤 7：移走资产后自动 rmdir 空容器（自内向外）。
+    container.rmdir()
+    (tmp_path / "通用").rmdir()
+    assert not container.exists()
+
+    restored = _locked_undo_delete(tmp_path, record["id"])
+
+    assert restored["removed_containers"] == [
+        str(tmp_path / "通用"),
+        str(container),
+    ]
+    assert container.is_dir()
+    assert (asset / "file.bin").read_bytes() == b"payload"
+
+
+def test_removed_containers_absent_keeps_previous_behaviour(tmp_path) -> None:
+    """不带容器的记录撤销行为不变（扩字段前后一致）。"""
+    _init_workspace(tmp_path)
+    asset = _make_asset(tmp_path)
+
+    record = _locked_register_delete(tmp_path, asset)
+    assert record["removed_containers"] == []
+
+    restored = _locked_undo_delete(tmp_path, record["id"])
+
+    assert restored["removed_containers"] == []
+    assert (asset / "file.bin").read_bytes() == b"payload"
+
+
+def test_existing_container_is_not_recreated_and_restore_succeeds(tmp_path) -> None:
+    """容器已被重新建出来（用户或并发操作）→ 视为满足前置，不报错。"""
+    _init_workspace(tmp_path)
+    container = tmp_path / "通用" / "主板程序"
+    container.mkdir(parents=True)
+    asset = _make_asset(container, "v1")
+
+    record = _locked_register_delete_with_containers(tmp_path, asset, [str(container)])
+    # 容器没有被删掉（调用方登记了但实际保留），撤销仍应成功。
+    assert container.is_dir()
+
+    _locked_undo_delete(tmp_path, record["id"])
+
+    assert (asset / "file.bin").read_bytes() == b"payload"
+
+
+def test_container_blocked_by_file_returns_undo_conflict(tmp_path) -> None:
+    """待重建容器被同名文件占住 → undo_conflict，隔离内容保留。"""
+    _init_workspace(tmp_path)
+    container = tmp_path / "通用" / "主板程序"
+    container.mkdir(parents=True)
+    asset = _make_asset(container, "v1")
+
+    record = _locked_register_delete_with_containers(tmp_path, asset, [str(container)])
+    container.rmdir()
+    container.write_text("占位文件", encoding="utf-8")
+
+    with pytest.raises(UndoConflictError):
+        _locked_undo_delete(tmp_path, record["id"])
+
+    assert Path(record["quarantine_path"]).is_dir()
+    assert len(load_quarantine_manifest(tmp_path)) == 1
+
+
+def test_removed_containers_outside_workspace_rejected(tmp_path) -> None:
+    """记录里的容器路径是自报内容，越界一律拒绝，不在工作区外建目录。"""
+    _init_workspace(tmp_path)
+    asset = _make_asset(tmp_path)
+    outside = tmp_path.parent / "外部容器"
+
+    record = _locked_register_delete_with_containers(tmp_path, asset, [str(outside)])
+
+    with pytest.raises(QuarantineError):
+        _locked_undo_delete(tmp_path, record["id"])
+
+    assert not outside.exists()
+    assert Path(record["quarantine_path"]).is_dir()
+
+
+def test_corrupt_removed_containers_field_degrades_to_empty(tmp_path) -> None:
+    """removed_containers 字段损坏 → 降级为 []，不阻断整份清单读取。"""
+    _init_workspace(tmp_path)
+    manifest_path = (
+        managed_root(tmp_path, "workspace_state") / "quarantine-manifest.json"
+    )
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "records": [
+                    {
+                        "id": "r1",
+                        "kind": "undoable_delete",
+                        "workspace_root": str(tmp_path),
+                        "original_path": str(tmp_path / "a"),
+                        "quarantine_path": str(tmp_path / "q"),
+                        "manifest": "h",
+                        "removed_containers": "不是列表",
+                    },
+                    {
+                        "id": "r2",
+                        "kind": "undoable_delete",
+                        "workspace_root": str(tmp_path),
+                        "original_path": str(tmp_path / "b"),
+                        "quarantine_path": str(tmp_path / "q2"),
+                        "manifest": "h",
+                        "removed_containers": ["ok", 123],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    records = load_quarantine_manifest(tmp_path)
+
+    assert len(records) == 2
+    assert records[0]["removed_containers"] == []
+    assert records[1]["removed_containers"] == []

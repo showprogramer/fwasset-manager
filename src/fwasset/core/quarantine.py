@@ -36,6 +36,7 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +139,16 @@ def _read_record(raw: dict[str, Any]) -> QuarantineRecord | None:
     expires_at = raw.get("expires_at", 0.0)
     if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
         expires_at = 0.0
+    # D10.1b：旧记录缺该键读为 []（撤销时不重建容器，与扩字段前行为一致）；
+    # 非 list 或含非字符串元素一律降级为 []，与本函数「损坏字段降级、不阻断
+    # 整份清单」的既有口径一致。
+    raw_containers = raw.get("removed_containers", [])
+    if isinstance(raw_containers, list) and all(
+        isinstance(item, str) for item in raw_containers
+    ):
+        removed_containers = [str(item) for item in raw_containers]
+    else:
+        removed_containers = []
     return {
         "id": record_id,
         "kind": kind,
@@ -148,6 +159,7 @@ def _read_record(raw: dict[str, Any]) -> QuarantineRecord | None:
         "status": status,
         "created_at": float(created_at),
         "expires_at": float(expires_at),
+        "removed_containers": removed_containers,
     }
 
 
@@ -300,6 +312,7 @@ def _register(
     *,
     kind: str,
     expires_at: float,
+    removed_containers: Sequence[str | Path] = (),
 ) -> QuarantineRecord:
     """两阶段登记：持续持有调用方的锁，先落盘 ``moving`` 记录，再移动内容，
     最后转正为终态——整个过程是**单一连续锁区间**，不在中途放锁再重新
@@ -329,6 +342,7 @@ def _register(
         "status": "moving",
         "created_at": now,
         "expires_at": expires_at if expires_at == 0.0 else now + expires_at,
+        "removed_containers": [str(item) for item in removed_containers],
     }
     records = load_quarantine_manifest(workspace_root)
     records.append(record)
@@ -343,14 +357,25 @@ def _register(
 
 
 def register_delete(
-    workspace_root: str | Path, source: str | Path
+    workspace_root: str | Path,
+    source: str | Path,
+    *,
+    removed_containers: Sequence[str | Path] = (),
 ) -> QuarantineRecord:
     """登记一条 ``undoable_delete``：先落盘记录，再移入隔离区，保留撤销窗口。
 
     调用方须已持有工作区写锁（未持锁调用直接拒绝，见模块 docstring）。
+
+    ``removed_containers``（D10.1b）：本次删除**由调用方自动 ``rmdir`` 掉的
+    空父容器**，自外向内排列；:func:`undo_delete` 会在移回内容前按需重建。
+    调用方只登记自己删掉的目录，不登记用户此前就不存在的路径。
     """
     return _register(
-        workspace_root, source, kind="undoable_delete", expires_at=UNDO_WINDOW_SECONDS
+        workspace_root,
+        source,
+        kind="undoable_delete",
+        expires_at=UNDO_WINDOW_SECONDS,
+        removed_containers=removed_containers,
     )
 
 
@@ -406,12 +431,44 @@ def _target_occupied(destination: Path) -> bool:
     return any(os.path.normcase(entry.name) == target_name for entry in entries)
 
 
+def _rebuild_removed_containers(
+    record: QuarantineRecord, workspace_root: str | Path
+) -> None:
+    """撤销前重建本次删除时自动 ``rmdir`` 掉的空父容器（D10.1b）。
+
+    ``removed_containers`` 自外向内排列，按序 ``mkdir`` 即可保证先祖先于
+    后代。每个路径都要过工作区守卫——记录里的路径是自报内容，不能直接拿来
+    建目录。已存在（用户或并发操作又建了回来）视为满足前置，不报错；被同名
+    **文件**占住则无法继续，报 :class:`UndoConflictError` 并保留隔离内容。
+    """
+    for raw in record.get("removed_containers", ()):
+        try:
+            container = assert_within_workspace(raw, workspace_root)
+        except PathGuardError as exc:
+            raise QuarantineError(f"待重建容器不在工作区内：{raw}") from exc
+        if container.is_dir():
+            continue
+        if container.exists():
+            raise UndoConflictError(
+                f"待重建的模块容器被同名文件占用，隔离内容已保留：{container}"
+            )
+        try:
+            container.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise QuarantineError(f"重建模块容器失败：{container}") from exc
+
+
 def undo_delete(workspace_root: str | Path, record_id: str) -> QuarantineRecord:
     """在窗口内撤销一条 ``undoable_delete``，还原到原路径。
 
     目标已被占用（含大小写 / junction 等价）→ :class:`UndoConflictError`，
     隔离内容保留不删；窗口已过 → :class:`QuarantineError`。调用方须已持有
     工作区写锁（未持锁调用直接拒绝，见模块 docstring）。
+
+    记录带 ``removed_containers`` 时（D10.1b：删除最后一个变体会自动
+    ``rmdir`` 空模块容器），先按 :func:`_rebuild_removed_containers` 重建
+    父容器再移回内容——否则 ``os.replace`` 的目标父目录不存在。重建发生在
+    占用检查**之后**、移动**之前**：占用冲突时不该留下凭空建出的空目录。
 
     与 :func:`sweep_expired` 一样，用 :func:`_assert_quarantine_path_owned`
     的 ``other_records`` 校验清单中是否有另一条记录解析到同一隔离目录
@@ -455,6 +512,7 @@ def undo_delete(workspace_root: str | Path, record_id: str) -> QuarantineRecord:
             raise UndoConflictError(
                 f"撤销目标已被占用，隔离内容已保留：{original}"
             )
+        _rebuild_removed_containers(record, workspace_root)
         try:
             os.replace(quarantine_path, original)
         except OSError as exc:
