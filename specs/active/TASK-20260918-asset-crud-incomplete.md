@@ -5,21 +5,10 @@
 | 项 | 状态 |
 | --- | --- |
 | 类型 | 实现规格（子任务 5） |
-| 当前状态 | **实现审查发现阻断问题，修复中** |
-| 版本 | r2（实现候选；审查未通过） |
+| 当前状态 | **已完成**（r5 复核通过，最终检查通过，已提交 `8b9fdab`） |
+| 版本 | r5（审查通过） |
 | 前置 | 父规格 `TASK-20260903-crud-write-semantics.md` D0.2、D2.4a、D2.5、D3、D7.1–D7.5、D10.1c；子任务 1（事务基础）、2（元数据/schema）、3（准入与导入原语）、4（型号/方案 CRUD）已完成 |
 | 父规格 | `specs/active/TASK-20260903-crud-write-semantics.md`（第 743 行子任务 5 定义） |
-
-### 当前交接
-
-```text
-阶段：修复完成，待复核
-负责人：实现 OMP（pane w9:pP）；审查/统筹 Codex（pane w9:pF）+ GLM 5.3 复核代理（r3/r4 已复核）
-候选：r5；基线：2446969
-范围：子任务 5 的 core 服务、候选扫描、隔离撤销及对应测试；不接 UI
-输入：本规格；docs/code-review/REVIEW-20260918-asset-crud-incomplete.md（ACI-001～008 + 002a/002b/003a/003b/008a 全部收口）
-下一步：复核 r5（仅 promote_candidate 三处差异 + 三条回归）→ 最终检查（ruff/mypy/pytest 全量）→ 提交
-```
 
 ## 目标与范围
 
@@ -315,14 +304,34 @@ D10.1c 明文：incomplete **不是** `FirmwareAsset`，不能调 `find_referenc
 
 散选规则定为「`.rom` 优先」而非「公共前缀」：核对 `firmware_catalog.toml` 后确认，**唯一会出现多文件散选的类型是 `handcontrol_ui`**（`usb_flow = "paired_files"`，且 `file_scan.py:128-135` 硬约束必须同时有 `.rom` 与 `.pkg`），配对固定是 `.rom` + `.pkg`（`settings.py:186-187`）。取 `.rom` 名即可覆盖该场景，比公共前缀算法简单且结果可预期。
 
+## 验证记录
+
+### 自动化验证（r5，2026-09-19 最终检查）
+
+在 Windows `.venv` 下执行：
+
+- `uv run ruff check src scripts` → `All checks passed!`（退出码 0）。
+- `uv run mypy` → `Success: no issues found in 50 source files`（退出码 0）。
+- `uv run python -m pytest -q` → `977 passed, 1 skipped`，`TOTAL` 覆盖率 94.60%（门槛 80%），退出码 0。
+
+> 首次 pytest 运行在结果汇总打印后出现一次 Qt 退出期崩溃（退出码 139），无任何用例失败；重跑退出码 0 且无 FAILED/ERROR，判定为 teardown 偶发，非用例缺陷。
+
+### 人工验证
+
+不适用。本子任务不接 UI（UI 编排归子任务 8），行为由测试完全断言，按 `docs/agent-workflow.md#验证与提交` 的例外判据自动化通过即可提交。
+
+- Review：`docs/code-review/REVIEW-20260918-asset-crud-incomplete.md`，ACI-001～008 + 002a/002b/003a/003b/008a 共 13 项全部收口。
+- CHANGELOG：不适用（服务层能力尚未接入 UI，用户不可感知；由子任务 8 接入时统一记录）。
+- 迁移说明：不适用。`QuarantineRecord.removed_containers` 旧记录缺键读为 `[]`，行为与扩字段前一致，无迁移负担。
+
 ## DoD
 
-- [ ] `asset_service.py` 实现 `create_asset` / `delete_asset` / `supplement_candidate` / `delete_candidate` / `undo_asset_delete`，签名与本规格一致。
-- [ ] `incomplete_scan.py` 实现 `scan_incomplete_imports`，诊断分级完整。
-- [ ] `asset_info.py` 扩展 `import_state` / `intended_firmware_type` 读写，沿用既有「严格读取 + 文本级合并保留未知键」模式。
-- [ ] `file_scan.py` 暴露供服务层使用的窄接口做 catalog 完整性判定，服务层不直接调私有 `_match_catalog_type`。
-- [ ] `types.py` 的 `QuarantineRecord` 增加 `removed_containers`，`quarantine.py` 的 `_read_record` 补读取与降级校验、`_register` 补可选参数（D10.1b 重建模块容器所需；不扩字段则该契约无法实现，见 A6）。旧记录缺该键读为 `[]`，不产生迁移负担。
-- [ ] 测试计划全部用例落地，`uv run python -m pytest -q` 通过，覆盖率不低于 `pyproject.toml` 门槛。
-- [ ] `uv run ruff check src scripts` / `uv run mypy` 通过。
-- [ ] 父规格点名的新契约断言落地：删除最后一个变体后撤销需重建模块容器、删除待补齐项的撤销。
-- [ ] 验证方式：本子任务无 UI（子任务 8 接入），按 `docs/agent-workflow.md#验证与提交` 判据——行为可由测试完全断言，自动化通过即可提交；候选区双盲区、零 TOML 改写、容器重建三条为必须断言项。
+- [x] `asset_service.py` 实现 `create_asset` / `delete_asset` / `supplement_candidate` / `delete_candidate` / `undo_asset_delete`，签名与本规格一致。（另含 ACI-003 修复引入的 `promote_candidate`）
+- [x] `incomplete_scan.py` 实现 `scan_incomplete_imports`，诊断分级完整。
+- [x] `asset_info.py` 扩展 `import_state` / `intended_firmware_type` 读写，沿用既有「严格读取 + 文本级合并保留未知键」模式。
+- [x] `file_scan.py` 暴露供服务层使用的窄接口做 catalog 完整性判定，服务层不直接调私有 `_match_catalog_type`。（`classify_staged_content`）
+- [x] `types.py` 的 `QuarantineRecord` 增加 `removed_containers`，`quarantine.py` 的 `_read_record` 补读取与降级校验、`_register` 补可选参数（D10.1b 重建模块容器所需；不扩字段则该契约无法实现，见 A6）。旧记录缺该键读为 `[]`，不产生迁移负担。
+- [x] 测试计划全部用例落地，`uv run python -m pytest -q` 通过，覆盖率不低于 `pyproject.toml` 门槛。
+- [x] `uv run ruff check src scripts` / `uv run mypy` 通过。
+- [x] 父规格点名的新契约断言落地：删除最后一个变体后撤销需重建模块容器（`test_asset_service.py:1256`）、删除待补齐项的撤销（`:1302`）。
+- [x] 验证方式：本子任务无 UI（子任务 8 接入），按 `docs/agent-workflow.md#验证与提交` 判据——行为可由测试完全断言，自动化通过即可提交；候选区双盲区、零 TOML 改写（`test_asset_service.py:983`）、容器重建三条为必须断言项。

@@ -1,6 +1,6 @@
 # REVIEW-20260918-asset-crud-incomplete：程序新增 / 删除 / 待补齐
 
-状态：已修复，待复核（r5：ACI-001～008 及复核新增 002a/002b/003a/003b/008a 全部收口；待统筹复核后进入最终检查）
+状态：已收口（r5：ACI-001～008 及复核新增 002a/002b/003a/003b/008a 共 13 项全部修复并通过复核；最终检查 ruff / mypy / pytest 全量通过，验证记录见 `specs/active/TASK-20260918-asset-crud-incomplete.md`）
 
 范围：`2446969..68478b0`（r2 初审）；r3 复核 = `68478b0` → 当前工作区未提交差异 + 受影响调用链。审查覆盖子任务 5 的服务契约、候选区生命周期、事务收敛、隔离撤销与索引对账。r4 复核（本次）= r3 快照 → 当前差异中的 ACI-003（promote_candidate）与 ACI-008 两处 + promote_candidate 受影响调用链（classify_staged_content / scan_incomplete_imports / save_vendor）；新发现的三处缺陷均经独立脚本实测复现。
 

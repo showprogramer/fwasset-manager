@@ -5,7 +5,7 @@
 | 项 | 状态 |
 | --- | --- |
 | 类型 | 写语义定稿（规则决策，不改产品代码） |
-| 当前状态 | 规则已定稿；实现子任务 1（公共事务基础）、2（元数据与 schema）、3（准入与导入原语）已完成；3a 不实施（实际工作区已是 `multi_model`）；4–8 待实施 |
+| 当前状态 | 规则已定稿；实现子任务 1（公共事务基础）、2（元数据与 schema）、3（准入与导入原语）、4（型号/方案 CRUD）、5（程序新增/删除/待补齐）已完成；3a 不实施（实际工作区已是 `multi_model`）；5a、6–8 待实施 |
 | 前置 | ✅ R5 路径守卫、✅ R1/R10 写入门闩、✅ R3 索引行级写、✅ R8 引用反查与级联 |
 | 父任务 | CRUD 准入（`docs/code-review/REVIEW-20260728-pre-crud-readiness.md`） |
 | 分支 | `feature/pyside6-migration` |
@@ -744,7 +744,9 @@ scanner / USB 用 `should_exclude_managed_path`；软件修复用 `managed_path_
    **已完成（2026-09-18 统筹收口）**，任务文件 `TASK-20260918-model-scheme-crud`（`e82fce6`，人工验证通过）。三轮规格审查 + 三轮代码审查累计 MSC-001~017 全部收口；失败路径统一收敛判据（零产物 `commit()` 为 `clean`，已落盘半成品保持 `recovery_required`）在本子任务定稿，后续 asset 级服务直接沿用。
 5. **程序新增/删除/待补齐**：新增（D0.2 层级）、删除程序（D2.4a）、待补齐候选区与 `scan_incomplete_imports`（D7.5）、补充文件服务、删除待补齐项（D10.1c）。
 
-   **实现审查修复中（2026-09-18）**，任务文件 `TASK-20260918-asset-crud-incomplete`，当前问题见 `docs/code-review/REVIEW-20260918-asset-crud-incomplete.md`。隔离记录的 `removed_containers` schema 已落地；服务实现候选 r2 尚有阻断问题，修复并复核后收口。
+   **已完成（2026-09-19 统筹收口）**，任务文件 `TASK-20260918-asset-crud-incomplete`（r5，最终检查通过）。审查见 `docs/code-review/REVIEW-20260918-asset-crud-incomplete.md`：ACI-001～008 + 002a/002b/003a/003b/008a 共 13 项全部收口，其中 4 项为 r3/r4 复核实测复现的新缺陷（补齐批次半成品残留、`UnboundLocalError` 穿透、完整性判定语境、`import_state` 一票否决）。隔离记录 `removed_containers` schema 已落地。
+
+   **收口裁决（2026-09-19 统筹）**：ACI-003 修复引入 `promote_candidate` 作为候选区的唯一提升入口——补齐后由用户重新选择落点，**完整性判定在业务落点语境执行**（与 `create_asset` 同口径），`import_state` 不再一票否决，手工塞齐的候选（`scan_incomplete_imports` 报 `ready_to_promote=True`）同样可提升。该入口属父规格 D7.5「候选项不保存旧操作意图」的直接落地，UI 入口归子任务 8。
 5a. **默认、元数据与借用编辑**：设为默认（D1.7，含旧 service 替换）、仅改厂商（D1.6）、登记/覆盖借用（D1.8）。事务与测试关注点与第 5 项不同，单独拆出。
 6. **布局归一与程序更新**：legacy 模块叶子归一（D0.3 状态机）、普通 update 事务（D1.4a）、`build_clear_defaults_plan`（D1.3）、改类型/改范围复合操作（D1.1）、`旧版本/` 与恢复交换（D4）。
 7. **存量 platform 归一**：`follow_default` 迁移前置 + 多块归一入口（D5.5）、legacy `"旧"` 关键词退役（D4.3③）。
