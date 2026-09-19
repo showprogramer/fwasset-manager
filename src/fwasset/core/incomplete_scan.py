@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,14 +75,35 @@ def scan_incomplete_imports(
     return candidates, issues
 
 
+def _candidate_content_files(candidate_dir: Path) -> list[str]:
+    """候选目录内容文件清单（相对路径，正斜杠归一）。
+
+    与 create 分流（``asset_service._session_filenames``）同一口径：递归收集
+    全部文件的相对路径；**根层**的受管元数据（``程序信息.toml``）不计入内容
+    ——它是候选期元数据，不是固件文件，把元数据当内容会让「仅元数据」的空
+    候选逃过「目录空」诊断，也会让完整性判定虚高。
+    """
+    names: list[str] = []
+    for entry in sorted(candidate_dir.rglob("*")):
+        if entry.is_file() and not (
+            entry.parent == candidate_dir
+            and os.path.normcase(entry.name) == os.path.normcase(ASSET_METADATA_FILENAME)
+        ):
+            names.append(str(entry.relative_to(candidate_dir)).replace("\\", "/"))
+    return names
+
+
 def _scan_one_candidate(
     candidate_dir: Path,
 ) -> tuple[IncompleteCandidate | None, list[ScanIssue]]:
     issues: list[ScanIssue] = []
     candidate_id = candidate_dir.name
 
+    # ACI-007：空目录诊断与完整性判定使用同一份内容清单——排除受管元数据、
+    # 递归收集相对路径，与 create 分流的 staging 清单口径一致（同一内容在
+    # 两个入口不得得出不同结论）。
     try:
-        has_content = any(candidate_dir.iterdir())
+        content_files = _candidate_content_files(candidate_dir)
     except OSError as exc:
         issues.append(
             {
@@ -91,7 +113,7 @@ def _scan_one_candidate(
             }
         )
         return None, issues
-    if not has_content:
+    if not content_files:
         issues.append(
             {
                 "severity": "warning",
@@ -144,19 +166,7 @@ def _scan_one_candidate(
     vendor = vendor_from_asset_info(data)
     intended_firmware_type = intended_firmware_type_from_asset_info(data)
 
-    try:
-        filenames = [f.name for f in candidate_dir.iterdir() if f.is_file()]
-    except OSError as exc:
-        issues.append(
-            {
-                "severity": "error",
-                "message": f"候选目录无法读取：{exc}",
-                "path": str(candidate_dir),
-            }
-        )
-        return None, issues
-
-    matched = classify_staged_content(candidate_dir, filenames)
+    matched = classify_staged_content(candidate_dir, content_files)
     ready_to_promote = matched is not None
 
     return (

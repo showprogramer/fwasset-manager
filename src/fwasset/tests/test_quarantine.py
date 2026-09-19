@@ -1012,3 +1012,191 @@ def test_corrupt_removed_containers_field_degrades_to_empty(tmp_path) -> None:
     assert len(records) == 2
     assert records[0]["removed_containers"] == []
     assert records[1]["removed_containers"] == []
+
+
+# ---------------------------------------------------------------------------
+# ACI-005：撤销重建容器后的失败补偿
+# ---------------------------------------------------------------------------
+
+
+def test_undo_replace_failure_rolls_back_created_containers(
+    tmp_path, monkeypatch
+) -> None:
+    """os.replace 失败 → 逆序移除本次创建的容器，隔离内容保留，可重试。"""
+    import os
+
+    _init_workspace(tmp_path)
+    container = tmp_path / "通用" / "主板程序"
+    container.mkdir(parents=True)
+    asset = _make_asset(container, "v1")
+
+    record = _locked_register_delete_with_containers(
+        tmp_path, asset, [str(tmp_path / "通用"), str(container)]
+    )
+    container.rmdir()
+    (tmp_path / "通用").rmdir()
+
+    def _boom(src, dst):
+        raise OSError("模拟移动失败")
+
+    with monkeypatch.context() as m:
+        m.setattr(os, "replace", _boom)
+        with pytest.raises(QuarantineError):
+            _locked_undo_delete(tmp_path, record["id"])
+
+    # 补偿完整：本次重建的容器已逆序移除，隔离内容仍在，清单保留一条记录。
+    assert not (tmp_path / "通用").exists()
+    assert not container.exists()
+    assert Path(record["quarantine_path"]).is_dir()
+    assert len(load_quarantine_manifest(tmp_path)) == 1
+
+    # 失败可重试：解除模拟后同一记录撤销成功。
+    restored = _locked_undo_delete(tmp_path, record["id"])
+    assert restored["status"] == "sent"
+    assert (asset / "file.bin").read_bytes() == b"payload"
+
+
+def test_undo_partial_multilevel_rebuild_rolled_back_on_failure(tmp_path) -> None:
+    """多级容器重建中途失败 → 已建部分被逆序回滚，不残留空容器。"""
+    import pathlib as _pathlib
+
+    _init_workspace(tmp_path)
+    container = tmp_path / "通用" / "主板程序"
+    container.mkdir(parents=True)
+    asset = _make_asset(container, "v1")
+
+    record = _locked_register_delete_with_containers(
+        tmp_path, asset, [str(tmp_path / "通用"), str(container)]
+    )
+    container.rmdir()
+    (tmp_path / "通用").rmdir()
+
+    # 第一级「通用」创建成功，第二级 mkdir 失败 → 已建部分须被逆序移除。
+    orig_mkdir = _pathlib.Path.mkdir
+
+    def _mkdir_fail_on_second(self, *args, **kwargs):
+        if self.name == "主板程序":
+            raise OSError("模拟第二级 mkdir 失败")
+        return orig_mkdir(self, *args, **kwargs)
+
+    _pathlib.Path.mkdir = _mkdir_fail_on_second
+    try:
+        with pytest.raises(QuarantineError):
+            _locked_undo_delete(tmp_path, record["id"])
+    finally:
+        _pathlib.Path.mkdir = orig_mkdir
+
+    # 回滚完整：中途建出的「通用」已被逆序移除，隔离内容保留。
+    assert not (tmp_path / "通用").exists()
+    assert Path(record["quarantine_path"]).is_dir()
+    assert len(load_quarantine_manifest(tmp_path)) == 1
+
+    # 失败可重试：解除模拟后同一记录撤销成功。
+    restored = _locked_undo_delete(tmp_path, record["id"])
+    assert restored["status"] == "sent"
+    assert (asset / "file.bin").read_bytes() == b"payload"
+
+
+def test_undo_rollback_rmdir_failure_maps_recovery_required(tmp_path) -> None:
+    """回滚（逆序 rmdir）自身失败 → UndoCompensationIncompleteError，
+    service 侧返回 undo_failed 且 payload.recovery_required=True。"""
+    import pathlib as _pathlib
+
+    from fwasset.core.services.asset_service import undo_asset_delete
+    from fwasset.core.workspace_transaction import load_workspace_status
+
+    _init_workspace(tmp_path)
+    container = tmp_path / "通用" / "主板程序"
+    container.mkdir(parents=True)
+    asset = _make_asset(container, "v1")
+
+    record = _locked_register_delete_with_containers(
+        tmp_path, asset, [str(tmp_path / "通用"), str(container)]
+    )
+    container.rmdir()
+    (tmp_path / "通用").rmdir()
+
+    orig_mkdir = _pathlib.Path.mkdir
+    orig_rmdir = _pathlib.Path.rmdir
+
+    def _mkdir_fail_on_second(self, *args, **kwargs):
+        if self.name == "主板程序":
+            raise OSError("模拟第二级 mkdir 失败")
+        return orig_mkdir(self, *args, **kwargs)
+
+    def _rmdir_fail(self, *args, **kwargs):
+        # 回滚时移除「通用」失败 → 补偿不完整。
+        raise OSError("模拟回滚 rmdir 失败")
+
+    # 经 service 入口触发（撤销事务内），故障发生在锁内的重建-失败-回滚链路。
+    _pathlib.Path.mkdir = _mkdir_fail_on_second
+    _pathlib.Path.rmdir = _rmdir_fail
+    try:
+        result = undo_asset_delete(str(tmp_path), record["id"])
+    finally:
+        _pathlib.Path.mkdir = orig_mkdir
+        _pathlib.Path.rmdir = orig_rmdir
+
+    assert result["ok"] is False
+    assert result["code"] == "undo_failed"
+    assert result["payload"]["recovery_required"] is True
+
+    # 补偿失败：中途建出的「通用」残留在工作区；事务未 commit。
+    assert (tmp_path / "通用").exists()
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+
+
+def test_undo_manifest_save_failure_maps_recovery_required(
+    tmp_path, monkeypatch
+) -> None:
+    """清单收尾失败 → 可区分补偿失败；service 返回 undo_failed +
+    recovery_required=True，工作区保持 recovery_required。"""
+    from fwasset.core import quarantine as qmod
+    from fwasset.core.services.asset_service import undo_asset_delete
+    from fwasset.core.workspace_transaction import load_workspace_status
+
+    def _broken_save(workspace_root, records):
+        raise OSError("模拟清单写盘失败")
+
+    # ---- 第一部分：undo_delete 直接行为（内容已移动、清单未收敛）----
+    _init_workspace(tmp_path)
+    container = tmp_path / "通用" / "主板程序"
+    container.mkdir(parents=True)
+    asset = _make_asset(container, "v1")
+
+    record = _locked_register_delete_with_containers(
+        tmp_path, asset, [str(container)]
+    )
+    container.rmdir()
+
+    with monkeypatch.context() as m:
+        m.setattr(qmod, "_save_quarantine_manifest", _broken_save)
+        with pytest.raises(qmod.UndoCompensationIncompleteError):
+            _locked_undo_delete(tmp_path, record["id"])
+
+    # 内容确实已移动到原路径，但隔离清单没有收敛（记录仍指向已消失的隔离目录）。
+    assert (asset / "file.bin").read_bytes() == b"payload"
+    assert len(load_quarantine_manifest(tmp_path)) == 1
+    assert not Path(record["quarantine_path"]).exists()
+
+    # ---- 第二部分：service 层在干净现场触发同一故障 ----
+    # 先 register（真实写清单），再 patch —— 避免登记本身失败。
+    ws2 = tmp_path.parent / f"{tmp_path.name}-service"
+    ws2.mkdir()
+    _init_workspace(ws2)
+    container2 = ws2 / "通用" / "主板程序"
+    container2.mkdir(parents=True)
+    asset2 = _make_asset(container2, "v1")
+    with WorkspaceLock(ws2):
+        record2 = register_delete(ws2, asset2, removed_containers=[str(container2)])
+    container2.rmdir()
+
+    with monkeypatch.context() as m:
+        m.setattr(qmod, "_save_quarantine_manifest", _broken_save)
+        result = undo_asset_delete(str(ws2), record2["id"])
+
+    assert result["ok"] is False
+    assert result["code"] == "undo_failed"
+    assert result["payload"]["recovery_required"] is True
+    # service 未 commit：工作区保持 recovery_required，不得宣称零产物成功。
+    assert load_workspace_status(ws2).state == "recovery_required"

@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Literal
 
-from fwasset.core.admission import AdmissionError
+from fwasset.core.admission import AdmissionError, validate_new_path
 from fwasset.core.asset_index import bulk_reindex_subtree
 from fwasset.core.asset_info import (
     IMPORT_STATE_INCOMPLETE,
@@ -31,14 +33,17 @@ from fwasset.core.asset_reconcile import reconcile_subtree
 from fwasset.core.file_scan import classify_staged_content
 from fwasset.core.import_io import (
     AssetImportError,
+    _create_missing_containers,
     promote_import,
     stage_import_archive,
     stage_import_directory,
     stage_import_files,
 )
+from fwasset.core.incomplete_scan import _candidate_content_files
 from fwasset.core.managed_paths import (
     RETIRED_VERSIONS_DIRNAME,
     assert_managed_write,
+    detect_workspace_layout,
     managed_path_reason,
     managed_root,
 )
@@ -55,6 +60,7 @@ from fwasset.core.path_guard import (
 )
 from fwasset.core.quarantine import (
     QuarantineError,
+    UndoCompensationIncompleteError,
     UndoConflictError,
     load_quarantine_manifest,
     register_delete,
@@ -68,16 +74,20 @@ from fwasset.core.reference_lookup import (
 from fwasset.core.staging_io import (
     StagingError,
     _assert_session_directory,
-    allocate_staging_area,
     cleanup_staging_area,
 )
 from fwasset.core.types import ServiceResult
-from fwasset.core.workspace_transaction import WorkspaceTransaction
+from fwasset.core.workspace_transaction import (
+    WorkspaceTransaction,
+    capture_workspace_preview,
+    preview_token_is_current,
+)
 
 __all__ = [
     "create_asset",
     "delete_asset",
     "supplement_candidate",
+    "promote_candidate",
     "delete_candidate",
     "undo_asset_delete",
 ]
@@ -129,6 +139,11 @@ def create_asset(
 
     ws = Path(workspace_root)
     model_root_path = Path(model_root)
+
+    # ACI-006：布局检测在锁外（D8「用户选择一律发生在锁外」，纯预览不持锁）。
+    layout = detect_workspace_layout(ws)
+    if layout == "invalid":
+        return _error("layout_invalid", "工作区布局无法识别（存在无法归类的内容），禁止新增程序")
 
     if source_kind not in ("files", "directory", "archive"):
         return _error("invalid_scope", f"非法的来源类型：{source_kind!r}")
@@ -195,16 +210,27 @@ def create_asset(
             transaction.commit()
             return _error("promote_failed", str(exc))
 
-        status, error_msg = save_vendor(destination, vendor)
-        if status not in ("ok",):
-            log_fn(f"新程序 vendor 写入失败（{status}）：{error_msg}")
+        # ACI-008：vendor 是新建程序的契约字段，写入失败按事务失败处理。
+        # 资产目录已落盘（非零产物），不能 commit 成功——按目标已落盘的收敛
+        # 判据返回 recovery_required，由人工确认后对账，不得只记日志。
+        vendor_status, vendor_err = save_vendor(destination, vendor)
+        if vendor_status != "ok":
+            log_fn(f"新程序 vendor 写入失败：{vendor_err}")
+            return _error(
+                "promote_failed",
+                f"程序已创建但元数据写入失败，需人工恢复：{vendor_err}",
+                {"recovery_required": True, "asset_path": str(destination)},
+            )
 
         transaction.set_phase("indexed", details={"target": str(destination)})
 
         code = "ok"
         message = f"程序「{asset_name}」已创建"
         try:
-            bulk_reindex_subtree(str(ws), str(destination), [])
+            # ACI-001：以磁盘为准重建新资产边界（reconcile_subtree 内部扫描
+            # 子树并整批写入），不能用 bulk_reindex_subtree(..., [])——那会把
+            # 目标边界内刚创建的资产行清空且不插回。
+            reconcile_subtree(str(ws), str(destination))
         except Exception as exc:  # noqa: BLE001
             log_fn(f"新程序索引写入失败，需重扫：{exc}")
             code = "index_pending"
@@ -273,11 +299,19 @@ def _create_incomplete_candidate(
             {"recovery_required": True, "candidate_path": str(candidate_path)},
         )
 
-    status, error_msg = save_candidate_metadata(
+    # ACI-008：候选元数据是 D7.5 可发现性不变量的磁盘真源（候选 scanner 靠它
+    # 识别），写入失败时候选目录已落盘（非零产物），不能 commit 成功——否则
+    # 候选目录成为普通 scanner 不认、候选 scanner 也不认的双盲死角。
+    meta_status, meta_err = save_candidate_metadata(
         candidate_path, vendor=vendor, intended_firmware_type=intended_firmware_type
     )
-    if status != "ok":
-        log_fn(f"候选元数据写入失败（{status}）：{error_msg}")
+    if meta_status != "ok":
+        log_fn(f"候选元数据写入失败：{meta_err}")
+        return _error(
+            "promote_failed",
+            "内容已存入候选区但元数据写入失败，需人工恢复",
+            {"recovery_required": True, "candidate_path": str(candidate_path)},
+        )
 
     transaction.set_phase("indexed", details={"candidate": str(candidate_path)})
     transaction.commit()
@@ -368,7 +402,14 @@ def supplement_candidate(
     files: Sequence[str | Path],
     log_fn: Callable[..., None] = print,
 ) -> ServiceResult:
-    """补充候选目录文件：禁止覆盖、staging 合并、CAS 提交、原子更新 import_state。"""
+    """补充候选目录文件：禁止覆盖、staging 合并、CAS 提交、原子更新 import_state。
+
+    ACI-002 失败零改动契约：来源验证复用 ``stage_import_files`` 的原语口径
+    （空来源 / 批内大小写等价重名 / 受管来源 / 元数据跳过）；锁内先 CAS 复验
+    再 ``begin_product_write``；新增文件逐项写入并跟踪，任一步失败逆序删除
+    本次新增文件——补偿完整 → commit clean 可重试；补偿不完整 → 不 commit
+    （``__exit__`` 落 ``recovery_required``）。
+    """
     gate = check_reference_gate(configured_root, workspace_root)
     if gate is not None:
         return gate
@@ -382,72 +423,135 @@ def supplement_candidate(
     if status != "ok" or import_state_from_asset_info(data) != IMPORT_STATE_INCOMPLETE:
         return _error("invalid_candidate", f"候选项元数据无效或已不是待补齐状态：{err_msg or status}")
 
+    # 锁外记录候选 preimage（CAS base）。
     try:
         preimage = directory_manifest_hash(candidate_path)
     except ManifestError as exc:
         return _error("invalid_candidate", f"候选目录内容无法校验：{exc}")
 
-    existing_names = {p.name.lower() for p in candidate_path.iterdir() if p.is_file()}
-    for item in files:
-        name = Path(item).name
-        if name.lower() in existing_names:
-            return _error("file_exists", f"补充文件与候选现有文件同名，禁止覆盖：{name}")
-
+    # 锁外复用导入原语做来源验证：空来源 / 批内大小写等价重名 / 来源不存在 /
+    # 受管来源 / 全部是元数据文件——一次 staging 完成，口径与 create_asset 一致。
     with WorkspaceTransaction(ws, operation="supplement_candidate") as transaction:
         try:
-            staging = allocate_staging_area(ws, transaction)
-        except StagingError as exc:
-            return _error("staging_unavailable", str(exc))
-
-        try:
-            import shutil
-
-            for item in files:
-                src = Path(item)
-                if not src.is_file():
-                    raise AssetImportError("source_unreadable", f"来源不是文件：{src}")
-                shutil.copy2(src, staging / src.name)
+            staged = stage_import_files(transaction, ws, list(files))
         except AssetImportError as exc:
-            cleanup_staging_area(ws, staging)
             transaction.commit()
             return _error(exc.code, exc.message, exc.payload)
+        staging = Path(staged["session"])
+
+        # 禁止覆盖既有文件：normcase 等价即拒绝（与批内重名同一判定精度）。
+        try:
+            staged_names = {entry.name for entry in staging.iterdir() if entry.is_file()}
+            existing_names = {
+                os.path.normcase(entry.name)
+                for entry in candidate_path.iterdir()
+                if entry.is_file()
+            }
         except OSError as exc:
             cleanup_staging_area(ws, staging)
             transaction.commit()
-            return _error("source_unreadable", f"复制补充文件失败：{exc}")
+            return _error("invalid_candidate", f"候选目录无法读取：{exc}")
+        for name in sorted(staged_names):
+            if os.path.normcase(name) in existing_names:
+                cleanup_staging_area(ws, staging)
+                transaction.commit()
+                return _error(
+                    "file_exists", f"补充文件与候选现有文件同名，禁止覆盖：{name}"
+                )
 
+        # 完整性判定基于合并视图（候选现有内容 + staging 新增）。
+        try:
+            existing_files = [
+                str(p.relative_to(candidate_path)).replace("\\", "/")
+                for p in sorted(candidate_path.rglob("*"))
+                if p.is_file()
+            ]
+        except OSError as exc:
+            cleanup_staging_area(ws, staging)
+            transaction.commit()
+            return _error("invalid_candidate", f"候选目录无法读取：{exc}")
         merged_filenames = sorted(
-            {p.name for p in candidate_path.iterdir() if p.is_file()}
-            | {p.name for p in staging.iterdir() if p.is_file()}
+            set(existing_files)
+            | {str(Path(name)) for name in staged_names}
         )
         matched = classify_staged_content(candidate_path, merged_filenames)
 
-        transaction.begin_product_write()
-
+        # CAS 复验必须在首个产品写之前（零改动失败收敛 clean）。
         try:
             current_hash = directory_manifest_hash(candidate_path)
         except ManifestError as exc:
             cleanup_staging_area(ws, staging)
-            return _error("invalid_candidate", f"候选目录内容无法校验：{exc}")
+            transaction.commit()
+            return _error("stale_candidate", f"候选目录内容无法校验：{exc}")
         if current_hash != preimage:
             cleanup_staging_area(ws, staging)
             transaction.commit()
             return _error("stale_candidate", "候选目录已被并发修改，提交已拒绝")
 
-        try:
-            _merge_staging_into(staging, candidate_path)
-        except OSError as exc:
-            return _error("promote_failed", f"补充文件合并失败：{exc}")
+        transaction.begin_product_write()
 
-        try:
+        # 逐项写入并跟踪目标；任一步失败逆序删除本次新增文件。
+        added: list[Path] = []
+        write_failed: Exception | None = None
+        meta_status = ""  # ACI-002a：先初始化，保证任意失败路径下可引用。
+        meta_err = ""
+        for name in sorted(staged_names):
+            source_file = staging / name
+            destination = candidate_path / name
+            try:
+                shutil.copy2(source_file, destination)
+            except OSError as exc:
+                # ACI-002b：copy2 中途失败时目标可能已创建半成品，先清理。
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    write_failed = exc
+                    break
+                write_failed = exc
+                break
+            added.append(destination)
+
+        if write_failed is None:
+            try:
+                cleanup_staging_area(ws, staging)
+            except StagingError:
+                pass
+
+            if matched is not None:
+                meta_status, meta_err = clear_candidate_metadata(candidate_path)
+                if meta_status != "ok":
+                    write_failed = OSError(f"候选元数据清除失败（{meta_status}）：{meta_err}")
+
+        if write_failed is not None:
+            # 逆序补偿：删除本次已写入的文件（含失败目标的半成品残留）。
+            rollback_ok = True
+            for written in reversed(added):
+                try:
+                    written.unlink()
+                except OSError:
+                    rollback_ok = False
+            if matched is not None and meta_status == "ok":
+                # 元数据键已删除但文件回滚 → 恢复候选元数据（磁盘真源）。
+                restore_status, restore_err = save_candidate_metadata(
+                    candidate_path,
+                    vendor=str(data.get("vendor", "")),
+                    intended_firmware_type=str(
+                        data.get("intended_firmware_type", "")
+                    ),
+                )
+                if restore_status != "ok":
+                    rollback_ok = False
             cleanup_staging_area(ws, staging)
-        except StagingError:
-            pass
-
-        if matched is not None:
-            status, err_msg = clear_candidate_metadata(candidate_path)
-            if status != "ok":
-                log_fn(f"候选元数据清除失败（{status}）：{err_msg}")
+            if rollback_ok:
+                transaction.commit()
+                return _error(
+                    "promote_failed", f"补充文件未写入，候选保持原样，可重试：{write_failed}"
+                )
+            return _error(
+                "promote_failed",
+                f"补充文件部分写入且无法完全回滚，需人工恢复：{write_failed}",
+                {"recovery_required": True, "candidate_path": str(candidate_path)},
+            )
 
         transaction.set_phase("indexed", details={"candidate": str(candidate_path)})
         transaction.commit()
@@ -465,14 +569,6 @@ def supplement_candidate(
         )
 
 
-def _merge_staging_into(staging: Path, candidate_path: Path) -> None:
-    import shutil
-
-    for entry in staging.iterdir():
-        destination = candidate_path / entry.name
-        shutil.move(str(entry), str(destination))
-
-
 def _resolve_candidate(
     ws: Path, candidate_id: str
 ) -> tuple[Path, ServiceResult | None]:
@@ -486,6 +582,194 @@ def _resolve_candidate(
     if not candidate_path.is_dir():
         return Path(), _error("invalid_candidate", f"候选项不存在：{candidate_id}")
     return candidate_path, None
+
+
+# ---------------------------------------------------------------------------
+# A5b promote_candidate（ACI-003：补齐完成的候选项唯一离开候选区的正道）
+# ---------------------------------------------------------------------------
+
+
+def promote_candidate(
+    configured_root: str | Path | None,
+    workspace_root: str | Path,
+    candidate_id: str,
+    *,
+    model_root: str | Path,
+    scope: str,
+    scheme_name: str = "",
+    module_name: str,
+    asset_name: str,
+    log_fn: Callable[..., None] = print,
+) -> ServiceResult:
+    """把补齐完成的候选项提升为正式程序（ACI-003 闭环）。
+
+    候选项不保存旧操作意图（D7.5）：落点由用户本次显式选择，与
+    ``create_asset`` 的 A2 路径同一套准入。候选内容必须在**落点语境**下
+    重新通过 A1 完整性判定（含用户手工塞齐 ``import_state`` 仍为
+    ``incomplete`` 的场景——那正是 A4 设计的「用户需显式操作」入口）；
+    提升 = 候选目录原子移入业务路径 + 候选期元数据随目录消失（磁盘真源
+    自动收敛），随后索引对账。落点不合法或目标已存在时候选保持原样可重试。
+    """
+    gate = check_reference_gate(configured_root, workspace_root)
+    if gate is not None:
+        return gate
+
+    ws = Path(workspace_root)
+    model_root_path = Path(model_root)
+
+    # 锁外：布局、目标型号根、落点参数校验（与 create_asset 同口径）。
+    layout = detect_workspace_layout(ws)
+    if layout == "invalid":
+        return _error("layout_invalid", "工作区布局无法识别（存在无法归类的内容），禁止提升候选")
+    if scope not in (_COMMON_DIR, _CUSTOM_DIR):
+        return _error("invalid_scope", f"非法的 scope：{scope!r}，必须是「通用」或「定制」")
+    if scope == _CUSTOM_DIR and not str(scheme_name).strip():
+        return _error("invalid_scope", "scope 为「定制」时 scheme_name 必填")
+    if not str(module_name).strip():
+        return _error("invalid_name", "模块名不能为空")
+    if not str(asset_name).strip():
+        return _error("invalid_name", "程序名不能为空")
+    from fwasset.core.managed_paths import _has_model_marker
+
+    if not _has_model_marker(model_root_path):
+        return _error("invalid_target", f"目标不是型号根：{model_root_path}")
+
+    if scope == _COMMON_DIR:
+        target = model_root_path / _COMMON_DIR / module_name / asset_name
+    else:
+        scheme_root = model_root_path / _CUSTOM_DIR / scheme_name
+        if not scheme_root.is_dir():
+            return _error("invalid_target", f"方案不存在：{scheme_root}")
+        target = scheme_root / module_name / asset_name
+
+    candidate_path, error = _resolve_candidate(ws, candidate_id)
+    if error is not None:
+        return error
+    data, status, err_msg = load_asset_info_with_status(candidate_path)
+    if status != "ok":
+        return _error("invalid_candidate", f"候选项元数据无效：{err_msg or status}")
+
+    # ACI-003b：import_state 不做一票否决——手工塞齐文件的候选（规格 A4
+    # 「用户手工塞了文件 → ready_to_promote，用户需显式操作」）仍带
+    # incomplete 键，而本服务正是那个显式操作入口；放行至 A1 内容判定，
+    # 由内容完整性决定能否提升。
+    import_state = import_state_from_asset_info(data)
+
+    # A1 判定（ACI-003a：与 create 分流同语境——按用户选择的落点 target
+    # 判定，不是候选区路径；dir_keywords 按 target 路径段匹配）。
+    content_files = _candidate_content_files(candidate_path)
+    matched = classify_staged_content(target, content_files)
+    if matched is None:
+        if import_state == IMPORT_STATE_INCOMPLETE:
+            return _error(
+                "invalid_candidate",
+                "候选内容仍不完整，请先补齐缺失文件再提升（可用 scan_incomplete_imports 查看缺失项）",
+            )
+        return _error(
+            "invalid_candidate",
+            "候选内容不完整（元数据缺少 import_state），无法按候选区规则提升；请确认内容完整后重试",
+        )
+
+    try:
+        preimage = directory_manifest_hash(candidate_path)
+    except ManifestError as exc:
+        return _error("invalid_candidate", f"候选目录内容无法校验：{exc}")
+
+    with WorkspaceTransaction(ws, operation="promote_candidate") as transaction:
+        # 锁内重验：候选身份 + 状态 CAS（并发补齐/删除期间候选不得已被改动）。
+        if managed_path_reason(candidate_path, is_dir=True, workspace_root=ws) != "incomplete_candidate":
+            transaction.commit()
+            return _error("invalid_candidate", f"候选项不在候选区内：{candidate_path}")
+        try:
+            current_hash = directory_manifest_hash(candidate_path)
+        except ManifestError as exc:
+            transaction.commit()
+            return _error("stale_candidate", f"候选目录内容无法校验：{exc}")
+        if current_hash != preimage:
+            transaction.commit()
+            return _error("stale_candidate", "候选目录已被并发修改，提升已拒绝")
+
+        # 准入复验（D3.7 同口径）：目标不存在、领域归属、排除项、锚点冲突。
+        try:
+            destination = validate_new_path(
+                target, kind="asset", configured_root=str(configured_root), workspace_root=ws
+            )
+        except AdmissionError as exc:
+            transaction.commit()
+            return _error(exc.code, exc.message, exc.payload)
+
+        transaction.begin_product_write()
+
+        # 候选目录 → 业务路径：同工作区内原子移动（候选区是受管根，不能走
+        # promote_staging 的 staging 会话校验；准入与容器创建已由
+        # validate_new_path + _create_missing_containers 覆盖）。
+        try:
+            manifest = manifest_hash(directory_manifest(candidate_path))
+        except (ManifestError, OSError) as exc:
+            transaction.commit()
+            return _error("promote_failed", f"候选内容无法校验：{exc}")
+        transaction.record_product(destination, manifest)
+        _create_missing_containers(transaction, destination)
+        try:
+            os.replace(candidate_path, destination)
+        except OSError as exc:
+            # 判据同子任务 4：目标是否已落盘决定收敛方式。
+            if target.exists():
+                return _error("promote_failed", f"候选提升失败：{exc}")
+            transaction.commit()
+            return _error("promote_failed", f"候选提升失败，候选保持原样，可重试：{exc}")
+
+        # 候选期元数据随目录整体移动、原样保留；正式程序不需要
+        # import_state / intended_firmware_type（Q1：vendor 保留）。手工塞齐
+        # 提升的候选仍带 incomplete 键（ACI-003b），移动后必须清除，否则
+        # 正式程序残留候选期键。ACI-008a：vendor 写入失败按事务失败处理——
+        # 候选已移走、资产已落盘（非零产物），不得 commit 报成功；IO 异常
+        # 同样收束为 ServiceResult，不裸抛穿透服务边界。
+        try:
+            if import_state == IMPORT_STATE_INCOMPLETE:
+                clear_status, clear_err = clear_candidate_metadata(destination)
+                if clear_status != "ok":
+                    log_fn(f"候选提升后元数据清除失败：{clear_err}")
+                    return _error(
+                        "promote_failed",
+                        "候选已提升但候选期元数据清除失败，需人工恢复",
+                        {"recovery_required": True, "asset_path": str(destination)},
+                    )
+        except OSError as io_exc:
+            log_fn(f"候选提升后元数据清除失败：{io_exc}")
+            return _error(
+                "promote_failed",
+                "候选已提升但候选期元数据清除失败，需人工恢复",
+                {"recovery_required": True, "asset_path": str(destination)},
+            )
+        if str(data.get("vendor", "")) == "":
+            save_status: Literal["ok", "missing", "parse_error", "parser_missing", "write_error"]
+            save_err: str
+            try:
+                save_status, save_err = save_vendor(destination, "")
+            except OSError as io_exc:
+                save_status, save_err = "write_error", f"IO 异常：{io_exc}"
+            if save_status != "ok":
+                log_fn(f"候选提升后 vendor 写入失败：{save_err}")
+                return _error(
+                    "promote_failed",
+                    "候选已提升但 vendor 元数据写入失败，需人工恢复",
+                    {"recovery_required": True, "asset_path": str(destination)},
+                )
+
+        transaction.set_phase("indexed", details={"target": str(destination)})
+
+        code = "ok"
+        message = f"程序「{asset_name}」已从候选区提升"
+        try:
+            reconcile_subtree(str(ws), str(destination))
+        except Exception as exc:  # noqa: BLE001
+            log_fn(f"候选提升后索引写入失败，需重扫：{exc}")
+            code = "index_pending"
+            message = f"程序「{asset_name}」已提升，但索引未同步，请重新读取程序列表"
+
+        transaction.commit()
+        return _ok(code, message, {"asset_path": str(destination), "candidate_id": candidate_id})
 
 
 # ---------------------------------------------------------------------------
@@ -575,44 +859,83 @@ def delete_asset(
     ws = Path(workspace_root)
     target_path = Path(asset_path)
 
+    # ACI-006：布局检测、目标存在性与反查全部在锁外完成（D8：纯预览不持锁，
+    # 全工作区 TOML 扫描不占用写锁；写锁只保护真实写操作）。
+    layout = detect_workspace_layout(ws)
+    if layout == "invalid":
+        return _error("layout_invalid", "工作区布局无法识别（存在无法归类的内容），禁止删除程序")
+    if not target_path.exists():
+        return _error("invalid_target", f"目标路径不存在：{target_path}")
+
+    # 锁外记录目标内容指纹（ACI-006 复核）：generation token 只能发现走
+    # 应用事务的并发变更，外部/绕过事务的改写不提升 generation——用目标
+    # manifest 二次比对补上这个盲区。
+    try:
+        target_preimage = directory_manifest_hash(target_path)
+    except ManifestError as exc:
+        return _error("invalid_target", f"目标内容无法校验：{exc}")
+
+    preview = capture_workspace_preview(ws)
+    lookup_result = find_references_to(configured_root, ws, target_path, "asset")
+    if not lookup_result["ok"]:
+        return lookup_result
+    lookup = lookup_result["payload"]["result"]
+
+    blocking = [issue for issue in lookup.issues if is_blocking_issue(issue)]
+    if blocking:
+        return _error(
+            "lookup_blocked",
+            "存在配置损坏或身份异常，反查清单不完整，已阻止删除",
+            {"issues": [i.__dict__ for i in blocking]},
+        )
+
+    owner_root = _owner_model_root(target_path)
+    cross_owner_hits = [
+        h for h in lookup.hits if owner_root is None or h.owner_root != str(owner_root)
+    ]
+    retired_copies = _count_retired_copies(target_path)
+    if cross_owner_hits and not confirm_shared:
+        return _error(
+            "confirmation_required",
+            f"存在 {len(cross_owner_hits)} 条跨型号借用命中，需确认后再删除",
+            {
+                "hits": [h.__dict__ for h in cross_owner_hits],
+                "retired_copies": retired_copies,
+            },
+        )
+
     try:
         with WorkspaceTransaction(ws, operation="delete_asset") as transaction:
-            lookup_result = find_references_to(configured_root, ws, target_path, "asset")
-            if not lookup_result["ok"]:
+            # D8 提交前重验：锁外预览期间工作区若被其他写事务改动（generation
+            # 变化），反查清单已过期，拒绝执行并收敛为 clean 可重试。
+            if not preview_token_is_current(ws, preview):
                 transaction.commit()
-                return lookup_result
-            lookup = lookup_result["payload"]["result"]
+                return _error("stale_plan", "工作区已发生其他变更，删除计划已过期，请重试")
 
-            blocking = [issue for issue in lookup.issues if is_blocking_issue(issue)]
-            if blocking:
+            if not target_path.exists():
                 transaction.commit()
-                return _error(
-                    "lookup_blocked",
-                    "存在配置损坏或身份异常，反查清单不完整，已阻止删除",
-                    {"issues": [i.__dict__ for i in blocking]},
-                )
+                return _error("invalid_target", f"目标路径不存在：{target_path}")
 
-            owner_root = _owner_model_root(target_path)
-            cross_owner_hits = [
-                h for h in lookup.hits if owner_root is None or h.owner_root != str(owner_root)
-            ]
-            if cross_owner_hits and not confirm_shared:
+            # ACI-006 复核：目标内容指纹复验。锁外反查之后目标被改写（哪怕
+            # 不经过事务、generation 不变）→ 反查清单已不可信，拒绝执行。
+            try:
+                current_target_hash = directory_manifest_hash(target_path)
+            except ManifestError as exc:
                 transaction.commit()
                 return _error(
-                    "confirmation_required",
-                    f"存在 {len(cross_owner_hits)} 条跨型号借用命中，需确认后再删除",
-                    {
-                        "hits": [h.__dict__ for h in cross_owner_hits],
-                        "retired_copies": _count_retired_copies(target_path),
-                    },
+                    "stale_plan", f"目标内容在删除计划确认后发生变化，请重试：{exc}"
                 )
-
-            retired_copies = _count_retired_copies(target_path)
-
-            transaction.begin_product_write()
+            if current_target_hash != target_preimage:
+                transaction.commit()
+                return _error(
+                    "stale_plan",
+                    f"目标内容在删除计划确认后已被修改，请重新确认后重试：{target_path}",
+                )
 
             module_dir = target_path.parent
             removed_containers = _plan_removed_containers(module_dir, target_path)
+
+            transaction.begin_product_write()
 
             try:
                 record = register_delete(
@@ -624,10 +947,13 @@ def delete_asset(
                 transaction.commit()
                 return _error("quarantine_failed", "隔离登记失败，目标未删除，可重试")
 
+            # ACI-004：任一必要索引步骤失败都必须返回 index_pending（磁盘删除
+            # 已成功，SQLite 可能残留幽灵行或缺行），不得静默降级为普通成功。
+            index_pending_reason = ""
             try:
                 bulk_reindex_subtree(str(ws), str(target_path), [])
             except Exception as exc:  # noqa: BLE001
-                log_fn(f"删除后索引写入失败，需重新读取程序列表：{exc}")
+                index_pending_reason = f"边界索引清理失败：{exc}"
 
             container_removed = False
             for container in removed_containers:
@@ -639,13 +965,24 @@ def delete_asset(
                 except OSError as exc:
                     log_fn(f"空模块容器删除失败，已保留：{container}（{exc}）")
 
-            if container_removed:
+            if container_removed and not index_pending_reason:
                 try:
                     reconcile_subtree(str(ws), str(module_dir.parent))
                 except Exception as exc:  # noqa: BLE001
-                    log_fn(f"删除后对模块父级对账失败，需重新读取程序列表：{exc}")
+                    index_pending_reason = f"模块父级对账失败：{exc}"
 
             transaction.commit()
+            if index_pending_reason:
+                log_fn(f"删除后索引未同步，请重新读取程序列表：{index_pending_reason}")
+                return _ok(
+                    "index_pending",
+                    f"「{target_path.name}」已删除，但索引未同步，请重新读取程序列表",
+                    {
+                        "quarantine_record_id": record["id"],
+                        "original_path": str(target_path),
+                        "retired_copies": retired_copies,
+                    },
+                )
             return _ok(
                 "ok",
                 f"「{target_path.name}」已删除，可在 5 秒内撤销",
@@ -767,6 +1104,11 @@ def undo_asset_delete(
             except UndoConflictError as exc:
                 transaction.commit()
                 return _error("undo_conflict", f"撤销目标已被占用，隔离内容已保留：{exc}")
+            except UndoCompensationIncompleteError:
+                # ACI-005：补偿不完整——工作区残留应用创建的容器或内容已
+                # 移动但清单未收敛。不 commit()，由 __exit__ 落
+                # recovery_required；不得空提交宣称零产物可重试。
+                raise
             except QuarantineError:
                 if not quarantine_path.exists():
                     raise
@@ -778,15 +1120,31 @@ def undo_asset_delete(
                     reconcile_root = ws
                 else:
                     reconcile_root = original_path.parent
+                # ACI-004：撤销后对账失败同样返回 index_pending，不误报普通成功。
                 try:
                     reconcile_subtree(str(ws), str(reconcile_root))
                 except Exception as exc:  # noqa: BLE001
-                    log_fn(f"撤销后索引对账失败，需重新读取程序列表：{exc}")
+                    log_fn(f"撤销后索引对账失败，请重新读取程序列表：{exc}")
+                    transaction.commit()
+                    return _ok(
+                        "index_pending",
+                        f"已撤销删除：{original_path.name}，但索引未同步，请重新读取程序列表",
+                        {"original_path": str(original_path)},
+                    )
 
             transaction.commit()
             return _ok(
                 "ok", f"已撤销删除：{original_path.name}", {"original_path": str(original_path)}
             )
+    except UndoCompensationIncompleteError as exc:
+        # ACI-005：补偿不完整。不 commit()，由 __exit__ 落 recovery_required；
+        # 返回值仍须可区分（payload 带 recovery_required），调用方不得按
+        # 「可重试、零产物」路径提示用户。
+        return _error(
+            "undo_failed",
+            f"撤销补偿不完整，需人工恢复：{exc}",
+            {"recovery_required": True, "record_id": record_id},
+        )
     except QuarantineError as exc:
         return _error(
             "undo_failed",

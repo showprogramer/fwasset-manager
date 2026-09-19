@@ -5,10 +5,21 @@
 | 项 | 状态 |
 | --- | --- |
 | 类型 | 实现规格（子任务 5） |
-| 当前状态 | **规格起草（r1），待审查** |
-| 版本 | r1 |
+| 当前状态 | **实现审查发现阻断问题，修复中** |
+| 版本 | r2（实现候选；审查未通过） |
 | 前置 | 父规格 `TASK-20260903-crud-write-semantics.md` D0.2、D2.4a、D2.5、D3、D7.1–D7.5、D10.1c；子任务 1（事务基础）、2（元数据/schema）、3（准入与导入原语）、4（型号/方案 CRUD）已完成 |
 | 父规格 | `specs/active/TASK-20260903-crud-write-semantics.md`（第 743 行子任务 5 定义） |
+
+### 当前交接
+
+```text
+阶段：修复完成，待复核
+负责人：实现 OMP（pane w9:pP）；审查/统筹 Codex（pane w9:pF）+ GLM 5.3 复核代理（r3/r4 已复核）
+候选：r5；基线：2446969
+范围：子任务 5 的 core 服务、候选扫描、隔离撤销及对应测试；不接 UI
+输入：本规格；docs/code-review/REVIEW-20260918-asset-crud-incomplete.md（ACI-001～008 + 002a/002b/003a/003b/008a 全部收口）
+下一步：复核 r5（仅 promote_candidate 三处差异 + 三条回归）→ 最终检查（ruff/mypy/pytest 全量）→ 提交
+```
 
 ## 目标与范围
 

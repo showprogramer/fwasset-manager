@@ -744,7 +744,7 @@ scanner / USB 用 `should_exclude_managed_path`；软件修复用 `managed_path_
    **已完成（2026-09-18 统筹收口）**，任务文件 `TASK-20260918-model-scheme-crud`（`e82fce6`，人工验证通过）。三轮规格审查 + 三轮代码审查累计 MSC-001~017 全部收口；失败路径统一收敛判据（零产物 `commit()` 为 `clean`，已落盘半成品保持 `recovery_required`）在本子任务定稿，后续 asset 级服务直接沿用。
 5. **程序新增/删除/待补齐**：新增（D0.2 层级）、删除程序（D2.4a）、待补齐候选区与 `scan_incomplete_imports`（D7.5）、补充文件服务、删除待补齐项（D10.1c）。
 
-   **规格起草中（2026-09-18）**，任务文件 `TASK-20260918-asset-crud-incomplete`。起草时核出一处必须的 schema 变更：D10.1b「删除最后一个变体后撤销需重建模块容器」要求隔离记录携带被自动 `rmdir` 的容器路径，而 `QuarantineRecord` 当前无此字段且 `_read_record` 会静默丢弃未知键，故须扩字段（旧记录读为空列表，无迁移负担）。
+   **实现审查修复中（2026-09-18）**，任务文件 `TASK-20260918-asset-crud-incomplete`，当前问题见 `docs/code-review/REVIEW-20260918-asset-crud-incomplete.md`。隔离记录的 `removed_containers` schema 已落地；服务实现候选 r2 尚有阻断问题，修复并复核后收口。
 5a. **默认、元数据与借用编辑**：设为默认（D1.7，含旧 service 替换）、仅改厂商（D1.6）、登记/覆盖借用（D1.8）。事务与测试关注点与第 5 项不同，单独拆出。
 6. **布局归一与程序更新**：legacy 模块叶子归一（D0.3 状态机）、普通 update 事务（D1.4a）、`build_clear_defaults_plan`（D1.3）、改类型/改范围复合操作（D1.1）、`旧版本/` 与恢复交换（D4）。
 7. **存量 platform 归一**：`follow_default` 迁移前置 + 多块归一入口（D5.5）、legacy `"旧"` 关键词退役（D4.3③）。

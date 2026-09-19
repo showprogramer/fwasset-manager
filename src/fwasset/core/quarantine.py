@@ -77,6 +77,17 @@ class UndoConflictError(QuarantineError):
     """撤销目标已被占用（含大小写 / junction 等价身份）；隔离内容不得删除。"""
 
 
+class UndoCompensationIncompleteError(QuarantineError):
+    """撤销的补偿不完整（ACI-005）。
+
+    ``undo_delete`` 已创建 ``removed_containers`` 或已移动内容，随后的
+    失败未能完整补偿（逆序 ``rmdir`` 失败，或清单收尾失败）：工作区残留
+    了应用创建的容器 / 内容已离开隔离区，但隔离清单未收敛。调用方**不得
+    按零产物 commit()**——必须保持 ``recovery_required``，否则失败返回
+    宣称「内容保留可重试」却隐藏了产品树变化。
+    """
+
+
 class TrashUnavailableError(QuarantineError):
     """无法建立同卷隔离根（首批不做跨卷分支）。"""
 
@@ -433,29 +444,66 @@ def _target_occupied(destination: Path) -> bool:
 
 def _rebuild_removed_containers(
     record: QuarantineRecord, workspace_root: str | Path
-) -> None:
+) -> list[Path]:
     """撤销前重建本次删除时自动 ``rmdir`` 掉的空父容器（D10.1b）。
 
     ``removed_containers`` 自外向内排列，按序 ``mkdir`` 即可保证先祖先于
     后代。每个路径都要过工作区守卫——记录里的路径是自报内容，不能直接拿来
-    建目录。已存在（用户或并发操作又建了回来）视为满足前置，不报错；被同名
-    **文件**占住则无法继续，报 :class:`UndoConflictError` 并保留隔离内容。
+    建目录。已存在（用户或并发操作又建了回来）视为满足前置，不报错也不计入
+    本次创建；被同名**文件**占住则无法继续，报 :class:`UndoConflictError`
+    并保留隔离内容。
+
+    返回**本次实际创建**的容器（创建顺序）。调用方在后续步骤失败时按逆序
+    ``rmdir`` 这些目录做补偿（ACI-005）——只删自己建的，不碰已存在的。
     """
+    created: list[Path] = []
     for raw in record.get("removed_containers", ()):
         try:
             container = assert_within_workspace(raw, workspace_root)
         except PathGuardError as exc:
+            if not _rollback_created_containers(created):
+                raise UndoCompensationIncompleteError(
+                    f"重建模块容器中途失败且补偿不完整（本次重建的容器未能全部移除）：{raw}"
+                ) from exc
             raise QuarantineError(f"待重建容器不在工作区内：{raw}") from exc
         if container.is_dir():
             continue
         if container.exists():
+            if not _rollback_created_containers(created):
+                raise UndoCompensationIncompleteError(
+                    f"待重建的模块容器被同名文件占用，且补偿不完整（本次重建的容器未能全部移除）：{container}"
+                )
             raise UndoConflictError(
                 f"待重建的模块容器被同名文件占用，隔离内容已保留：{container}"
             )
         try:
             container.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
+            if not _rollback_created_containers(created):
+                raise UndoCompensationIncompleteError(
+                    f"重建模块容器失败且补偿不完整（本次重建的容器未能全部移除）：{container}"
+                ) from exc
             raise QuarantineError(f"重建模块容器失败：{container}") from exc
+        created.append(container)
+    return created
+
+
+def _rollback_created_containers(created: Sequence[Path]) -> bool:
+    """逆序移除本次撤销创建的容器（ACI-005 补偿）。
+
+    只 ``rmdir`` 本次 ``mkdir`` 出来的目录，且任一条目残留内容（例如补偿
+    窗口内被外部写入）即停止——防御性检查，不递归删除。全部移除成功返回
+    ``True``；有残留返回 ``False``（调用方据此判定补偿是否完整）。
+    """
+    for container in reversed(created):
+        try:
+            if container.is_dir() and not any(container.iterdir()):
+                container.rmdir()
+            else:
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def undo_delete(workspace_root: str | Path, record_id: str) -> QuarantineRecord:
@@ -512,14 +560,32 @@ def undo_delete(workspace_root: str | Path, record_id: str) -> QuarantineRecord:
             raise UndoConflictError(
                 f"撤销目标已被占用，隔离内容已保留：{original}"
             )
-        _rebuild_removed_containers(record, workspace_root)
+        # ACI-005：跟踪本次重建的容器；重建中途失败已在 _rebuild 内逆序回滚，
+        # 这里接管 os.replace 失败与清单收尾失败的补偿。
+        created_containers = _rebuild_removed_containers(record, workspace_root)
         try:
             os.replace(quarantine_path, original)
         except OSError as exc:
-            raise QuarantineError(f"撤销还原失败：{original}") from exc
+            # 移动失败：隔离内容仍在原处，逆序移除本次创建的容器。补偿完整
+            # → 工作区回到撤销前状态，错误可重试；补偿不完整（容器残留）
+            # → 报可区分的补偿失败，调用方必须保持 recovery_required，不得
+            # 空提交宣称零产物。
+            if _rollback_created_containers(created_containers):
+                raise QuarantineError(f"撤销还原失败：{original}") from exc
+            raise UndoCompensationIncompleteError(
+                f"撤销还原失败且补偿不完整（本次重建的容器未能全部移除）：{original}"
+            ) from exc
 
         records.pop(index)
-        _save_quarantine_manifest(workspace_root, records)
+        try:
+            _save_quarantine_manifest(workspace_root, records)
+        except OSError as exc:
+            # 清单收尾失败：内容已移动、隔离清单未收敛（ACI-005 沿用既有
+            # 「内容已移动 → recovery_required」口径，不尝试回滚已移动的
+            # 内容——那是更大的破坏性操作）。
+            raise UndoCompensationIncompleteError(
+                f"撤销内容已移动但隔离清单收尾失败，需人工恢复：{original}"
+            ) from exc
         return {**record, "status": "sent"}
     raise QuarantineError(f"隔离记录不存在：{record_id}")
 

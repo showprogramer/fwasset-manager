@@ -72,6 +72,50 @@ def test_scan_ready_to_promote_when_complete(tmp_path: Path) -> None:
     assert candidate_dir.is_dir()
 
 
+def test_scan_metadata_only_directory_diagnosed_as_empty(tmp_path: Path) -> None:
+    """ACI-007 回归：候选目录只有 ``程序信息.toml`` 时按「目录空」诊断。
+
+    受管元数据不是固件内容——把元数据算作有效内容会让空候选逃过
+    「目录空」诊断，形成普通 scanner 不认、候选 scanner 也不报的双盲死角。
+    """
+    _init_workspace(tmp_path)
+    candidate_dir = _candidate_dir(tmp_path, "meta-only")
+    save_candidate_metadata(
+        candidate_dir, vendor="摩众", intended_firmware_type="handcontrol_ui"
+    )
+
+    candidates, issues = scan_incomplete_imports(tmp_path)
+
+    assert candidates == []
+    assert len(issues) == 1
+    assert issues[0]["severity"] == "warning"
+    assert "空" in issues[0]["message"]
+
+
+def test_scan_nested_rom_and_pkg_ready_to_promote(tmp_path: Path) -> None:
+    """ACI-007 回归：完整性判定使用递归相对路径清单。
+
+    rom 与 pkg 位于子目录时，顶层文件名清单看不到它们；create 分流用
+    ``rglob`` 递归清单判定，候选扫描若只看顶层文件名，同一内容会得出
+    相反结论（口径漂移）。
+    """
+    _init_workspace(tmp_path)
+    candidate_dir = _candidate_dir(tmp_path, "nested-content")
+    subdir = candidate_dir / "V1.0"
+    subdir.mkdir()
+    (subdir / "fw.rom").write_bytes(b"rom")
+    (subdir / "fw.pkg").write_bytes(b"pkg")
+    save_candidate_metadata(
+        candidate_dir, vendor="", intended_firmware_type="handcontrol_ui"
+    )
+
+    candidates, issues = scan_incomplete_imports(tmp_path)
+
+    assert issues == []
+    assert len(candidates) == 1
+    assert candidates[0].ready_to_promote is True
+
+
 def test_scan_diagnoses_missing_metadata_file(tmp_path: Path) -> None:
     _init_workspace(tmp_path)
     candidate_dir = _candidate_dir(tmp_path, "no-meta")

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from fwasset.core.asset_index import query_assets
 from fwasset.core.asset_info import load_asset_info_with_status
 from fwasset.core.file_scan import scan_firmware_assets
 from fwasset.core.incomplete_scan import scan_incomplete_imports
@@ -86,6 +87,18 @@ def _write_bin(tmp_path: Path, name: str = "fw.bin", content: bytes = b"x") -> P
     return path
 
 
+def _source_dir(tmp_path: Path, name: str = "_src") -> Path:
+    """工作区外的唯一来源目录（ACI-006 配套）。
+
+    来源脚手架（散选文件 / 目录 / zip）落在工作区根会被
+    ``detect_workspace_layout`` 判为无法归类内容 → ``invalid``。生产规则
+    不放宽，测试来源统一放到 ``tmp_path`` 之外。
+    """
+    directory = tmp_path.parent / f"{tmp_path.name}-{name}"
+    directory.mkdir(exist_ok=True)
+    return directory
+
+
 def _write_rom_only(tmp_path: Path, name: str = "fw.rom") -> Path:
     path = tmp_path / name
     path.write_bytes(b"rom-content")
@@ -99,8 +112,7 @@ def _write_rom_only(tmp_path: Path, name: str = "fw.rom") -> Path:
 
 def test_create_asset_files_success_common_scope(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     bin_file = _write_bin(src_dir)
 
     result = _create_common_asset(tmp_path, model_root, files=[bin_file], vendor="摩众")
@@ -114,6 +126,9 @@ def test_create_asset_files_success_common_scope(tmp_path: Path) -> None:
     data, status, _err = load_asset_info_with_status(asset_path)
     assert status == "ok"
     assert data.get("vendor") == "摩众"
+    # ACI-001 回归：创建后索引必须能查询到该资产（不是被清空的边界）。
+    indexed_paths = {item["path"] for item in query_assets(path=None)}
+    assert str(asset_path) in indexed_paths
 
 
 def test_create_asset_directory_success_custom_scope(tmp_path: Path) -> None:
@@ -121,8 +136,7 @@ def test_create_asset_directory_success_custom_scope(tmp_path: Path) -> None:
     scheme_result = create_scheme(str(tmp_path), str(tmp_path), str(model_root), "方案A")
     assert scheme_result["ok"] is True
 
-    src_dir = tmp_path / "_srcdir"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path, "_srcdir")
     _write_bin(src_dir, "fw.bin")
 
     result = create_asset(
@@ -145,7 +159,7 @@ def test_create_asset_directory_success_custom_scope(tmp_path: Path) -> None:
 
 def test_create_asset_archive_success(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    archive = tmp_path / "_src.zip"
+    archive = _source_dir(tmp_path) / "src.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("fw.bin", b"payload")
 
@@ -167,8 +181,7 @@ def test_create_asset_archive_success(tmp_path: Path) -> None:
 
 def test_create_asset_module_container_reused_on_second_asset(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
 
     r1 = _create_common_asset(
         tmp_path, model_root, asset_name="程序A", files=[_write_bin(src_dir, "a.bin")]
@@ -177,8 +190,7 @@ def test_create_asset_module_container_reused_on_second_asset(tmp_path: Path) ->
     module_dir = model_root / "通用" / "主板"
     assert module_dir.is_dir()
 
-    src_dir2 = tmp_path / "_src2"
-    src_dir2.mkdir()
+    src_dir2 = _source_dir(tmp_path, "_src2")
     r2 = _create_common_asset(
         tmp_path, model_root, asset_name="程序B", files=[_write_bin(src_dir2, "b.bin")]
     )
@@ -205,14 +217,29 @@ def test_create_asset_admission_out_of_workspace(tmp_path: Path) -> None:
     assert r2["code"] == "out_of_workspace"
 
 
+def test_create_asset_invalid_layout_rejected(tmp_path: Path) -> None:
+    """ACI-006 回归：工作区存在无法归类内容时 create_asset 返回 layout_invalid。"""
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    bin_file = _write_bin(src_dir)
+
+    # 用户在工作区根堆放了一份来源压缩包 → 布局无法归类。
+    (tmp_path / "随机资料.zip").write_bytes(b"junk")
+
+    result = _create_common_asset(tmp_path, model_root, files=[bin_file])
+
+    assert result["ok"] is False
+    assert result["code"] == "layout_invalid"
+    assert not (model_root / "通用" / "主板" / "程序A").exists()
+
+
 def test_create_asset_promote_failure_leaves_no_residue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from fwasset.core.services import asset_service as svc
 
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     bin_file = _write_bin(src_dir)
 
     def _boom(*args: object, **kwargs: object) -> None:
@@ -233,14 +260,14 @@ def test_create_asset_index_write_failure_is_ok_with_index_pending(
     from fwasset.core.services import asset_service as svc
 
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     bin_file = _write_bin(src_dir)
 
     def _boom(*args: object, **kwargs: object) -> None:
         raise RuntimeError("模拟索引失败")
 
-    monkeypatch.setattr(svc, "bulk_reindex_subtree", _boom)
+    # ACI-001：创建路径的索引同步已改为 reconcile_subtree（磁盘为真源）。
+    monkeypatch.setattr(svc, "reconcile_subtree", _boom)
     result = _create_common_asset(tmp_path, model_root, files=[bin_file])
 
     assert result["ok"] is True
@@ -255,8 +282,7 @@ def test_create_asset_index_write_failure_is_ok_with_index_pending(
 
 def test_create_asset_incomplete_handcontrol_goes_to_candidate(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     rom_file = _write_rom_only(src_dir)
 
     result = create_asset(
@@ -288,8 +314,7 @@ def test_create_asset_incomplete_handcontrol_goes_to_candidate(tmp_path: Path) -
 def test_incomplete_candidate_double_blind_zone(tmp_path: Path) -> None:
     """候选目录不被普通 scanner 发现，但能被 scan_incomplete_imports 发现。"""
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     rom_file = _write_rom_only(src_dir)
 
     result = create_asset(
@@ -316,8 +341,7 @@ def test_incomplete_candidate_double_blind_zone(tmp_path: Path) -> None:
 
 def test_scan_incomplete_imports_ready_to_promote_after_manual_fix(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     rom_file = _write_rom_only(src_dir)
     result = create_asset(
         str(tmp_path),
@@ -397,8 +421,7 @@ def test_incomplete_candidate_not_indexed(tmp_path: Path) -> None:
     from fwasset.core.asset_index import query_assets
 
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     rom_file = _write_rom_only(src_dir)
     create_asset(
         str(tmp_path),
@@ -421,8 +444,7 @@ def test_incomplete_candidate_not_indexed(tmp_path: Path) -> None:
 
 
 def _make_incomplete_candidate(tmp_path: Path, model_root: Path) -> str:
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir(exist_ok=True)
+    src_dir = _source_dir(tmp_path)
     rom_file = _write_rom_only(src_dir, f"fw-{len(list(src_dir.iterdir()))}.rom")
     result = create_asset(
         str(tmp_path),
@@ -438,12 +460,307 @@ def _make_incomplete_candidate(tmp_path: Path, model_root: Path) -> str:
     return result["payload"]["candidate_id"]
 
 
+# ---------------------------------------------------------------------------
+# A5b promote_candidate（ACI-003）
+# ---------------------------------------------------------------------------
+
+
+def test_promote_candidate_success_moves_to_business_path(tmp_path: Path) -> None:
+    """ACI-003 回归：补齐完成的候选经 promote_candidate 提升为正式程序。"""
+    from fwasset.core.asset_index import query_assets
+    from fwasset.core.services.asset_service import promote_candidate
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+
+    # 用户补齐缺失的 .pkg（supplement_candidate 正常路径）。
+    pkg_dir = _source_dir(tmp_path, "_pkg")
+    pkg_file = pkg_dir / "fw.pkg"
+    pkg_file.write_bytes(b"pkg")
+    sup = supplement_candidate(str(tmp_path), str(tmp_path), candidate_id, files=[pkg_file])
+    assert sup["ok"] is True and sup["payload"]["complete"] is True
+
+    result = promote_candidate(
+        str(tmp_path),
+        str(tmp_path),
+        candidate_id,
+        model_root=model_root,
+        scope="通用",
+        module_name="手控",
+        asset_name="手控程序A",
+    )
+
+    assert result["ok"] is True, result
+    assert result["code"] == "ok"
+    asset_path = Path(result["payload"]["asset_path"])
+    assert asset_path == model_root / "通用" / "手控" / "手控程序A"
+    assert (asset_path / "fw-0.rom").is_file()
+    assert (asset_path / "fw.pkg").is_file()
+    # 候选目录已消失；正式元数据无 import_state（Q1）。
+    assert not candidate_path.exists()
+    data, status, _err = load_asset_info_with_status(asset_path)
+    assert status == "ok"
+    assert "import_state" not in data
+    # 索引可查询（ACI-001 同口径）。
+    assert asset_path in {Path(item["path"]) for item in query_assets(path=None)}
+
+
+def test_promote_candidate_incomplete_content_rejected(tmp_path: Path) -> None:
+    """候选内容仍不完整 → invalid_candidate，候选保持原样。"""
+    from fwasset.core.services.asset_service import promote_candidate
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+
+    result = promote_candidate(
+        str(tmp_path),
+        str(tmp_path),
+        candidate_id,
+        model_root=model_root,
+        scope="通用",
+        module_name="手控",
+        asset_name="手控程序A",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "invalid_candidate"
+    assert candidate_path.is_dir()
+    assert not (model_root / "通用" / "手控" / "手控程序A").exists()
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_promote_candidate_target_exists_keeps_candidate(tmp_path: Path) -> None:
+    """落点已存在 → 准入拒绝（path_exists），候选保持原样可重试。"""
+    from fwasset.core.services.asset_service import promote_candidate
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+
+    pkg_dir = _source_dir(tmp_path, "_pkg")
+    (pkg_dir / "fw.pkg").write_bytes(b"pkg")
+    sup = supplement_candidate(str(tmp_path), str(tmp_path), candidate_id, files=[pkg_dir / "fw.pkg"])
+    assert sup["ok"] is True
+
+    # 预先占用落点。
+    occupied = model_root / "通用" / "手控" / "手控程序A"
+    occupied.mkdir(parents=True)
+
+    result = promote_candidate(
+        str(tmp_path),
+        str(tmp_path),
+        candidate_id,
+        model_root=model_root,
+        scope="通用",
+        module_name="手控",
+        asset_name="手控程序A",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "path_exists"
+    assert candidate_path.is_dir()
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_promote_candidate_cas_conflict_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """锁内 CAS 复验失败（候选被并发改动）→ stale_candidate，候选保留。"""
+    from fwasset.core.services import asset_service as svc
+    from fwasset.core.services.asset_service import promote_candidate
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+
+    pkg_dir = _source_dir(tmp_path, "_pkg")
+    (pkg_dir / "fw.pkg").write_bytes(b"pkg")
+    sup = supplement_candidate(str(tmp_path), str(tmp_path), candidate_id, files=[pkg_dir / "fw.pkg"])
+    assert sup["ok"] is True
+
+    real_hash = svc.directory_manifest_hash
+    calls = {"n": 0}
+
+    def _flaky_hash(path: Path) -> str:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            (candidate_path / "concurrent.txt").write_bytes(b"race")
+        return real_hash(path)
+
+    monkeypatch.setattr(svc, "directory_manifest_hash", _flaky_hash)
+    result = promote_candidate(
+        str(tmp_path),
+        str(tmp_path),
+        candidate_id,
+        model_root=model_root,
+        scope="通用",
+        module_name="手控",
+        asset_name="手控程序A",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "stale_candidate"
+    assert candidate_path.is_dir()
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_promote_candidate_keyword_type_content_succeeds(tmp_path: Path) -> None:
+    """ACI-003a 回归：keyword 型内容（mainboard，dir_keywords 按 target 路径段
+    匹配）在落点语境判定完整并可提升——候选区路径语境不含任何 keyword，
+    会把同一份内容误判为「不完整」。"""
+    from fwasset.core.services.asset_service import promote_candidate
+
+    model_root = _make_model(tmp_path)
+    # 主板 .bin（keyword 型）：create 时模块名不含 catalog 关键词 → 进候选区。
+    src_dir = _source_dir(tmp_path)
+    bin_file = src_dir / "board.bin"
+    bin_file.write_bytes(b"bin")
+    created = create_asset(
+        str(tmp_path),
+        str(tmp_path),
+        source=[str(bin_file)],
+        source_kind="files",
+        model_root=model_root,
+        scope="通用",
+        module_name="自定义模块",
+        asset_name="程序A",
+    )
+    assert created["ok"] is True
+    assert created["code"] == "created_incomplete"
+    candidate_id = created["payload"]["candidate_id"]
+    candidate_path = Path(created["payload"]["candidate_path"])
+
+    # 手工补齐场景（ACI-003b 同场）：元数据仍带 incomplete 键。
+    result = promote_candidate(
+        str(tmp_path),
+        str(tmp_path),
+        candidate_id,
+        model_root=model_root,
+        scope="通用",
+        module_name="主板",
+        asset_name="主板程序A",
+    )
+
+    assert result["ok"] is True, result
+    asset_path = Path(result["payload"]["asset_path"])
+    assert asset_path == model_root / "通用" / "主板" / "主板程序A"
+    assert (asset_path / "board.bin").is_file()
+    assert not candidate_path.exists()
+    # ACI-003b：手工塞齐场景元数据仍带 incomplete 键——提升后正式程序不得
+    # 再带候选期键（Q1），提升流程须清掉它。
+    data, status, _err = load_asset_info_with_status(asset_path)
+    assert status == "ok"
+    assert "import_state" not in data
+
+
+def test_promote_candidate_manually_completed_ready_to_promote_succeeds(
+    tmp_path: Path,
+) -> None:
+    """ACI-003b 回归：用户手工塞齐缺失文件（scan 报 ready_to_promote=True、
+    import_state 仍为 incomplete）→ 唯一显式提升入口必须放行，ACI-003 的
+    孤儿影响在手工补齐场景不得复现。"""
+    from fwasset.core.services.asset_service import promote_candidate
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+
+    # 用户绕过应用直接塞入缺失的 .pkg（不经过 supplement_candidate）。
+    pkg_src = _source_dir(tmp_path, "_pkg")
+    (pkg_src / "fw.pkg").write_bytes(b"pkg")
+    (candidate_path / "fw.pkg").write_bytes(b"pkg")
+
+    # scan 诊断该候选已可提升（A4 明文场景）。
+    candidates, issues = scan_incomplete_imports(tmp_path)
+    assert len(candidates) == 1
+    assert candidates[0].candidate_id == candidate_id
+    assert candidates[0].ready_to_promote is True
+
+    # 用户显式操作：提升。
+    result = promote_candidate(
+        str(tmp_path),
+        str(tmp_path),
+        candidate_id,
+        model_root=model_root,
+        scope="通用",
+        module_name="手控",
+        asset_name="手控程序A",
+    )
+
+    assert result["ok"] is True, result
+    asset_path = Path(result["payload"]["asset_path"])
+    assert (asset_path / "fw.pkg").is_file()
+    assert not candidate_path.exists()
+
+
+def test_promote_candidate_vendor_write_failure_recovery_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-008a 回归：提升后 vendor 补写失败（含 IO 异常）→ 不 commit、
+    返回 promote_failed + recovery_required，不得静默报成功。"""
+    from fwasset.core.services import asset_service as svc
+    from fwasset.core.services.asset_service import promote_candidate
+
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    rom_file = _write_rom_only(src_dir)
+
+    # 创建 vendor 为空的候选（补齐 .pkg 变完整后提升时才会触发补写）。
+    created = create_asset(
+        str(tmp_path),
+        str(tmp_path),
+        source=[str(rom_file)],
+        source_kind="files",
+        model_root=model_root,
+        scope="通用",
+        module_name="手控",
+        asset_name="程序A",
+    )
+    assert created["ok"] is True
+    candidate_id = created["payload"]["candidate_id"]
+
+    pkg_src = _source_dir(tmp_path, "_pkg")
+    (pkg_src / "fw.pkg").write_bytes(b"pkg")
+    sup = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[pkg_src / "fw.pkg"]
+    )
+    assert sup["ok"] is True
+
+    def _failing_vendor(asset_dir, vendor):
+        return ("parse_error", "模拟提升后 vendor 写入失败")
+
+    monkeypatch.setattr(svc, "save_vendor", _failing_vendor)
+    result = promote_candidate(
+        str(tmp_path),
+        str(tmp_path),
+        candidate_id,
+        model_root=model_root,
+        scope="通用",
+        module_name="手控",
+        asset_name="手控程序A",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "promote_failed"
+    assert result["payload"]["recovery_required"] is True
+    # 候选已移走、资产已落盘（非零产物），工作区保持待恢复现场。
+    asset_path = model_root / "通用" / "手控" / "手控程序A"
+    assert asset_path.is_dir()
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+
+
 def test_supplement_candidate_completes_and_clears_import_state(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
     candidate_id = _make_incomplete_candidate(tmp_path, model_root)
 
-    pkg_dir = tmp_path / "_pkg"
-    pkg_dir.mkdir()
+    pkg_dir = _source_dir(tmp_path, "_pkg")
     pkg_file = pkg_dir / "fw.pkg"
     pkg_file.write_bytes(b"pkg-content")
 
@@ -468,8 +785,7 @@ def test_supplement_candidate_rejects_same_name_file(tmp_path: Path) -> None:
     candidate_path = candidate_root / candidate_id
     existing_name = next(p.name for p in candidate_path.iterdir() if p.is_file())
 
-    dup_dir = tmp_path / "_dup"
-    dup_dir.mkdir()
+    dup_dir = _source_dir(tmp_path, "_dup")
     dup_file = dup_dir / existing_name
     dup_file.write_bytes(b"dup")
 
@@ -490,8 +806,7 @@ def test_supplement_candidate_two_rounds_still_incomplete_then_complete(
     model_root = _make_model(tmp_path)
     candidate_id = _make_incomplete_candidate(tmp_path, model_root)
 
-    extra_dir = tmp_path / "_extra"
-    extra_dir.mkdir()
+    extra_dir = _source_dir(tmp_path, "_extra")
     extra_file = extra_dir / "readme.txt"
     extra_file.write_bytes(b"note")
 
@@ -501,8 +816,7 @@ def test_supplement_candidate_two_rounds_still_incomplete_then_complete(
     assert r1["ok"] is True
     assert r1["payload"]["complete"] is False
 
-    pkg_dir = tmp_path / "_pkg"
-    pkg_dir.mkdir()
+    pkg_dir = _source_dir(tmp_path, "_pkg")
     pkg_file = pkg_dir / "fw.pkg"
     pkg_file.write_bytes(b"pkg")
     r2 = supplement_candidate(
@@ -522,8 +836,7 @@ def test_supplement_candidate_stale_cas_conflict(
     candidate_root = managed_root(tmp_path, "incomplete_candidate")
     candidate_path = candidate_root / candidate_id
 
-    pkg_dir = tmp_path / "_pkg"
-    pkg_dir.mkdir()
+    pkg_dir = _source_dir(tmp_path, "_pkg")
     pkg_file = pkg_dir / "fw.pkg"
     pkg_file.write_bytes(b"pkg")
 
@@ -555,6 +868,7 @@ def test_supplement_candidate_stale_cas_conflict(
 def test_supplement_candidate_mid_failure_cleans_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """ACI-002 回归：第二个文件写入失败 → 逆序回滚已写文件，无部分残留。"""
     from fwasset.core.services import asset_service as svc
 
     model_root = _make_model(tmp_path)
@@ -563,22 +877,32 @@ def test_supplement_candidate_mid_failure_cleans_staging(
     candidate_path = candidate_root / candidate_id
     before = sorted(p.name for p in candidate_path.iterdir())
 
-    pkg_dir = tmp_path / "_pkg"
-    pkg_dir.mkdir()
-    pkg_file = pkg_dir / "fw.pkg"
-    pkg_file.write_bytes(b"pkg")
+    src_dir = _source_dir(tmp_path, "_pkg")
+    f1 = src_dir / "readme1.txt"
+    f1.write_bytes(b"note1")
+    f2 = src_dir / "readme2.txt"
+    f2.write_bytes(b"note2")
 
-    def _boom(*args: object, **kwargs: object) -> None:
-        raise OSError("模拟合并失败")
+    real_copy2 = svc.shutil.copy2
 
-    monkeypatch.setattr(svc, "_merge_staging_into", _boom)
+    def _copy2_fail_into_candidate(src, dst, *args, **kwargs):
+        # 目标进入候选目录的第二个文件失败：第一个已写入候选，须逆序回滚。
+        if str(dst).startswith(str(candidate_path)) and Path(dst).name == "readme2.txt":
+            raise OSError("模拟第二个文件写入失败")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(svc.shutil, "copy2", _copy2_fail_into_candidate)
     result = supplement_candidate(
-        str(tmp_path), str(tmp_path), candidate_id, files=[pkg_file]
+        str(tmp_path), str(tmp_path), candidate_id, files=[f1, f2]
     )
 
     assert result["ok"] is False
+    assert result["code"] == "promote_failed"
+    assert not result.get("payload", {}).get("recovery_required")
     after = sorted(p.name for p in candidate_path.iterdir())
     assert before == after
+    # 零产物失败：工作区收敛 clean，可重试。
+    assert load_workspace_status(tmp_path).state == "clean"
 
 
 # ---------------------------------------------------------------------------
@@ -588,8 +912,7 @@ def test_supplement_candidate_mid_failure_cleans_staging(
 
 def test_delete_asset_success_no_external_reference(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -602,11 +925,64 @@ def test_delete_asset_success_no_external_reference(tmp_path: Path) -> None:
     assert "quarantine_record_id" in result["payload"]
 
 
+def test_delete_asset_index_failure_returns_index_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-004 回归：删除后边界索引失败 → ok=True, code=index_pending。"""
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    r = _create_common_asset(
+        tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
+    )
+    asset_path = Path(r["payload"]["asset_path"])
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("模拟索引失败")
+
+    monkeypatch.setattr(svc, "bulk_reindex_subtree", _boom)
+
+    result = delete_asset(str(tmp_path), str(tmp_path), asset_path, confirm_shared=False)
+
+    assert result["ok"] is True
+    assert result["code"] == "index_pending"
+    # 磁盘删除已成功，只是索引未同步——不得误报普通成功。
+    assert not asset_path.exists()
+    assert "重新读取程序列表" in result["message"]
+    assert "quarantine_record_id" in result["payload"]
+
+
+def test_delete_asset_module_reconcile_failure_returns_index_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-004 回归：模块父级对账失败 → ok=True, code=index_pending。"""
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    r = _create_common_asset(
+        tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
+    )
+    asset_path = Path(r["payload"]["asset_path"])
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("模拟对账失败")
+
+    monkeypatch.setattr(svc, "reconcile_subtree", _boom)
+
+    result = delete_asset(str(tmp_path), str(tmp_path), asset_path, confirm_shared=False)
+
+    assert result["ok"] is True
+    assert result["code"] == "index_pending"
+    assert not asset_path.exists()
+    assert (asset_path.parent).exists() is False
+
+
 def test_delete_asset_zero_toml_rewrite(tmp_path: Path) -> None:
     """R8 不变量：删除前后所有 TOML 逐字节一致。"""
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -626,8 +1002,7 @@ def test_delete_asset_zero_toml_rewrite(tmp_path: Path) -> None:
 
 def test_delete_asset_retired_copies_counted(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -645,8 +1020,7 @@ def test_delete_asset_retired_copies_counted(tmp_path: Path) -> None:
 
 def test_delete_asset_lookup_blocked_on_corrupt_config(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -659,10 +1033,110 @@ def test_delete_asset_lookup_blocked_on_corrupt_config(tmp_path: Path) -> None:
     assert result["code"] == "lookup_blocked"
 
 
+def test_delete_asset_lookup_runs_without_workspace_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-006 回归：反查（全工作区 TOML 扫描）在锁外执行，D8 纯预览不持锁。"""
+    from fwasset.core.services import asset_service as svc
+    from fwasset.core.workspace_transaction import workspace_lock_is_held
+
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    r = _create_common_asset(
+        tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
+    )
+    asset_path = Path(r["payload"]["asset_path"])
+
+    held_during_lookup: list[bool] = []
+    real_find = svc.find_references_to
+
+    def _tracking_find(*args: object, **kwargs: object):
+        held_during_lookup.append(workspace_lock_is_held(tmp_path))
+        return real_find(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(svc, "find_references_to", _tracking_find)
+
+    result = delete_asset(str(tmp_path), str(tmp_path), asset_path, confirm_shared=False)
+
+    assert result["ok"] is True
+    assert held_during_lookup == [False]
+
+
+def test_delete_asset_stale_preview_token_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-006 回归：锁外预览后工作区被并发改动 → stale_plan，零产物收敛 clean。"""
+    from fwasset.core.services import asset_service as svc
+    from fwasset.core.workspace_transaction import WorkspaceTransaction
+
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    r = _create_common_asset(
+        tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
+    )
+    asset_path = Path(r["payload"]["asset_path"])
+
+    real_find = svc.find_references_to
+
+    def _mutating_find(*args: object, **kwargs: object):
+        result = real_find(*args, **kwargs)  # type: ignore[arg-type]
+        # 模拟并发写事务：预览 token 捕获后、删除执行前，另一个写操作完成
+        # （begin_product_write 提升 generation，空提交无法体现真实变更）。
+        with WorkspaceTransaction(tmp_path, operation="concurrent_op") as tx:
+            tx.begin_product_write()
+            tx.commit()
+        return result
+
+    monkeypatch.setattr(svc, "find_references_to", _mutating_find)
+
+    result = delete_asset(str(tmp_path), str(tmp_path), asset_path, confirm_shared=False)
+
+    assert result["ok"] is False
+    assert result["code"] == "stale_plan"
+    assert asset_path.is_dir()
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_delete_asset_external_target_mutation_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-006 复核回归：目标被外部改写（不提升 generation）→ stale_plan。
+
+    generation token 只能发现走应用事务的并发变更；外部/绕过事务的改写
+    要靠锁外记录的目标 manifest 与锁内复验的比对来拦截。
+    """
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    r = _create_common_asset(
+        tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
+    )
+    asset_path = Path(r["payload"]["asset_path"])
+    # 反查完成后、进入锁内之前，外部直接改写目标内容（不经应用事务）。
+    real_find = None
+    from fwasset.core.services import asset_service as svc
+
+    real_find = svc.find_references_to
+
+    def _mutating_find(*args: object, **kwargs: object):
+        result = real_find(*args, **kwargs)  # type: ignore[arg-type]
+        (asset_path / "fw.bin").write_bytes(b"externally-rewritten")
+        return result
+
+    monkeypatch.setattr(svc, "find_references_to", _mutating_find)
+
+    result = delete_asset(str(tmp_path), str(tmp_path), asset_path, confirm_shared=False)
+
+    assert result["ok"] is False
+    assert result["code"] == "stale_plan"
+    # 目标未被隔离删除，外部改写的内容原样保留；generation 未变（事务收敛 clean）。
+    assert asset_path.is_dir()
+    assert (asset_path / "fw.bin").read_bytes() == b"externally-rewritten"
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
 def test_delete_asset_last_variant_rmdir_empty_module_container(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -678,8 +1152,7 @@ def test_delete_asset_last_variant_rmdir_empty_module_container(tmp_path: Path) 
 
 def test_delete_asset_module_container_with_retired_versions_kept(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -701,8 +1174,7 @@ def test_delete_asset_container_removal_triggers_parent_reconcile(
     from fwasset.core.services import asset_service as svc
 
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -733,8 +1205,7 @@ def test_delete_asset_container_removal_triggers_parent_reconcile(
 def test_undo_asset_delete_restores_content_and_index(tmp_path: Path) -> None:
 
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -752,10 +1223,39 @@ def test_undo_asset_delete_restores_content_and_index(tmp_path: Path) -> None:
     assert before_files == after_files
 
 
+def test_undo_asset_delete_reconcile_failure_returns_index_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-004 回归：撤销后对账失败 → ok=True, code=index_pending。"""
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    r = _create_common_asset(
+        tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
+    )
+    asset_path = Path(r["payload"]["asset_path"])
+
+    delete_result = delete_asset(str(tmp_path), str(tmp_path), asset_path, confirm_shared=False)
+    record_id = delete_result["payload"]["quarantine_record_id"]
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("模拟对账失败")
+
+    monkeypatch.setattr(svc, "reconcile_subtree", _boom)
+
+    undo_result = undo_asset_delete(str(tmp_path), record_id)
+
+    assert undo_result["ok"] is True
+    assert undo_result["code"] == "index_pending"
+    # 撤销本身已成功：内容已回到原路径，只是索引未同步。
+    assert asset_path.is_dir()
+    assert "重新读取程序列表" in undo_result["message"]
+
+
 def test_undo_asset_delete_rebuilds_module_container(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -775,8 +1275,7 @@ def test_undo_asset_delete_rebuilds_module_container(tmp_path: Path) -> None:
 
 def test_undo_asset_delete_target_occupied_undo_conflict(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -902,15 +1401,13 @@ def test_delete_candidate_cas_conflict(
 
 def test_msc001_create_asset_admission_failure_workspace_stays_clean(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r1 = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
     assert r1["ok"] is True
 
-    src_dir2 = tmp_path / "_src2"
-    src_dir2.mkdir()
+    src_dir2 = _source_dir(tmp_path, "_src2")
     r2 = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir2, "fw2.bin")]
     )
@@ -925,8 +1422,7 @@ def test_msc001_delete_asset_confirmation_required_workspace_stays_clean(
 ) -> None:
     model_a = _make_model(tmp_path, "L99程序")
     model_b = _make_model(tmp_path, "L98程序")
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_a, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -963,8 +1459,7 @@ def test_msc001_supplement_candidate_file_exists_workspace_stays_clean(
     candidate_path = candidate_root / candidate_id
     existing_name = next(p.name for p in candidate_path.iterdir() if p.is_file())
 
-    dup_dir = tmp_path / "_dup"
-    dup_dir.mkdir()
+    dup_dir = _source_dir(tmp_path, "_dup")
     dup_file = dup_dir / existing_name
     dup_file.write_bytes(b"dup")
 
@@ -978,6 +1473,352 @@ def test_msc001_supplement_candidate_file_exists_workspace_stays_clean(
 
 
 # ---------------------------------------------------------------------------
+# ACI-002：supplement_candidate 失败零改动契约
+# ---------------------------------------------------------------------------
+
+
+def test_supplement_candidate_empty_source_rejected(tmp_path: Path) -> None:
+    """ACI-002：空来源 → empty_source，候选与工作区零变化。"""
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+    before = sorted(p.name for p in candidate_path.iterdir())
+
+    result = supplement_candidate(str(tmp_path), str(tmp_path), candidate_id, files=[])
+
+    assert result["ok"] is False
+    assert result["code"] == "empty_source"
+    assert sorted(p.name for p in candidate_path.iterdir()) == before
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_supplement_candidate_batch_duplicate_names_rejected(tmp_path: Path) -> None:
+    """ACI-002：批内大小写等价重名 → duplicate_name（stage_import_files 口径）。"""
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+    before = sorted(p.name for p in candidate_path.iterdir())
+
+    src_dir = _source_dir(tmp_path, "_dupbatch")
+    a = src_dir / "Readme.TXT"
+    a.write_bytes(b"a")
+    b = src_dir / "readme.txt"
+    b.write_bytes(b"b")
+
+    result = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[a, b]
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "duplicate_name"
+    assert sorted(p.name for p in candidate_path.iterdir()) == before
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_supplement_candidate_managed_source_rejected(tmp_path: Path) -> None:
+    """ACI-002：受管来源（候选区内部文件）→ source_managed，不进入流程。"""
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+    before = sorted(p.name for p in candidate_path.iterdir())
+    source_inside_candidate = next(p for p in candidate_path.iterdir() if p.is_file())
+
+    result = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[source_inside_candidate]
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "source_managed"
+    assert sorted(p.name for p in candidate_path.iterdir()) == before
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_supplement_candidate_metadata_file_skipped(tmp_path: Path) -> None:
+    """ACI-002：来源全部是元数据文件 → empty_source（元数据跳过口径）。"""
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+    before = sorted(p.name for p in candidate_path.iterdir())
+
+    src_dir = _source_dir(tmp_path, "_meta")
+    meta = src_dir / "程序信息.toml"
+    meta.write_text('vendor = "x"\n', encoding="utf-8")
+
+    result = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[meta]
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "empty_source"
+    assert sorted(p.name for p in candidate_path.iterdir()) == before
+
+
+def test_supplement_candidate_cas_manifest_error_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-002：CAS 复验 ManifestError 发生在首个产品写之前 → clean 可重试。"""
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+    before = sorted(p.name for p in candidate_path.iterdir())
+
+    src_dir = _source_dir(tmp_path, "_pkg")
+    pkg_file = src_dir / "fw.pkg"
+    pkg_file.write_bytes(b"pkg")
+
+    real_hash = svc.directory_manifest_hash
+    calls = {"n": 0}
+
+    def _hash_error_on_recheck(path: Path) -> str:
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise ManifestError("模拟复验清单失败")
+        return real_hash(path)
+
+    monkeypatch.setattr(svc, "directory_manifest_hash", _hash_error_on_recheck)
+    result = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[pkg_file]
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "stale_candidate"
+    assert sorted(p.name for p in candidate_path.iterdir()) == before
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_supplement_candidate_metadata_clear_failure_no_false_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-002：补齐时 clear_candidate_metadata 非 ok → 回滚新增文件，
+    不得误报 complete=True；候选保持 incomplete 原样，可重试。"""
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+    before = sorted(p.name for p in candidate_path.iterdir())
+
+    src_dir = _source_dir(tmp_path, "_pkg")
+    pkg_file = src_dir / "fw.pkg"
+    pkg_file.write_bytes(b"pkg")
+
+    def _broken_clear(asset_dir):
+        return ("write_error", "模拟元数据清除失败")
+
+    monkeypatch.setattr(svc, "clear_candidate_metadata", _broken_clear)
+    result = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[pkg_file]
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "promote_failed"
+    assert result.get("payload", {}).get("complete") is not True
+    after = sorted(p.name for p in candidate_path.iterdir())
+    assert before == after
+    data, status, _err = load_asset_info_with_status(candidate_path)
+    assert status == "ok"
+    assert data.get("import_state") == "incomplete"
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_supplement_candidate_completing_batch_write_failure_no_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-002a 回归：补齐批次（matched 非 None）copy 失败 → 经 ServiceResult
+    返回错误，不裸抛 UnboundLocalError；候选保持原样、工作区 clean。"""
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+    before = sorted(p.name for p in candidate_path.iterdir())
+
+    src_dir = _source_dir(tmp_path, "_pkg")
+    pkg_file = src_dir / "fw.pkg"
+    pkg_file.write_bytes(b"pkg")
+
+    real_copy2 = svc.shutil.copy2
+
+    def _copy2_fail_into_candidate(src, dst, *args, **kwargs):
+        if str(dst).startswith(str(candidate_path)):
+            raise OSError("模拟补齐批次写入失败")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(svc.shutil, "copy2", _copy2_fail_into_candidate)
+    result = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[pkg_file]
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "promote_failed"
+    assert not result.get("payload", {}).get("recovery_required")
+    assert sorted(p.name for p in candidate_path.iterdir()) == before
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_supplement_candidate_partial_copy_cleans_half_written_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-002b 回归：copy2 写入目标途中失败（半成品已创建）→ 半成品被清理，
+    候选目录零残留；否则残留文件会让重试同批文件被 file_exists 拒绝。"""
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+    before = sorted(p.name for p in candidate_path.iterdir())
+
+    src_dir = _source_dir(tmp_path, "_pkg")
+    f1 = src_dir / "readme.txt"
+    f1.write_bytes(b"note")
+
+    real_copy2 = svc.shutil.copy2
+
+    def _copy2_half_write_then_fail(src, dst, *args, **kwargs):
+        if not str(dst).startswith(str(candidate_path)):
+            # staging 侧复制正常完成；只在候选目录目标上模拟半成品失败。
+            return real_copy2(src, dst, *args, **kwargs)
+        # 先创建半成品目标（模拟磁盘满前的部分写入），再抛错。
+        Path(dst).parent.mkdir(parents=True, exist_ok=True)
+        with open(dst, "wb") as fh:
+            fh.write(b"partial")
+        raise OSError("模拟写入目标途中失败（磁盘满）")
+
+    monkeypatch.setattr(svc.shutil, "copy2", _copy2_half_write_then_fail)
+    result = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[f1]
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "promote_failed"
+    assert sorted(p.name for p in candidate_path.iterdir()) == before
+    assert load_workspace_status(tmp_path).state == "clean"
+
+    # 可重试：残留清理干净后，同批文件补齐不再被 file_exists 拒绝。
+    monkeypatch.undo()
+    retry = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[f1]
+    )
+    assert retry["ok"] is True
+
+
+def test_supplement_candidate_rollback_failure_recovery_required(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-002：新增文件回滚失败（unlink 失败）→ 不 commit，
+    返回 recovery_required，不得报告普通成功。"""
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_path = candidate_root / candidate_id
+
+    src_dir = _source_dir(tmp_path, "_pkg")
+    f1 = src_dir / "readme1.txt"
+    f1.write_bytes(b"note1")
+    f2 = src_dir / "readme2.txt"
+    f2.write_bytes(b"note2")
+
+    real_copy2 = svc.shutil.copy2
+    real_unlink = Path.unlink
+
+    def _copy2_fail_into_candidate(src, dst, *args, **kwargs):
+        if str(dst).startswith(str(candidate_path)) and Path(dst).name == "readme2.txt":
+            raise OSError("模拟第二个文件写入失败")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    def _unlink_fail(self, *args, **kwargs):
+        # 回滚删除第一个已写入候选文件失败 → 补偿不完整。
+        if self.parent == candidate_path and self.name == "readme1.txt":
+            raise OSError("模拟回滚 unlink 失败")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(svc.shutil, "copy2", _copy2_fail_into_candidate)
+    monkeypatch.setattr(Path, "unlink", _unlink_fail)
+    result = supplement_candidate(
+        str(tmp_path), str(tmp_path), candidate_id, files=[f1, f2]
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "promote_failed"
+    assert result["payload"]["recovery_required"] is True
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+
+
+def test_create_asset_vendor_write_failure_not_reported_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-008 回归：save_vendor 非 ok → 不得返回普通成功（契约字段缺失）。"""
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    bin_file = _write_bin(src_dir)
+
+    def _failing_vendor(asset_dir, vendor):
+        return ("write_error", "模拟 vendor 写入失败")
+
+    monkeypatch.setattr(svc, "save_vendor", _failing_vendor)
+    result = _create_common_asset(tmp_path, model_root, files=[bin_file], vendor="摩众")
+
+    assert result["ok"] is False
+    assert result["code"] == "promote_failed"
+    assert result["payload"]["recovery_required"] is True
+    # 磁盘侧资产已落盘（非零产物），工作区必须保持待恢复现场。
+    assert (model_root / "通用" / "主板" / "程序A").is_dir()
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+
+
+def test_create_candidate_metadata_write_failure_not_reported_ok(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ACI-008 回归：候选元数据写入失败 → 不得返回 created_incomplete。
+
+    元数据是候选 scanner 的识别真源；失败时若报成功，候选目录会成为
+    普通 scanner 不认、候选 scanner 也不认的双盲死角。
+    """
+    from fwasset.core.services import asset_service as svc
+
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    rom_file = _write_rom_only(src_dir)
+
+    def _failing_meta(asset_dir, vendor, intended_firmware_type):
+        return ("write_error", "模拟候选元数据写入失败")
+
+    monkeypatch.setattr(svc, "save_candidate_metadata", _failing_meta)
+    result = create_asset(
+        str(tmp_path),
+        str(tmp_path),
+        source=[str(rom_file)],
+        source_kind="files",
+        model_root=model_root,
+        scope="通用",
+        module_name="手控",
+        asset_name="程序A",
+    )
+
+    assert result["ok"] is False
+    assert result["code"] == "promote_failed"
+    assert result["payload"]["recovery_required"] is True
+    # 候选目录已落盘（非零产物），工作区保持待恢复现场。
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    assert candidate_root.is_dir()
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+
+
+# ---------------------------------------------------------------------------
 # 中断恢复（阶段边界）
 # ---------------------------------------------------------------------------
 
@@ -988,8 +1829,7 @@ def test_create_asset_interrupted_after_promote_before_index_recovery_required(
     from fwasset.core.services import asset_service as svc
 
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     bin_file = _write_bin(src_dir)
 
     def _boom(*args: object, **kwargs: object) -> None:
@@ -1023,8 +1863,7 @@ def test_delete_asset_interrupted_after_quarantine_before_rmdir(
     from fwasset.core.services import asset_service as svc
 
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     r = _create_common_asset(
         tmp_path, model_root, module_name="蓝牙", files=[_write_bin(src_dir, "fw.bin")]
     )
@@ -1095,8 +1934,7 @@ def test_candidate_promote_zero_product_failure_keeps_workspace_clean(
     （AGENTS.md：不以裸异常代替服务错误码）。
     """
     model_root = _make_model(tmp_path)
-    src_dir = tmp_path / "_src"
-    src_dir.mkdir()
+    src_dir = _source_dir(tmp_path)
     rom_file = _write_rom_only(src_dir)
 
     def _boom(*_args: object, **_kwargs: object) -> str:
