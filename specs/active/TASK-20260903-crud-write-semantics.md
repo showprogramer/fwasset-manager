@@ -5,7 +5,7 @@
 | 项 | 状态 |
 | --- | --- |
 | 类型 | 写语义定稿（规则决策，不改产品代码） |
-| 当前状态 | 规则已定稿；实现子任务 1（公共事务基础）、2（元数据与 schema）、3（准入与导入原语）、4（型号/方案 CRUD）、5（程序新增/删除/待补齐）已完成；3a 不实施（实际工作区已是 `multi_model`）；5a 与 6a 已实现待审查；6b、7、8 待实施 |
+| 当前状态 | 规则已定稿；实现子任务 1–5、5a、6a、6b 已完成；3a 不实施（实际工作区已是 `multi_model`）；7、8 待实施 |
 | 前置 | ✅ R5 路径守卫、✅ R1/R10 写入门闩、✅ R3 索引行级写、✅ R8 引用反查与级联 |
 | 父任务 | CRUD 准入（`docs/code-review/REVIEW-20260728-pre-crud-readiness.md`） |
 | 分支 | `feature/pyside6-migration` |
@@ -747,10 +747,12 @@ scanner / USB 用 `should_exclude_managed_path`；软件修复用 `managed_path_
    **已完成（2026-09-19 统筹收口）**，任务文件 `TASK-20260918-asset-crud-incomplete`（r5，最终检查通过）。审查见 `docs/code-review/REVIEW-20260918-asset-crud-incomplete.md`：ACI-001～008 + 002a/002b/003a/003b/008a 共 13 项全部收口，其中 4 项为 r3/r4 复核实测复现的新缺陷（补齐批次半成品残留、`UnboundLocalError` 穿透、完整性判定语境、`import_state` 一票否决）。隔离记录 `removed_containers` schema 已落地。
 
    **收口裁决（2026-09-19 统筹）**：ACI-003 修复引入 `promote_candidate` 作为候选区的唯一提升入口——补齐后由用户重新选择落点，**完整性判定在业务落点语境执行**（与 `create_asset` 同口径），`import_state` 不再一票否决，手工塞齐的候选（`scan_incomplete_imports` 报 `ready_to_promote=True`）同样可提升。该入口属父规格 D7.5「候选项不保存旧操作意图」的直接落地，UI 入口归子任务 8。
-5a. **默认、元数据与借用编辑**：设为默认（D1.7，含旧 service 替换）、仅改厂商（D1.6）、登记/覆盖借用（D1.8）。事务与测试关注点与第 5 项不同，单独拆出。
+5a. **默认、元数据与借用编辑**：设为默认（D1.7，含旧 service 替换）、仅改厂商（D1.6）、登记/覆盖/解除借用（D1.8 / D10.1a）。
+
+   **已完成（2026-09-21）**，任务文件 `TASK-20260919-default-vendor-shared-edit`。审查见 `docs/code-review/REVIEW-20260919-default-vendor-shared-edit.md`：WES-001～009 已闭合。
 6. **布局归一与程序更新**：legacy 模块叶子归一（D0.3 状态机）、普通 update 事务（D1.4a）、`build_clear_defaults_plan`（D1.3）、改类型/改范围复合操作（D1.1）、`旧版本/` 与恢复交换（D4）。按依赖方向拆两轮：
-   - 6a（D0.3 + D1.4a + D1.3）**已实现待审查**，任务文件 `TASK-20260920-layout-normalize-update`。
-   - 6b（D1.1 + D4）消费 6a 的冻结计划与 `旧版本/` 产物。**6b 须一并修复 `_default_program_dir` 的别名缺陷**：该函数只按 canonical 名匹配模块目录、不走 catalog `dir_keywords`，因此指向关键词命名目录（如 `主板` 之于 `主板程序`）的 defaults 条目反查不到命中，改名/更新/归一都会留下悬空默认值。它属 `find_references_to` 公共语义，修复须同步补 rename 与 delete 预检侧的回归（6a 已实测确认，见其规格第 15 节）。
+   - 6a（D0.3 + D1.4a + D1.3）**已完成**，任务文件 `TASK-20260920-layout-normalize-update`。
+   - 6b（D1.1 + D4）**已完成**，任务文件 `TASK-20260920-change-semantics-retired-versions`。`_default_program_dir` 的 catalog `dir_keywords` 唯一匹配回退已落地。
 7. **存量 platform 归一**：`follow_default` 迁移前置 + 多块归一入口（D5.5）、legacy `"旧"` 关键词退役（D4.3③）。
 8. **UI 编排**：术语映射（差异 #6）、二次确认、删除类撤销提示条、影响展示、待补齐入口、空工作区新增入口、空白型号显示与旧布局迁移引导。**新增程序对话框的程序名预填**（2026-09-18 用户确认）：文件夹取目录名、zip 取包名去后缀、散选取 `.rom` 文件名去扩展名（唯一的多文件散选场景是 `handcontrol_ui` 的 `.rom` + `.pkg` 配对），用户可改；服务层不做来源推导兜底，规则见 `TASK-20260918-asset-crud-incomplete` 已裁决问题 Q2。
 
