@@ -12,8 +12,14 @@ from fwasset.core.model_config import (
     save_model_id,
     save_shared_module,
 )
-from fwasset.core.platform_config import PlatformDefaults, save_platform_config
+from fwasset.core.platform_config import (
+    PlatformDefaults,
+    canonical_module_dir,
+    save_platform_config,
+)
 from fwasset.core.reference_lookup import (
+    BLOCKING_ISSUE_CATEGORIES,
+    _default_program_dir,
     check_reference_gate,
     find_dangling_anchors,
     find_references_to,
@@ -599,3 +605,136 @@ def test_owner_model_root_for_outside_all_roots_returns_none(tmp_path: Path):
     outside.mkdir(parents=True)
     assert owner_model_root_for(outside, [root]) is None
     assert owner_model_root_for(outside, []) is None
+
+
+# ---------------------------------------------------------------------------
+# defaults 反查：catalog dir_keywords 目录名
+# rename（find_references_to）与删除预检走同一条 _default_program_dir 路径。
+# ---------------------------------------------------------------------------
+
+
+def _keyword_mainboard_workspace(tmp_path: Path) -> tuple[Path, Path]:
+    """仅含关键词目录 通用/主板 的工作区（无 canonical 名 主板程序）。"""
+    root = tmp_path / "ws"
+    model = root / "L36程序"
+    model.mkdir(parents=True)
+    save_model_id(model, "l36")
+    save_platform_config(model, [PlatformDefaults("标准单机芯3D", {"主板程序": "v1"})])
+    variant = model / "通用" / "主板" / "v1"
+    _write(variant / "rom.bin")
+    return root, variant
+
+
+def test_defaults_keyword_named_dir_hit_on_asset_lookup(tmp_path: Path):
+    """通用/主板（mainboard dir_keywords）上的 defaults，find_references_to 能命中。
+
+    rename 与删除预检都走这条反查路径。
+    """
+    root, variant = _keyword_mainboard_workspace(tmp_path)
+    res = find_references_to(str(root), root, variant, "asset")
+    assert res["ok"] is True
+    hits = [h for h in _result(res["payload"]).hits if h.kind == "platform_default"]
+    assert len(hits) == 1
+    assert hits[0].raw_key == "主板程序"
+    assert hits[0].raw_value == "v1"
+    assert Path(hits[0].current_target).resolve() == variant.resolve()
+
+
+def test_defaults_canonical_named_dir_hit_on_asset_lookup(ws: Path):
+    """通用/主板程序（canonical 名）defaults 反查行为不变。"""
+    l36 = ws / "L36程序"
+    save_platform_config(l36, [PlatformDefaults("标准单机芯3D", {"主板程序": "v1"})])
+    variant = l36 / "通用" / "主板程序" / "v1"
+    res = find_references_to(str(ws), ws, variant, "asset")
+    assert res["ok"] is True
+    hits = [h for h in _result(res["payload"]).hits if h.kind == "platform_default"]
+    assert len(hits) == 1
+    assert hits[0].raw_key == "主板程序"
+    assert hits[0].raw_value == "v1"
+    assert Path(hits[0].current_target).resolve() == variant.resolve()
+
+
+def test_defaults_keyword_dir_catalog_unavailable_does_not_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """catalog 不可用时 _default_program_dir 不崩，不把关键词目录静默当命中。"""
+    import fwasset.core.reference_lookup as rl
+
+    root, variant = _keyword_mainboard_workspace(tmp_path)
+    model = variant.parents[2]  # L36程序
+    monkeypatch.setattr(rl, "_catalog_context", lambda: None)
+    got = _default_program_dir(model, "主板程序", "v1")
+    assert got == model / "通用" / "主板程序" / "v1"
+
+
+def test_defaults_canonical_dir_dangling_anchor_still_hits(ws: Path):
+    """find_dangling_anchors 对 canonical 变体的 platform_default 命中不变。"""
+    l36 = ws / "L36程序"
+    save_platform_config(l36, [PlatformDefaults("标准单机芯3D", {"主板程序": "v1"})])
+    variant = l36 / "通用" / "主板程序" / "v1"
+    res = find_dangling_anchors(str(ws), ws, variant)
+    hits = [h for h in _result(res["payload"]).hits if h.kind == "platform_default"]
+    assert len(hits) == 1
+    assert hits[0].raw_key == "主板程序"
+    assert hits[0].raw_value == "v1"
+
+
+def test_canonical_module_dir_does_not_alias_mainboard_keyword() -> None:
+    """主板 不得写入 canonical 别名表；关键词命中只发生在 _default_program_dir 回退。"""
+    assert canonical_module_dir("主板") == "主板"
+    assert canonical_module_dir("主板程序") == "主板程序"
+
+
+def test_defaults_canonical_dir_preferred_over_keyword_dir(tmp_path: Path) -> None:
+    """canonical 名与关键词目录并存时以 canonical 为准，不再看 dir_keywords。"""
+    root, _keyword = _keyword_mainboard_workspace(tmp_path)
+    model = root / "L36程序"
+    canonical = model / "通用" / "主板程序" / "v1"
+    _write(canonical / "rom.bin")
+
+    got = _default_program_dir(model, "主板程序", "v1")
+    assert got.resolve() == canonical.resolve()
+
+    res = find_references_to(str(root), root, canonical, "asset")
+    assert res["ok"] is True
+    hits = [h for h in _result(res["payload"]).hits if h.kind == "platform_default"]
+    assert len(hits) == 1
+    assert Path(hits[0].current_target).resolve() == canonical.resolve()
+
+
+def test_defaults_non_unique_keyword_dirs_synthesize_canonical(tmp_path: Path) -> None:
+    """通用区有两个均可匹配同一 module_key 的关键词目录 → 合成路径，不静默命中。"""
+    root, variant = _keyword_mainboard_workspace(tmp_path)
+    model = variant.parents[2]
+    other = model / "通用" / "L36主板" / "v1"
+    _write(other / "rom.bin")
+
+    got = _default_program_dir(model, "主板程序", "v1")
+    assert got == model / "通用" / "主板程序" / "v1"
+
+    res = find_references_to(str(root), root, variant, "asset")
+    assert res["ok"] is True
+    hits = [h for h in _result(res["payload"]).hits if h.kind == "platform_default"]
+    assert hits == []
+
+
+def test_delete_asset_precheck_sees_keyword_dir_default_hit(tmp_path: Path) -> None:
+    """delete_asset 预检走同一条 find_references_to：关键词目录 defaults 不得显示无人引用。"""
+    from fwasset.core.services.asset_service import delete_asset
+
+    root, variant = _keyword_mainboard_workspace(tmp_path)
+    lookup = find_references_to(str(root), root, variant, "asset")
+    assert lookup["ok"] is True
+    hits = [h for h in _result(lookup["payload"]).hits if h.kind == "platform_default"]
+    assert len(hits) == 1
+    assert hits[0].raw_key == "主板程序"
+
+    result = delete_asset(
+        str(root), root, variant, confirm_shared=True
+    )
+    assert result["ok"] is True, result
+    assert not variant.exists()
+
+
+def test_retired_anchor_not_in_blocking_categories() -> None:
+    assert "retired_anchor" not in BLOCKING_ISSUE_CATEGORIES

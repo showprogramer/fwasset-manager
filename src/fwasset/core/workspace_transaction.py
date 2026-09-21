@@ -461,11 +461,18 @@ class WorkspaceTransaction:
     现场，``products`` 供「删除本次产物」原语做身份校验（D1.4c）。
     """
 
-    def __init__(self, workspace_root: str | Path, *, operation: str) -> None:
+    def __init__(
+        self,
+        workspace_root: str | Path,
+        *,
+        operation: str,
+        resume: bool = False,
+    ) -> None:
         if not operation.strip():
             raise ValueError("操作名称不能为空")
         self._workspace_root = Path(workspace_root)
         self._operation = operation
+        self._resume = resume
         self._lock = WorkspaceLock(workspace_root)
         self.status = WorkspaceStatus("clean", 0, None)
         self._committed = False
@@ -492,6 +499,11 @@ class WorkspaceTransaction:
     def products(self) -> tuple[OperationProduct, ...]:
         """本事务已记录产物的只读镜像（与落盘一致）。"""
         return tuple(self._log["products"])
+
+    @property
+    def log(self) -> OperationLog:
+        """当前操作日志镜像（续跑按 phase / details 前进）。"""
+        return self._log
 
     def _persist_log(self) -> None:
         _write_json_atomically(
@@ -540,6 +552,8 @@ class WorkspaceTransaction:
         try:
             _initialize_managed_roots(self._workspace_root)
             self.status = load_workspace_status(self._workspace_root)
+            if self._resume:
+                return self._enter_resume()
             if (
                 self._lock.was_abandoned
                 or self.status.state != "clean"
@@ -564,6 +578,26 @@ class WorkspaceTransaction:
         except Exception:
             self._lock.__exit__(None, None, None)
             raise
+
+    def _enter_resume(self) -> WorkspaceTransaction:
+        """崩溃续跑：加载既有日志，把 generation 收为偶数后继续持锁前进。"""
+        log = load_operation_log(self._workspace_root)
+        if log is None or log["operation"] != self._operation:
+            raise WorkspaceRecoveryRequiredError(
+                f"没有可续跑的操作日志（期望 {self._operation}）"
+            )
+        if self.status.state not in {"recovery_required", "operation_in_progress"}:
+            raise WorkspaceRecoveryRequiredError("当前工作区状态不允许续跑")
+        generation = self.status.generation + (self.status.generation % 2)
+        if generation != self.status.generation:
+            _write_generation(self._workspace_root, generation)
+        _write_state(self._workspace_root, "operation_in_progress")
+        self._log = log
+        self._entered = True
+        self.status = WorkspaceStatus(
+            "operation_in_progress", generation, self._operation
+        )
+        return self
 
     def begin_product_write(self) -> None:
         """在调用方首次改动产品数据前持久化 odd generation。"""

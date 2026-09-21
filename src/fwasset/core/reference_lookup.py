@@ -14,6 +14,10 @@ from pathlib import Path
 
 from fwasset.core.file_scan import _is_excluded_dir
 from fwasset.core.firmware_catalog import FirmwareTypeConfig
+from fwasset.core.managed_paths import (
+    RETIRED_VERSIONS_DIRNAME,
+    managed_path_reason,
+)
 from fwasset.core.model_config import (
     MODEL_CONFIG_FILENAME,
     SharedModuleRef,
@@ -78,6 +82,9 @@ class LookupIssue:
     config_path: str
     owner_root: str
     detail: str = ""
+    anchor_path: str = ""
+    source_root: str = ""
+    raw_key: str = ""
 
 
 @dataclass
@@ -398,7 +405,12 @@ def _scan_workspace(
 
 
 def _default_program_dir(model_root: Path, module_key: str, raw_value: str) -> Path:
-    """defaults 条目 → 当前指向（尽力还原）：通用区模块目录 + 变体。"""
+    """defaults 条目 → 当前指向（尽力还原）：通用区模块目录 + 变体。
+
+    先按 ``canonical_module_dir(子目录名) == module_key`` 命中；找不到时回退到
+    catalog ``dir_keywords``（复用 scanner 的 ``_match_catalog_type``）。catalog
+    不可用则保持合成 canonical 路径，不把关键词目录静默当命中。
+    """
     common_dir = model_root / "通用"
     module_dir: Path | None = None
     if common_dir.is_dir():
@@ -410,9 +422,38 @@ def _default_program_dir(model_root: Path, module_key: str, raw_value: str) -> P
             if child.is_dir() and canonical_module_dir(child.name) == module_key:
                 module_dir = child
                 break
+        if module_dir is None:
+            module_dir = _module_dir_by_catalog_keywords(children, module_key, raw_value)
     if module_dir is None:
         module_dir = common_dir / module_key
     return module_dir / raw_value if raw_value else module_dir
+
+
+def _module_dir_by_catalog_keywords(
+    children: list[Path], module_key: str, raw_value: str
+) -> Path | None:
+    """canonical 名未命中时，按 catalog dir_keywords 回退匹配模块目录。
+
+    「唯一」指通用区子目录中满足「命中条目 label 的 canonical == module_key」
+    的目录个数为 1；0 个或 ≥2 个都不把任一关键词目录静默当命中。
+    """
+    context = _catalog_context()
+    if context is None:
+        return None
+    _labels, types = context
+    matches: list[Path] = []
+    for child in children:
+        if not child.is_dir():
+            continue
+        candidate = child / raw_value if raw_value else child
+        matched = _is_catalog_asset_dir(candidate, types)
+        if matched is None:
+            continue
+        if canonical_module_dir(str(matched.get("label", ""))) == module_key:
+            matches.append(child)
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 def _shared_hit(
@@ -725,6 +766,86 @@ def _error_result(code: str, message: str, payload: dict | None = None) -> Servi
     }
 
 
+def _retired_copy_root(path: Path) -> Path | None:
+    """路径若含 ``旧版本`` 段，返回该副本目录（``旧版本`` 的直接子目录）。"""
+    retired = os.path.normcase(RETIRED_VERSIONS_DIRNAME)
+    parts = path.parts
+    for index, part in enumerate(parts):
+        if os.path.normcase(part) != retired:
+            continue
+        if index + 1 < len(parts):
+            return Path(*parts[: index + 2])
+        return Path(*parts[: index + 1])
+    return None
+
+
+def _retired_anchor_issue_for(
+    *,
+    config_path: str,
+    owner_root: str,
+    raw_key: str,
+    anchor: Path,
+) -> LookupIssue | None:
+    if managed_path_reason(anchor, is_dir=True) != "retired_versions":
+        return None
+    copy_root = _retired_copy_root(anchor)
+    return LookupIssue(
+        category="retired_anchor",
+        config_path=config_path,
+        owner_root=owner_root,
+        detail=f"借用锚点落在旧版本：{anchor}",
+        anchor_path=str(anchor),
+        source_root=str(copy_root) if copy_root is not None else str(anchor),
+        raw_key=raw_key,
+    )
+
+
+def _collect_retired_anchor_issues(
+    entries: list[_ModelEntry], ws: Path
+) -> list[LookupIssue]:
+    """扫描全部 shared 引用，锚点落在 ``旧版本/`` 时发出 issue（与本次查询目标无关）。"""
+    issues: list[LookupIssue] = []
+    seen: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        config_path = str(entry.root / MODEL_CONFIG_FILENAME)
+        for raw_key, ref in entry.shared_pairs:
+            anchors: list[Path] = []
+            if ref.mode in ("static", "follow_asset"):
+                anchors.append(ws / Path(str(ref.source_relative_path).replace("\\", "/")))
+            elif ref.mode == "follow_default":
+                resolution = resolve_shared_module(ref, ws)
+                if resolution.resolved_path is not None:
+                    anchors.append(resolution.resolved_path)
+            for anchor in anchors:
+                issue = _retired_anchor_issue_for(
+                    config_path=config_path,
+                    owner_root=str(entry.root),
+                    raw_key=raw_key,
+                    anchor=anchor,
+                )
+                if issue is None:
+                    continue
+                key = (issue.config_path, issue.raw_key, issue.anchor_path)
+                if key in seen:
+                    continue
+                seen.add(key)
+                issues.append(issue)
+    return issues
+
+
+def _retired_anchor_related(target: Path, issue: LookupIssue) -> bool:
+    """查询目标与 issue 的锚点/来源是否同一身份或祖先-后代。"""
+    for related in (issue.anchor_path, issue.source_root):
+        if not related:
+            continue
+        other = Path(related)
+        if same_path_identity(target, other):
+            return True
+        if is_within_boundary(target, other) or is_within_boundary(other, target):
+            return True
+    return False
+
+
 def find_references_to(
     configured_root: str | Path | None,
     workspace_root: str | Path,
@@ -735,6 +856,8 @@ def find_references_to(
 
     返回 ``ok=True`` 时 payload 携带 ``ReferenceLookupResult``；``issues`` 非空
     表示命中清单可能不完整，删除预检/计划构建必须按阻止处理。
+    ``retired_anchor`` 不进全局阻断集合：仅当查询目标与该锚点有边界关系时
+    本次返回 ``ok=False``。
     """
     gate = check_reference_gate(configured_root, workspace_root)
     if gate is not None:
@@ -754,12 +877,27 @@ def find_references_to(
     entries, issues, _id_roots = _scan_workspace(ws)
     hits = _collect_shared_hits(entries, ws, target, target_kind)
     hits.extend(_collect_defaults_hits(entries, target, target_kind))
+    issues.extend(_collect_retired_anchor_issues(entries, ws))
     hits.sort(key=lambda h: (h.owner_root, h.kind, h.module_key, h.raw_key))
     result = ReferenceLookupResult(
         hits=hits,
         issues=issues,
         model_roots=[str(e.root) for e in entries],
     )
+    related = next(
+        (
+            issue
+            for issue in issues
+            if issue.category == "retired_anchor" and _retired_anchor_related(target, issue)
+        ),
+        None,
+    )
+    if related is not None:
+        return _error_result(
+            "retired_anchor",
+            "目标与旧版本中的借用锚点存在路径关系，已阻止",
+            {"result": result},
+        )
     return {
         "ok": True,
         "code": "ok",

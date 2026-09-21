@@ -36,6 +36,9 @@ MANAGED_ROOT_DIRNAME = ".fwasset"
 #: 资产内部备用副本目录名（精确目录段比较，见 D4.1）。
 RETIRED_VERSIONS_DIRNAME = "旧版本"
 
+#: D4.2 备用副本元数据文件名。禁止再写字面量 ``"退位信息.toml"``。
+RETIRED_METADATA_FILENAME = "退位信息.toml"
+
 #: 程序元数据文件名（D6.2）。
 ASSET_METADATA_FILENAME = "程序信息.toml"
 

@@ -277,8 +277,19 @@ ClearDefaultsKind = Literal[
     "custom_scheme_move",
 ]
 
-#: D1.4b 退位方式。两种记录不得合并。
+#: D1.4b / D1.1 退位方式。两种记录不得合并。
 RetireMode = Literal["retire_to_trash", "retire_to_backup"]
+
+RetiredBy = Literal["update_asset", "change_asset_semantics", "restore_retired_version"]
+
+
+class RetiredVersionMetadata(TypedDict):
+    """D4.2 备用副本元数据（``退位信息.toml`` 四字段齐全）。"""
+
+    retired_from: str
+    content_hash: str
+    retired_at: str
+    retired_by: RetiredBy
 
 
 @dataclass

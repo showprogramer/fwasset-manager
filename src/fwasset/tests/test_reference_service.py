@@ -971,3 +971,51 @@ def test_clear_defaults_plan_reports_parse_error(ws: Path):
     old = ws / "L36程序" / "通用" / "快捷键" / "贝乐"
     res = build_clear_defaults_plan(str(ws), str(ws), str(old), "change_type")
     assert res["ok"] is False and res["code"] == "config_parse_error"
+
+
+def _keyword_mainboard_workspace(tmp_path: Path) -> tuple[Path, Path]:
+    """仅含关键词目录 通用/主板 的工作区（无 canonical 名 主板程序）。"""
+    root = tmp_path / "ws"
+    model = root / "L36程序"
+    model.mkdir(parents=True)
+    save_model_id(model, "l36")
+    save_platform_config(model, [PlatformDefaults("标准单机芯3D", {"主板程序": "v1"})])
+    variant = model / "通用" / "主板" / "v1"
+    _write(variant / "rom.bin")
+    return root, variant
+
+
+def test_rename_plan_includes_keyword_dir_defaults(tmp_path: Path) -> None:
+    """关键词模块目录上的 platform_default 必须进入 rename 改写计划。"""
+    root, variant = _keyword_mainboard_workspace(tmp_path)
+    new = variant.parent / "v2"
+    res = build_rewrite_plan(
+        str(root),
+        str(root),
+        RewriteRequest(
+            operation="rename",
+            target_kind="asset",
+            old_path=str(variant),
+            new_path=str(new),
+        ),
+    )
+    assert res["ok"] is True, res
+    plan = res["payload"]["plan"]
+    hits = [h for h in plan.hits if h.kind == "platform_default"]
+    assert len(hits) == 1
+    assert hits[0].raw_key == "主板程序"
+    assert hits[0].block_index == 0
+    assert plan.files
+
+
+def test_clear_defaults_plan_includes_keyword_dir_hit(tmp_path: Path) -> None:
+    """D1.3 builder 对关键词目录 defaults 必须签发非空计划。"""
+    root, variant = _keyword_mainboard_workspace(tmp_path)
+    res = build_clear_defaults_plan(str(root), str(root), str(variant), "change_type")
+    assert res["ok"] is True, res
+    plan = res["payload"]["plan"]
+    hits = [h for h in plan.hits if h.kind == "platform_default"]
+    assert len(hits) == 1
+    assert hits[0].raw_key == "主板程序"
+    assert hits[0].block_index == 0
+    assert plan.files
