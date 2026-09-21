@@ -60,15 +60,28 @@ from fwasset.core.scheme_config import (
     serialize_scheme_config,
 )
 from fwasset.core.shared_module_resolver import resolve_shared_module
-from fwasset.core.types import RewriteRequest, ServiceResult
+from fwasset.core.types import ClearDefaultsKind, RewriteRequest, ServiceResult
 
 __all__ = [
     "FileRewrite",
     "RewritePlan",
     "apply_rewrite_plan",
+    "build_clear_defaults_plan",
     "build_rewrite_plan",
     "migrate_follow_default_refs",
 ]
+
+#: D1.3 语义变化种类 → 是否清除命中的 platform defaults。
+#:
+#: ``custom_to_general`` 不自动设默认（由用户显式「设为默认」）；
+#: ``custom_scheme_move`` 不涉及 defaults（defaults 只指向通用区）。
+#: 两者都返回**空计划**而非错误——调用方无需按种类分支。
+_CLEAR_DEFAULTS_KINDS: dict[str, bool] = {
+    "change_type": True,
+    "general_to_custom": True,
+    "custom_to_general": False,
+    "custom_scheme_move": False,
+}
 
 
 @dataclass
@@ -517,6 +530,161 @@ def build_rewrite_plan(
         "message": f"改写计划就绪：{len(plan.files)} 个文件待改写",
         "payload": {"plan": plan},
     }
+
+
+def build_clear_defaults_plan(
+    configured_root: str | Path | None,
+    workspace_root: str | Path,
+    old_path: str | Path,
+    change_kind: ClearDefaultsKind,
+    *,
+    log_fn: Callable[..., None] = print,
+) -> ServiceResult:
+    """签发「清除失效 platform defaults」计划（D1.3，纯函数、不改盘、不持锁）。
+
+    ``build_rewrite_plan`` 遇语义变化一律 ``unsupported_semantic_change``，
+    而改类型 / 通用转定制后旧 default 必然失效，故需本入口。
+
+    **命中集由 builder 自行冷读派生，签名内没有 ``hits`` 参数**：调用方传入
+    不完整清单会漏清 defaults（留下悬空 default），传入过期或伪造 hit 会清错
+    块。即便上游 D1.1 已校验过 ``old_path``，本入口仍自行确认它是现存合法
+    资产——builder 不信任调用方状态。
+
+    产出的是既有 :class:`RewritePlan`（同一 ``_plan_token`` 签发），直接交
+    ``apply_rewrite_plan`` 在锁内 CAS 落盘、可回滚；不另起平行结构。
+    """
+    ws = Path(workspace_root).resolve()
+    gate = check_reference_gate(configured_root, workspace_root)
+    if gate is not None:
+        return gate
+
+    if change_kind not in _CLEAR_DEFAULTS_KINDS:
+        return _error_result("invalid_request", f"未知的语义变化种类：{change_kind}")
+
+    try:
+        target = assert_within_workspace(Path(old_path), ws)
+    except PathGuardError as exc:
+        return _error_result("out_of_workspace", f"目标不在工作区内：{exc}")
+
+    kind_detail = _validate_target_kind(target, "asset")
+    if kind_detail is not None:
+        return _error_result(
+            "invalid_target", f"目标不是现存的合法程序目录：{kind_detail}"
+        )
+
+    request = RewriteRequest(
+        operation="clear_defaults",
+        target_kind="asset",
+        old_path=str(target),
+    )
+    plan = RewritePlan(
+        configured_root=str(Path(configured_root or "")),
+        workspace_root=str(ws),
+        request=request,
+    )
+
+    if not _CLEAR_DEFAULTS_KINDS[change_kind]:
+        # custom_to_general / custom_scheme_move：空计划是**正常结果**，
+        # 调用方照常 apply（零文件即零写入），不必按种类分支。
+        plan.token = _plan_token(plan)
+        log_fn(f"语义变化「{change_kind}」无需清理 defaults")
+        return {
+            "ok": True,
+            "code": "ok",
+            "message": "本次语义变化不涉及平台默认，无需清理",
+            "payload": {"plan": plan},
+        }
+
+    entries, issues, _id_roots = _scan_workspace(ws)
+    blocking = [i for i in issues if is_blocking_issue(i)]
+    if blocking:
+        # 命中集不完整就签发 = 漏清 → 已知悬空 default，宁可阻止。
+        # 平台配置自身读不出来是本入口要改的那个文件坏了，单独给码，
+        # 否则用户只看到「反查不完整」，不知道该去修哪个文件。
+        parse_errors = [i for i in blocking if i.category == "platform_parse_error"]
+        if parse_errors:
+            return _error_result(
+                "config_parse_error",
+                "平台配置严格读取失败，已阻止清理默认："
+                + "；".join(i.detail for i in parse_errors),
+                payload={"issues": [i.__dict__ for i in parse_errors]},
+            )
+        return _error_result(
+            "reference_incomplete",
+            "存在配置损坏或身份异常，反查清单不完整，已阻止清理默认",
+            payload={"issues": [i.__dict__ for i in blocking]},
+        )
+
+    from fwasset.core.reference_lookup import _collect_defaults_hits
+
+    hits = _collect_defaults_hits(entries, target, "asset")
+    plan.hits = hits
+    if not hits:
+        plan.token = _plan_token(plan)
+        return {
+            "ok": True,
+            "code": "ok",
+            "message": "没有指向该程序的平台默认，无需清理",
+            "payload": {"plan": plan},
+        }
+
+    _assemble_clear_defaults_files(plan, entries, hits)
+
+    log_fn(f"清理默认计划：{len(plan.files)} 个文件，{len(hits)} 条命中")
+    plan.token = _plan_token(plan)
+    return {
+        "ok": True,
+        "code": "ok",
+        "message": f"清理默认计划就绪：{len(hits)} 条平台默认待清除",
+        "payload": {"plan": plan},
+    }
+
+
+def _assemble_clear_defaults_files(
+    plan: RewritePlan,
+    entries: list[_ModelEntry],
+    hits: list[ReferenceHit],
+) -> None:
+    """把 defaults 命中落成逐文件删除条目。
+
+    清除范围**限定为命中的 ``(block_index, raw_key)``**：同模块的其他块、
+    同块的其他模块一律零改动。调用方已排除严格读取失败的配置。
+    """
+    entries_by_root = {str(e.root): e for e in entries}
+    scoped: dict[str, tuple[_ModelEntry, set[tuple[int, str]], list[str]]] = {}
+    for hit in hits:
+        entry = entries_by_root.get(hit.owner_root)
+        if entry is None:
+            continue
+        cfg = str(entry.root / PLATFORM_CONFIG_FILENAME)
+        bucket = scoped.setdefault(cfg, (entry, set(), []))
+        bucket[1].add((hit.block_index, hit.raw_key))
+        bucket[2].append(f"defaults[{hit.raw_key}]: {hit.raw_value!r} → 已清除")
+
+    for cfg, (entry, removals, changes) in scoped.items():
+        pre_path = entry.root / PLATFORM_CONFIG_FILENAME
+        platforms = deepcopy(entry.platforms)
+        for block_index, raw_key in removals:
+            if block_index >= len(platforms):
+                continue
+            platforms[block_index].defaults.pop(raw_key, None)
+        new_content = serialize_platform_config(platforms)
+        original_bytes = pre_path.read_bytes() if pre_path.exists() else None
+        plan.files.append(
+            FileRewrite(
+                kind="platform_config",
+                pre_path=pre_path,
+                post_path=Path(cfg),
+                owner_root=str(entry.root),
+                original_bytes=original_bytes,
+                original_sha256=(
+                    _sha256(original_bytes) if original_bytes is not None else ""
+                ),
+                new_content=new_content,
+                new_sha256=_sha256(new_content.encode("utf-8")),
+                changes=changes,
+            )
+        )
 
 
 def _rewritten_ref_rel(

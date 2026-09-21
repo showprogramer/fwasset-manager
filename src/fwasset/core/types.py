@@ -263,7 +263,22 @@ class FirmwareAsset(TypedDict):
 # ---------------------------------------------------------------------------
 
 ReferenceTargetKind = Literal["model", "scheme", "module", "asset"]
-ReferenceOperation = Literal["rename", "update"]
+#: ``clear_defaults``（D1.3）只由 ``build_clear_defaults_plan`` 签发：语义变化
+#: 时清除失效的 platform defaults 条目，``build_rewrite_plan`` 不接受该取值。
+ReferenceOperation = Literal["rename", "update", "clear_defaults"]
+
+#: D1.3 语义变化种类。``change_type`` 改程序类型；``general_to_custom`` /
+#: ``custom_to_general`` 通用区与定制区互转；``custom_scheme_move`` 定制区内
+#: 换方案。各自的 defaults 处理见 ``build_clear_defaults_plan``。
+ClearDefaultsKind = Literal[
+    "change_type",
+    "general_to_custom",
+    "custom_to_general",
+    "custom_scheme_move",
+]
+
+#: D1.4b 退位方式。两种记录不得合并。
+RetireMode = Literal["retire_to_trash", "retire_to_backup"]
 
 
 @dataclass

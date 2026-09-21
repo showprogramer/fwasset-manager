@@ -19,6 +19,7 @@ from fwasset.core.platform_config import PlatformDefaults, save_platform_config
 from fwasset.core.services.reference_service import (
     RewritePlan,
     apply_rewrite_plan,
+    build_clear_defaults_plan,
     build_rewrite_plan,
     migrate_follow_default_refs,
 )
@@ -889,3 +890,84 @@ def test_junction_anchor_update_overlap_blocked(ws: Path, tmp_path: Path):
     )
     res = build_rewrite_plan(str(ws), str(ws), req)
     assert res["ok"] is False and res["code"] == "invalid_operation"
+
+
+# ---------------------------------------------------------------------------
+# D1.3 build_clear_defaults_plan（子任务 6a）
+# ---------------------------------------------------------------------------
+
+
+def test_clear_defaults_plan_change_type_clears_hit_entry(ws: Path):
+    """改类型：清除旧 canonical 键命中的 defaults，计划可直接 apply。"""
+    old = ws / "L36程序" / "通用" / "快捷键" / "贝乐"
+    res = build_clear_defaults_plan(str(ws), str(ws), str(old), "change_type")
+    assert res["ok"] is True, res
+    plan = res["payload"]["plan"]
+    assert [f.kind for f in plan.files] == ["platform_config"]
+    assert apply_rewrite_plan(plan, str(ws))["ok"] is True
+    from fwasset.core.platform_config import load_platform_config
+
+    defaults = load_platform_config(ws / "L36程序")[0].defaults
+    assert "快捷键程序" not in defaults
+    assert defaults["主板程序"] == "v1"  # 同块其他条目不受影响
+
+
+def test_clear_defaults_plan_general_to_custom_also_clears(ws: Path):
+    """通用转定制同样清除精确命中，避免留下已知悬空 default。"""
+    old = ws / "L36程序" / "通用" / "快捷键" / "贝乐"
+    res = build_clear_defaults_plan(str(ws), str(ws), str(old), "general_to_custom")
+    assert res["ok"] is True, res
+    assert len(res["payload"]["plan"].files) == 1
+
+
+def test_clear_defaults_plan_custom_to_general_is_empty(ws: Path):
+    """定制转通用不自动设默认，返回空计划。"""
+    old = ws / "L36程序" / "通用" / "快捷键" / "贝乐"
+    res = build_clear_defaults_plan(str(ws), str(ws), str(old), "custom_to_general")
+    assert res["ok"] is True, res
+    assert res["payload"]["plan"].files == []
+
+
+def test_clear_defaults_plan_custom_scheme_move_is_empty(ws: Path):
+    """定制内换方案不涉及 defaults（defaults 只指向通用区），空计划。"""
+    old = ws / "L36程序" / "通用" / "快捷键" / "贝乐"
+    res = build_clear_defaults_plan(str(ws), str(ws), str(old), "custom_scheme_move")
+    assert res["ok"] is True, res
+    assert res["payload"]["plan"].files == []
+
+
+def test_clear_defaults_plan_rejects_missing_target(ws: Path):
+    old = ws / "L36程序" / "通用" / "快捷键" / "不存在"
+    res = build_clear_defaults_plan(str(ws), str(ws), str(old), "change_type")
+    assert res["ok"] is False and res["code"] == "invalid_target"
+
+
+def test_clear_defaults_plan_rejects_incomplete_lookup(ws: Path):
+    """反查阻断级 issue → 命中集不完整，拒绝签发计划。"""
+    _borrow(ws / "L50程序", "快捷键程序", "L50程序/../L36程序/通用/快捷键/贝乐")
+    old = ws / "L36程序" / "通用" / "快捷键" / "贝乐"
+    res = build_clear_defaults_plan(str(ws), str(ws), str(old), "change_type")
+    assert res["ok"] is False and res["code"] == "reference_incomplete"
+
+
+def test_clear_defaults_plan_signature_has_no_hits_parameter():
+    """硬约束：builder 自行派生命中集，签名内不得出现 hits。"""
+    import inspect
+
+    assert "hits" not in inspect.signature(build_clear_defaults_plan).parameters
+
+
+def test_clear_defaults_plan_token_passes_apply_validation(ws: Path):
+    """复用既有 RewritePlan / _plan_token，而非平行实现。"""
+    old = ws / "L36程序" / "通用" / "快捷键" / "贝乐"
+    plan = build_clear_defaults_plan(str(ws), str(ws), str(old), "change_type")["payload"]["plan"]
+    assert isinstance(plan, RewritePlan)
+    assert apply_rewrite_plan(plan, str(ws))["code"] != "invalid_plan"
+
+
+def test_clear_defaults_plan_reports_parse_error(ws: Path):
+    """平台配置严格读取失败 → config_parse_error，不签发计划。"""
+    atomic_write_text(ws / "L36程序" / "平台配置.toml", "这不是合法 TOML = = =\n")
+    old = ws / "L36程序" / "通用" / "快捷键" / "贝乐"
+    res = build_clear_defaults_plan(str(ws), str(ws), str(old), "change_type")
+    assert res["ok"] is False and res["code"] == "config_parse_error"
