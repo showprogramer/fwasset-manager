@@ -185,10 +185,11 @@ def load_vendor_candidates() -> list[str]:
 # USB 扫描常量（硬编码，不再从用户配置读取）
 SCAN_ROM_EXTENSIONS: list[str] = [".rom"]
 SCAN_PKG_EXTENSIONS: list[str] = [".pkg"]
+# 泛化的 "旧" 已按 D4.3③ 退役：它按子串匹配，会连带排除 旧款L36 这类真实型号
+# 目录。``旧版本/`` 备用副本仍由 managed_paths 的**精确目录段**比较排除。
 SCAN_EXCLUDE_DIR_KEYWORDS: list[str] = [
     "CH341SER",
     "接线图",
-    "旧",
     "新建文件夹",
     "照片",
 ]

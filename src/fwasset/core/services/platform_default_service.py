@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import get_args
 
 from fwasset.core.path_guard import PathGuardError, assert_within_workspace
 from fwasset.core.platform_config import (
@@ -11,6 +12,7 @@ from fwasset.core.platform_config import (
     save_platform_config,
 )
 from fwasset.core.scheme_config import discover_schemes
+from fwasset.core.types import ChassisType
 
 # 再导出，便于 view model / 测试从 service 侧一并导入
 __all__ = [
@@ -22,6 +24,8 @@ __all__ = [
 ]
 
 _INTERNAL_DEFAULT_BLOCK = "默认"
+
+_CHASSIS_TYPES: set[str] = set(get_args(ChassisType))
 
 
 def _scheme_platform_names(model_root: Path) -> list[str]:
@@ -50,16 +54,24 @@ def bootstrap_platform_blocks(model_root: Path | str) -> list[PlatformDefaults]:
     return [PlatformDefaults(platform_name=_INTERNAL_DEFAULT_BLOCK, defaults={})]
 
 
+def _is_normalized_blocks(platforms: list[PlatformDefaults]) -> bool:
+    """D5.5③：恰好一个块且块名属机芯类型枚举 = 已归一，不得再制造新块。"""
+    return len(platforms) == 1 and platforms[0].platform_name in _CHASSIS_TYPES
+
+
 def ensure_platform_blocks(
     model_root: Path | str, platforms: list[PlatformDefaults]
 ) -> list[PlatformDefaults]:
     """保证写盘前有配置块：空则 bootstrap；已有则补全方案声明但尚未建块的 platform。
 
-    不删除历史块。
+    不删除历史块。已归一型号（单块 + 枚举名）**原样返回**，不再从方案
+    ``platform`` 补块，否则归一成果会被这条旧路径重新打散（D5.5③）。
     """
     root = Path(model_root)
     if not platforms:
         return bootstrap_platform_blocks(root)
+    if _is_normalized_blocks(platforms):
+        return platforms
     existing = {p.platform_name for p in platforms}
     for name in _scheme_platform_names(root):
         if name not in existing:
@@ -176,8 +188,21 @@ def set_default_variant(
     if err is not None:
         return err
 
+    assert platforms is not None
+    if _is_normalized_blocks(platforms) and platforms[0].platform_name != platform:
+        message = "该型号平台配置已归一，不能新建配置块"
+        log_fn(message)
+        return {
+            "ok": False,
+            "code": "platform_normalized_locked",
+            "message": message,
+            "payload": {
+                "current": platforms[0].platform_name,
+                "requested": platform,
+            },
+        }
+
     try:
-        assert platforms is not None
         target = next((p for p in platforms if p.platform_name == platform), None)
         if target is None:
             target = PlatformDefaults(platform_name=platform)

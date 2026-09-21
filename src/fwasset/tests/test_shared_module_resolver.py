@@ -165,7 +165,7 @@ def test_variants_skip_noise_dirs(tmp_path: Path):
     mod = src / "通用" / "快捷键"
     _write(mod / "贝乐" / "a.hex")
     _write(mod / "backup" / "old.hex")
-    _write(mod / "旧" / "old2.hex")
+    _write(mod / "tmp" / "old2.hex")
     save_model_id(src, "l36")
     lookup = _id_lookup(ws)
     res = resolve_shared_module(

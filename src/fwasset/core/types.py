@@ -278,6 +278,51 @@ ClearDefaultsKind = Literal[
 ]
 
 #: D1.4b / D1.1 退位方式。两种记录不得合并。
+class PlatformBlockView(TypedDict):
+    """归一预览里的单个 ``[[platform]]`` 块（原样展示，不做 canonical 化）。"""
+
+    block_index: int
+    name: str
+    is_chassis_type: bool
+    defaults: dict[str, str]
+
+
+class ModuleConflictView(TypedDict):
+    """按 canonical 模块键聚合后的取值分类（D5.5「逐模块处理 defaults 冲突」）。
+
+    ``kind`` 判定互斥且有序：先 ``value_conflict``（异值），再
+    ``alias_duplicate``（同值多别名键），最后 ``unique``。
+    """
+
+    module_key: str
+    raw_keys: list[str]
+    values: list[str]
+    kind: Literal["unique", "alias_duplicate", "value_conflict"]
+    resolved: str
+
+
+class NormalizeExpectation(TypedDict):
+    """用户确认时所见配置的最小摘要（普通值对象，**不是**签发 token）。"""
+
+    block_names: list[str]
+    module_values: dict[str, list[str]]
+
+
+class PlatformNormalizePreview(TypedDict):
+    """``preview_platform_normalize`` 的只读产物（不持锁、不写盘）。"""
+
+    model_root: str
+    blocks: list[PlatformBlockView]
+    conflicts: list[ModuleConflictView]
+    chassis_candidates: list[str]
+    needs_module_choice: list[str]
+    follow_default_hits: list[dict[str, Any]]
+    follow_default_blocked: bool
+    already_normalized: bool
+    expectation: NormalizeExpectation
+    discarded_content: list[str]
+
+
 RetireMode = Literal["retire_to_trash", "retire_to_backup"]
 
 RetiredBy = Literal["update_asset", "change_asset_semantics", "restore_retired_version"]

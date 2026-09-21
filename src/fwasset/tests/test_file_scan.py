@@ -243,7 +243,7 @@ def test_scan_firmware_assets_uses_expanded_catalog_keywords_and_excludes(
     ignored_photo_dir.mkdir(parents=True)
     (ignored_photo_dir / "voice_v3.0.0.bin").write_text("voice", encoding="utf-8")
 
-    ignored_old_dir = tmp_path / "L36配置" / "旧" / "快捷键程序"
+    ignored_old_dir = tmp_path / "L36配置" / "新建文件夹" / "快捷键程序"
     ignored_old_dir.mkdir(parents=True)
     (ignored_old_dir / "shortcut_v4.0.0.bin").write_text("shortcut", encoding="utf-8")
 
@@ -484,15 +484,11 @@ def test_scan_excludes_retired_versions_directory(tmp_path: Path):
     assert all("旧版本" not in path for path in paths)
 
 
-def test_scan_does_not_exclude_retired_versions_prefix_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_scan_does_not_exclude_retired_versions_prefix_directory(tmp_path: Path):
     """旧版本说明/ 是普通用户目录，精确段比较不得误排。
 
-    需临时移除 legacy 泛化关键词 "旧"（它会先一步整枝排除），才能观察受管
-    路径判定自身的行为；泛化关键词现状另有测试固化。
+    泛化关键词 "旧" 已按 D4.3③ 退役，不再需要 monkeypatch 把它移走。
     """
-    monkeypatch.setattr(file_scan, "SCAN_EXCLUDE_DIR_KEYWORDS", ["CH341SER"])
     target = tmp_path / "旧版本说明" / "语音板"
     target.mkdir(parents=True)
     (target / "voice_v2.0.0.bin").write_text("voice", encoding="utf-8")
@@ -517,11 +513,10 @@ def test_scan_filters_asset_metadata_from_files(tmp_path: Path):
     assert assets[0]["files"] == ["voice_v2.0.0.bin"]
 
 
-def test_legacy_generic_old_keyword_still_excludes_real_model_dir(tmp_path: Path):
-    """固化现状：泛化关键词 "旧" 会静默排除 旧款L36 这类真实型号目录。
+def test_generic_old_keyword_retired_so_real_model_dir_is_scanned(tmp_path: Path):
+    """D4.3③ 退役后，旧款L36 这类真实型号目录不再被泛化 "旧" 静默排除。
 
-    这是既存隐患（父规格 D4.3③），退役归子任务 7；此处固化行为，避免在
-    受管路径改造中被无意改变。
+    退役前此处固化的是相反行为；完整退役断言见 test_legacy_exclusions.py。
     """
     legacy = tmp_path / "旧款L36" / "语音板"
     legacy.mkdir(parents=True)
@@ -530,7 +525,7 @@ def test_legacy_generic_old_keyword_still_excludes_real_model_dir(tmp_path: Path
     assets, errors = scan_firmware_assets(str(tmp_path))
 
     assert errors == []
-    assert assets == []
+    assert [item["path"] for item in assets] == [str(legacy)]
 
 
 def test_scan_excludes_internal_managed_roots(tmp_path: Path):

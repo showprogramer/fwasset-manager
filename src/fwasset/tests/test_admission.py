@@ -241,11 +241,21 @@ def test_invalid_name_reason_edges():
 
 
 def test_path_excluded_by_keyword(ws: Path):
-    _reject(ws / "L36程序" / "通用" / "旧手柄" / "v1", "asset", ws, "path_excluded")
+    _reject(ws / "L36程序" / "通用" / "照片手柄" / "v1", "asset", ws, "path_excluded")
+
+
+def test_path_with_retired_generic_keyword_is_allowed(ws: Path):
+    """D4.3③：泛化 "旧" 退役后，名含「旧」的路径不再被 D3.5 拒绝。"""
+    validate_new_path(
+        ws / "L36程序" / "通用" / "旧手柄" / "v1",
+        kind="asset",
+        configured_root=str(ws),
+        workspace_root=ws,
+    )
 
 
 def test_workspace_excluded_by_keyword(tmp_path: Path):
-    root = tmp_path / "旧固件" / "ws"
+    root = tmp_path / "照片固件" / "ws"
     root.mkdir(parents=True)
     (root / "通用").mkdir()
     _reject(root / "通用" / "主板程序" / "v1", "asset", root, "workspace_excluded")

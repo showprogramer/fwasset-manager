@@ -72,9 +72,9 @@ def _is_excluded_dir(dirpath: str, workspace_root: Path | None = None) -> bool:
 
     受管判定走公共 helper，不在此复制字符串规则。``workspace_root`` 必须传入，
     否则 staging / 候选区 / 隔离区等**内部受管根无法被识别**，其中的固件会被
-    扫描成正式资产。legacy ``SCAN_EXCLUDE_DIR_KEYWORDS`` 的泛化子串匹配作为
-    短期兼容保留（含泛化的 ``"旧"``，会连带排除 ``旧款L36`` 这类真实型号
-    目录——既存隐患，退役见父规格 D4.3③）。
+    扫描成正式资产。``SCAN_EXCLUDE_DIR_KEYWORDS`` 仍按子串匹配，但泛化的
+    ``"旧"`` 已按 D4.3③ 退役（它会连带排除 ``旧款L36`` 这类真实型号目录）；
+    ``旧版本/`` 备用副本改由受管路径的**精确目录段**比较排除。
     """
     if should_exclude_managed_path(
         dirpath, is_dir=True, workspace_root=workspace_root

@@ -123,9 +123,14 @@ def discover_schemes(model_root: Path) -> list[SchemeConfig]:
 
 
 def _is_excluded_dir(name: str) -> bool:
-    """判断目录名是否应被跳过（临时、备份等）。"""
+    """判断目录名是否应被跳过（临时、备份等）。
+
+    这里的关键词表与 ``settings.SCAN_EXCLUDE_DIR_KEYWORDS`` 各自独立。泛化的
+    ``"旧"`` 已按 D4.3③ 一并退役：它在**型号级子目录**那一层生效，留着会让
+    ``旧款L36`` 的全部定制方案整片消失。其余四项不会命中中文业务目录名。
+    """
     lower = name.lower()
-    return any(kw in lower for kw in ("backup", "-back", "旧", "temp", "tmp"))
+    return any(kw in lower for kw in ("backup", "-back", "temp", "tmp"))
 
 
 def scheme_for_path(

@@ -354,6 +354,10 @@ def _is_ignorable_entry(entry: Path, workspace_root: Path, *, is_dir: bool) -> b
     关键词只对目录生效——scanner 的排除语义是「整枝目录不要」，工作区根下的
     散落**文件**（``接线图.txt`` 之类）不是扫描排除对象，必须计入未知内容，
     否则会把用户堆放资料的目录误判成空工作区。
+
+    泛化 ``"旧"`` 退役后（D4.3③），根下名含「旧」的目录不再可忽略：带型号标志
+    计为型号，否则计为未知内容（布局可能变 ``invalid``）。这是有意的——用户
+    目录不该被静默忽略。
     """
     if should_exclude_managed_path(entry, is_dir=is_dir, workspace_root=workspace_root):
         return True
