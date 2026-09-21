@@ -22,12 +22,17 @@ from fwasset.core.manifest import manifest_hash
 from fwasset.core.path_guard import is_within_boundary
 from fwasset.core.staging_io import (
     StagingError,
+    _assert_session_directory,
+    _assert_transaction_workspace,
     allocate_staging_area,
     cleanup_staging_area,
     promote_staging,
 )
 from fwasset.core.types import StagedImport
-from fwasset.core.workspace_transaction import WorkspaceTransaction
+from fwasset.core.workspace_transaction import (
+    WorkspaceTransaction,
+    workspace_lock_is_held,
+)
 
 
 class AssetImportError(RuntimeError):
@@ -99,29 +104,53 @@ def stage_import_directory(
     transaction: WorkspaceTransaction,
     workspace_root: str | Path,
     source: str | Path,
+    *,
+    session: str | Path | None = None,
 ) -> StagedImport:
-    """文件夹导入：会话根替代来源目录这一层，内部结构原样保留。"""
-    session = allocate_staging_area(workspace_root, transaction)
+    """文件夹导入：会话根替代来源目录这一层，内部结构原样保留。
+
+    调用方若已分配并持久化 ``session``，传入后本函数不再另行分配；失败时
+    也不自动清理该会话，以便崩溃续跑按日志回收。
+    """
+    if session is None:
+        owned = True
+        area = allocate_staging_area(workspace_root, transaction)
+    else:
+        owned = False
+        area = Path(session)
+        if not transaction.is_active or not workspace_lock_is_held(workspace_root):
+            raise StagingError("传入的 staging 会话只能在持锁且未提交的事务内使用")
+        _assert_transaction_workspace(transaction, workspace_root)
+        _assert_session_directory(area, workspace_root)
+        if not area.is_dir():
+            raise StagingError(f"传入的 staging 会话不存在或不是目录：{area}")
+        try:
+            leftover = any(area.iterdir())
+        except OSError as exc:
+            raise StagingError(f"无法读取传入的 staging 会话：{area}") from exc
+        if leftover:
+            raise StagingError(f"传入的 staging 会话必须为空：{area}")
     try:
         src = Path(source)
         if not src.is_dir():
             raise AssetImportError("source_unreadable", f"来源不是目录：{src}")
         _assert_source_not_managed(src, is_dir=True, workspace_root=workspace_root)
-        if is_within_boundary(session, src):
+        if is_within_boundary(area, src):
             raise AssetImportError(
                 "source_overlap",
                 f"来源包含暂存区，导入会产生自嵌套：{src}",
             )
-        skipped = _copy_tree_contents(src, session)
-        if _count_files(session) == 0:
+        skipped = _copy_tree_contents(src, area)
+        if _count_files(area) == 0:
             raise AssetImportError(
                 "empty_source",
                 "来源目录没有任何可导入文件",
                 {"skipped_metadata": skipped},
             )
-        return {"session": str(session), "skipped_metadata": skipped}
+        return {"session": str(area), "skipped_metadata": skipped}
     except BaseException:
-        _cleanup_quietly(workspace_root, session)
+        if owned:
+            _cleanup_quietly(workspace_root, area)
         raise
 
 

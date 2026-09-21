@@ -12,11 +12,12 @@ generation 收束（子任务 4 定稿、5/5a 沿用）；已落盘半成品的�
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import shutil
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -63,8 +64,10 @@ from fwasset.core.reference_lookup import (
     find_references_to,
 )
 from fwasset.core.services.reference_service import (
+    FileRewrite,
     RewritePlan,
     _derive_semantics,
+    _plan_token,
     apply_rewrite_plan,
     build_clear_defaults_plan,
     build_rewrite_plan,
@@ -99,7 +102,9 @@ __all__ = [
     "normalize_module_leaf",
     "restore_retired_version",
     "resume_change_asset_semantics",
+    "resume_normalize_module_leaf",
     "resume_restore_retired_version",
+    "resume_update_asset",
     "retire_asset_to_backup",
     "update_asset",
 ]
@@ -121,6 +126,16 @@ def _transaction_error(exc: Exception) -> ServiceResult:
     if isinstance(exc, WorkspaceRecoveryRequiredError):
         return _error("recovery_required", "工作区存在待恢复的中断操作，暂不能写入")
     return _error("write_failed", f"写入失败：{exc}")
+
+
+def _coerce_asset_path(old_asset: FirmwareAsset | Mapping[str, Any] | str | Path) -> Path:
+    """6A-IMP-003：公开契约是 FirmwareAsset，只取其 path，随后仍冷扫重验。"""
+    if isinstance(old_asset, Mapping):
+        raw = old_asset.get("path")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValueError("程序对象缺少 path")
+        return Path(raw)
+    return Path(old_asset)
 
 
 def _scan_single_asset(
@@ -355,13 +370,22 @@ def _run_normalize(
             plan_result["payload"],
         )
     plan = plan_result["payload"]["plan"]
+    transaction.set_phase(
+        "build_plan",
+        details={
+            "module": str(module),
+            "target": str(target),
+            "plan": _serialize_rewrite_plan(plan),
+        },
+    )
 
     transaction.begin_product_write()
 
-    # 步骤 2：M → staging（不能把 M 直接移进自身后代 M/V）
-    transaction.set_phase("move_to_staging")
+    # 步骤 2：M → staging（不能把 M 直接移进自身后代 M/V）。
+    # 6A-IMP-002：先持久化 staging 身份，再 os.replace；崩溃夹在中间仍能找到 temp。
     try:
         staging = allocate_staging_area(ws, transaction)
+        transaction.set_phase("move_to_staging", details={"staging": str(staging)})
         os.rmdir(staging)  # os.replace 要求目标不存在
         os.replace(module, staging)
     except (OSError, StagingError) as exc:
@@ -417,6 +441,7 @@ def _run_normalize(
                 apply_result["payload"],
             )
         return _rollback_normalize(transaction, ws, module, target, apply_result)
+    transaction.set_phase("apply_done")
 
     # 步骤 6：对账（磁盘为准，不回滚）
     transaction.set_phase("reconcile")
@@ -522,7 +547,7 @@ def _keep_scene(
 def update_asset(
     configured_root: str | Path | None,
     workspace_root: str | Path,
-    old_asset: str | Path,
+    old_asset: FirmwareAsset | str | Path,
     source: str | Path,
     *,
     retire_mode: RetireMode,
@@ -549,9 +574,11 @@ def update_asset(
         return _error("invalid_args", f"未知的退位方式：{retire_mode}")
 
     try:
-        old = assert_within_workspace(Path(old_asset), ws)
+        old = assert_within_workspace(_coerce_asset_path(old_asset), ws)
     except PathGuardError as exc:
         return _error("out_of_workspace", f"旧程序不在工作区内：{exc}")
+    except (TypeError, ValueError) as exc:
+        return _error("invalid_target", f"旧程序无法识别：{exc}")
 
     src = Path(source)
     if not src.is_dir():
@@ -625,15 +652,29 @@ def _run_update(
         return _error("invalid_target", f"锁内重验失败：{reason}")
 
     # 步骤 2：staging 导入并验证完整性（D1.5）
-    transaction.set_phase("stage_import", details={"source": str(src)})
+    transaction.set_phase(
+        "stage_import",
+        details={
+            "old_path": str(old),
+            "target": str(target),
+            "source": str(src),
+            "retire_mode": retire_mode,
+        },
+    )
     transaction.begin_product_write()
     try:
-        staged = stage_import_directory(transaction, ws, src)
-    except (AssetImportError, StagingError, OSError) as exc:
-        transaction.commit()  # staging 由导入侧自行清理，产品区零改动
+        session = allocate_staging_area(ws, transaction)
+    except StagingError as exc:
+        transaction.commit()
         return _error("incomplete_replacement", f"来源导入失败：{exc}")
-
-    session = Path(staged["session"])
+    # 6A-IMP-006：写入 staging 内容之前先持久化 session 身份。
+    transaction.set_phase("stage_import", details={"session": str(session)})
+    try:
+        stage_import_directory(transaction, ws, src, session=session)
+    except (AssetImportError, StagingError, OSError) as exc:
+        cleanup_staging_area(ws, session)
+        transaction.commit()  # 产品区零改动
+        return _error("incomplete_replacement", f"来源导入失败：{exc}")
     if not _staging_is_complete_asset(ws, session, target):
         cleanup_staging_area(ws, session)
         transaction.commit()
@@ -698,10 +739,12 @@ def _run_update(
             f"引用改写计划构建失败：{plan_result['message']}",
             plan_result["payload"],
         )
+    plan = plan_result["payload"]["plan"]
+    transaction.set_phase("build_plan", details={"plan": _serialize_rewrite_plan(plan)})
 
     # 步骤 5：apply
     transaction.set_phase("apply_plan")
-    apply_result = apply_rewrite_plan(plan_result["payload"]["plan"], configured_root, log_fn)
+    apply_result = apply_rewrite_plan(plan, configured_root, log_fn)
     if not apply_result["ok"]:
         if apply_result["code"] == "rollback_conflict":
             # 回滚冲突 → 保留现场，**不自动删除 replacement**
@@ -719,6 +762,10 @@ def _run_update(
             f"引用改写失败，已恢复原状：{apply_result['message']}",
             apply_result["payload"],
         )
+    transaction.set_phase(
+        "apply_done",
+        details={"old_manifest": directory_manifest_hash(old)},
+    )
 
     # 步骤 6：旧程序退位（两条独立分支，落点与生命周期完全不同）
     transaction.set_phase("retire_old", details={"retire_mode": retire_mode})
@@ -823,6 +870,569 @@ def _cleanup_product(
         )
     transaction.commit()  # 磁盘已回到原状
     return _error(code, message, payload)
+
+
+def _serialize_semantics(sem: ReferenceSemantics | None) -> dict[str, str] | None:
+    if sem is None:
+        return None
+    return {
+        "model_id": sem.model_id,
+        "module_key": sem.module_key,
+        "source_group": sem.source_group,
+        "scheme_name": sem.scheme_name,
+    }
+
+
+def _deserialize_semantics(raw: object) -> ReferenceSemantics | None:
+    if not isinstance(raw, dict):
+        return None
+    return ReferenceSemantics(
+        model_id=str(raw.get("model_id") or ""),
+        module_key=str(raw.get("module_key") or ""),
+        source_group=str(raw.get("source_group") or ""),
+        scheme_name=str(raw.get("scheme_name") or ""),
+    )
+
+
+def _serialize_rewrite_plan(plan: RewritePlan) -> dict[str, Any]:
+    """把 RewritePlan 写入操作日志，崩溃后续跑可重建 token 再 apply。"""
+    request = plan.request
+    return {
+        "configured_root": plan.configured_root,
+        "workspace_root": plan.workspace_root,
+        "request": {
+            "operation": request.operation,
+            "target_kind": request.target_kind,
+            "old_path": request.old_path,
+            "new_path": request.new_path,
+            "replacement_path": request.replacement_path,
+            "old_semantics": _serialize_semantics(request.old_semantics),
+            "new_semantics": _serialize_semantics(request.new_semantics),
+        },
+        "files": [
+            {
+                "kind": item.kind,
+                "pre_path": str(item.pre_path),
+                "post_path": str(item.post_path),
+                "owner_root": item.owner_root,
+                "original_absent": item.original_bytes is None,
+                "original_b64": (
+                    ""
+                    if item.original_bytes is None
+                    else base64.b64encode(item.original_bytes).decode("ascii")
+                ),
+                "original_sha256": item.original_sha256,
+                "new_content": item.new_content,
+                "new_sha256": item.new_sha256,
+                "changes": list(item.changes),
+            }
+            for item in plan.files
+        ],
+    }
+
+
+def _deserialize_rewrite_plan(data: Mapping[str, Any]) -> RewritePlan:
+    raw_request = data.get("request")
+    if not isinstance(raw_request, dict):
+        raw_request = {}
+    request = RewriteRequest(
+        operation=raw_request.get("operation") or "rename",
+        target_kind=raw_request.get("target_kind") or "asset",
+        old_path=str(raw_request.get("old_path") or ""),
+        new_path=str(raw_request.get("new_path") or ""),
+        replacement_path=str(raw_request.get("replacement_path") or ""),
+        old_semantics=_deserialize_semantics(raw_request.get("old_semantics")),
+        new_semantics=_deserialize_semantics(raw_request.get("new_semantics")),
+    )
+    files: list[FileRewrite] = []
+    raw_files = data.get("files")
+    if isinstance(raw_files, list):
+        for item in raw_files:
+            if not isinstance(item, dict):
+                continue
+            original_bytes: bytes | None = None
+            if not item.get("original_absent", False):
+                original_bytes = base64.b64decode(str(item.get("original_b64") or ""))
+            files.append(
+                FileRewrite(
+                    kind=str(item.get("kind") or ""),
+                    pre_path=Path(str(item.get("pre_path") or "")),
+                    post_path=Path(str(item.get("post_path") or "")),
+                    owner_root=str(item.get("owner_root") or ""),
+                    original_bytes=original_bytes,
+                    original_sha256=str(item.get("original_sha256") or ""),
+                    new_content=str(item.get("new_content") or ""),
+                    new_sha256=str(item.get("new_sha256") or ""),
+                    changes=[str(change) for change in item.get("changes") or []],
+                )
+            )
+    plan = RewritePlan(
+        configured_root=str(data.get("configured_root") or ""),
+        workspace_root=str(data.get("workspace_root") or ""),
+        request=request,
+        files=files,
+    )
+    plan.token = _plan_token(plan)
+    return plan
+
+
+def _plan_disk_state(plan_raw: Mapping[str, Any]) -> str:
+    """根据序列化计划判断磁盘是 preimage / postimage / mixed / empty。"""
+    files = plan_raw.get("files")
+    if not isinstance(files, list) or not files:
+        return "empty"
+    states: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            states.add("mixed")
+            continue
+        post = Path(str(item.get("post_path") or ""))
+        pre = Path(str(item.get("pre_path") or ""))
+        path = post if post.exists() else pre
+        new_hash = str(item.get("new_sha256") or "")
+        old_hash = str(item.get("original_sha256") or "")
+        absent = bool(item.get("original_absent"))
+        if not path.exists():
+            states.add("preimage" if absent else "mixed")
+            continue
+        digest = _sha256_bytes(path.read_bytes())
+        if new_hash and digest == new_hash:
+            states.add("postimage")
+        elif old_hash and digest == old_hash:
+            states.add("preimage")
+        else:
+            states.add("mixed")
+    if states == {"postimage"}:
+        return "postimage"
+    if states == {"preimage"}:
+        return "preimage"
+    return "mixed"
+
+
+def _backup_matches_this_update(
+    destination: Path, old: Path, expected_manifest: str
+) -> bool:
+    data = _load_retired_toml(destination)
+    if not data or not expected_manifest.strip():
+        return False
+    if not same_path_identity(_retired_from_identity(data), old):
+        return False
+    if str(data.get("retired_by") or "") != "update_asset":
+        return False
+    return str(data.get("content_hash") or "") == expected_manifest
+
+
+def _update_has_retire_evidence(
+    ws: Path,
+    old: Path,
+    target: Path,
+    retire_mode: str,
+    expected_manifest: str,
+) -> bool:
+    """旧路径已不在时，是否有**本次**退位证据（路径 + 内容身份）。"""
+    if not expected_manifest.strip():
+        return False
+    if retire_mode == "retire_to_backup":
+        root = target / RETIRED_VERSIONS_DIRNAME
+        if not root.is_dir():
+            return False
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            data = _load_retired_toml(child)
+            if not data:
+                continue
+            if not same_path_identity(_retired_from_identity(data), old):
+                continue
+            if str(data.get("retired_by") or "") != "update_asset":
+                continue
+            if str(data.get("content_hash") or "") == expected_manifest:
+                return True
+        return False
+    from fwasset.core.quarantine import list_records
+
+    for record in list_records(ws):
+        if record.get("kind") != "transactional_retire":
+            continue
+        if not same_path_identity(str(record.get("original_path") or ""), old):
+            continue
+        if str(record.get("manifest") or "") == expected_manifest:
+            return True
+    return False
+
+
+def resume_normalize_module_leaf(
+    configured_root: str | Path | None,
+    workspace_root: str | Path,
+    *,
+    log_fn: Callable[..., None] = print,
+) -> ServiceResult:
+    """按操作日志续跑 ``normalize_module_leaf``（6A-IMP-002）。"""
+    ws = Path(workspace_root).resolve()
+    try:
+        with WorkspaceTransaction(
+            ws, operation="normalize_module_leaf", resume=True
+        ) as transaction:
+            return _resume_normalize(transaction, ws, configured_root, log_fn)
+    except Exception as exc:  # noqa: BLE001
+        return _transaction_error(exc)
+
+
+def _resume_normalize(
+    transaction: WorkspaceTransaction,
+    ws: Path,
+    configured_root: str | Path | None,
+    log_fn: Callable[..., None],
+) -> ServiceResult:
+    details = transaction.log.get("details") or {}
+    phase = str(transaction.log.get("phase") or "")
+    module = Path(str(details.get("module") or ""))
+    target = Path(str(details.get("target") or ""))
+    staging = Path(str(details.get("staging") or ""))
+    if not str(module) or not str(target):
+        return _keep_scene(
+            transaction,
+            "stale_plan",
+            "归一续跑缺少模块或目标路径，已保留现场",
+            dict(details),
+        )
+
+    product_error = _verify_recorded_products(transaction)
+    if product_error is not None:
+        return product_error
+
+    staging_has_payload = staging.is_dir() and any(staging.iterdir())
+    if staging_has_payload:
+        if module.exists() and not _directory_is_empty(module) and not target.exists():
+            return _keep_scene(
+                transaction,
+                "layout_inconsistent",
+                "归一续跑发现暂存与模块目录同时有内容，已保留现场",
+                {"staging": str(staging), "module": str(module)},
+            )
+        transaction.begin_product_write()
+        if not module.exists():
+            try:
+                module.mkdir(parents=True, exist_ok=False)
+            except OSError as exc:
+                return _restore_from_staging(
+                    transaction, ws, staging, module, f"续跑创建模块容器失败：{exc}"
+                )
+        if not target.exists():
+            try:
+                promote_staging(transaction, ws, staging, target)
+            except (OSError, StagingError) as exc:
+                if _directory_is_empty(module):
+                    try:
+                        module.rmdir()
+                    except OSError:
+                        return _keep_scene(
+                            transaction,
+                            "layout_inconsistent",
+                            f"归一续跑提升失败且无法清理空容器：{exc}",
+                            {"staging": str(staging), "module": str(module)},
+                        )
+                    return _restore_from_staging(
+                        transaction, ws, staging, module, f"续跑变体提升失败：{exc}"
+                    )
+                return _keep_scene(
+                    transaction,
+                    "layout_inconsistent",
+                    f"归一续跑提升失败且模块目录非空：{exc}",
+                    {"staging": str(staging), "module": str(module)},
+                )
+
+    if (
+        module.is_dir()
+        and not _has_child_directories(module)
+        and not target.exists()
+    ):
+        if staging.is_dir():
+            try:
+                cleanup_staging_area(ws, staging)
+            except StagingError:
+                pass
+        return _run_normalize(transaction, ws, configured_root, module, target, log_fn)
+
+    if not target.is_dir():
+        return _keep_scene(
+            transaction,
+            "layout_inconsistent",
+            "归一续跑找不到变体目录，已保留现场",
+            {"module": str(module), "target": str(target), "staging": str(staging)},
+        )
+
+    if phase not in {"apply_done", "reconcile"}:
+        plan_raw = details.get("plan")
+        if not isinstance(plan_raw, dict):
+            return _keep_scene(
+                transaction,
+                "stale_plan",
+                "归一续跑缺少引用改写计划，已保留现场",
+                {"target": str(target)},
+            )
+        disk = _plan_disk_state(plan_raw)
+        if disk == "mixed":
+            return _keep_scene(
+                transaction,
+                "layout_inconsistent",
+                "归一续跑发现引用文件处于部分改写状态，已保留现场",
+                {"target": str(target)},
+            )
+        if disk != "postimage":
+            transaction.begin_product_write()
+            apply_result = apply_rewrite_plan(
+                _deserialize_rewrite_plan(plan_raw), configured_root, log_fn
+            )
+            if not apply_result["ok"]:
+                if apply_result["code"] == "rollback_conflict":
+                    return _keep_scene(
+                        transaction,
+                        "layout_inconsistent",
+                        "归一续跑引用改写失败且回滚存在冲突，已保留现场",
+                        apply_result["payload"],
+                    )
+                return _keep_scene(
+                    transaction,
+                    "layout_inconsistent",
+                    f"归一续跑引用改写失败：{apply_result['message']}",
+                    apply_result["payload"],
+                )
+        transaction.set_phase("apply_done")
+
+    transaction.set_phase("reconcile")
+    try:
+        reconcile_subtree(str(ws), str(module.parent))
+    except (AssetIndexError, OSError) as exc:
+        transaction.commit()
+        log_fn(f"归一续跑后索引对账失败，需重新读取程序列表：{exc}")
+        return _ok(
+            "reindex_failed",
+            f"已归一为「{module.name}/{target.name}」，但索引对账失败，请重新扫描程序列表",
+            {"module": str(module), "asset": str(target), "detail": str(exc)},
+        )
+    transaction.commit()
+    log_fn(f"归一续跑完成：{module} → {target}")
+    return _ok(
+        "ok",
+        f"已归一为「{module.name}/{target.name}」",
+        {"module": str(module), "asset": str(target)},
+    )
+
+
+def resume_update_asset(
+    configured_root: str | Path | None,
+    workspace_root: str | Path,
+    *,
+    log_fn: Callable[..., None] = print,
+) -> ServiceResult:
+    """按操作日志续跑 ``update_asset``（6A-IMP-002）。"""
+    ws = Path(workspace_root).resolve()
+    try:
+        with WorkspaceTransaction(ws, operation="update_asset", resume=True) as transaction:
+            return _resume_update(transaction, ws, configured_root, log_fn)
+    except Exception as exc:  # noqa: BLE001
+        return _transaction_error(exc)
+
+
+def _resume_update(
+    transaction: WorkspaceTransaction,
+    ws: Path,
+    configured_root: str | Path | None,
+    log_fn: Callable[..., None],
+) -> ServiceResult:
+    details = transaction.log.get("details") or {}
+    phase = str(transaction.log.get("phase") or "")
+    old = Path(str(details.get("old_path") or ""))
+    target = Path(str(details.get("target") or ""))
+    retire_mode = str(details.get("retire_mode") or "retire_to_trash")
+    session_raw = details.get("session")
+    if retire_mode not in ("retire_to_trash", "retire_to_backup"):
+        retire_mode = "retire_to_trash"
+
+    temp_raw = details.get("retire_temp")
+    dest_raw = details.get("retire_destination")
+    old_from = Path(str(details.get("retire_old_path") or details.get("old_path") or ""))
+    expected_old = str(details.get("old_manifest") or "")
+    if isinstance(dest_raw, str) and dest_raw.strip() and Path(dest_raw).is_dir():
+        product_error = _verify_recorded_products(transaction)
+        if product_error is not None:
+            return product_error
+        dest = Path(dest_raw)
+        temp_has_payload = False
+        if isinstance(temp_raw, str) and Path(temp_raw).is_dir():
+            try:
+                temp_has_payload = any(Path(temp_raw).iterdir())
+            except OSError:
+                temp_has_payload = True
+        dest_ok = _backup_matches_this_update(dest, old, expected_old)
+        if temp_has_payload or not dest_ok:
+            return _keep_scene(
+                transaction,
+                "retire_inconsistent",
+                "续跑发现正式副本路径不可信或退位临时目录仍有内容，已保留现场",
+                {
+                    "temp": str(temp_raw or ""),
+                    "destination": str(dest),
+                    "old": str(old),
+                },
+            )
+        if old.exists() or old_from.exists():
+            return _keep_scene(
+                transaction,
+                "retire_inconsistent",
+                "正式副本已完成后旧程序路径又出现，已保留现场",
+                {"old": str(old), "destination": str(dest)},
+            )
+        transaction.begin_product_write()
+        return _resume_update_reconcile(transaction, ws, old, target, log_fn)
+    if isinstance(temp_raw, str) and Path(temp_raw).is_dir():
+        temp = Path(temp_raw)
+        if old_from.exists():
+            return _keep_scene(
+                transaction,
+                "retire_inconsistent",
+                "续跑发现退位临时目录存在但原路径已被占用，已保留现场",
+                {"temp": str(temp), "old": str(old_from)},
+            )
+        transaction.begin_product_write()
+        try:
+            os.replace(temp, old_from)
+        except OSError as exc:
+            return _keep_scene(
+                transaction,
+                "retire_inconsistent",
+                f"续跑无法把退位临时目录归位：{exc}",
+                {"temp": str(temp), "old": str(old_from)},
+            )
+        old = old_from
+        phase = "apply_done"
+
+    product_error = _verify_recorded_products(transaction)
+    if product_error is not None:
+        return product_error
+
+    if not target.is_dir() and phase in {
+        "prepared",
+        "writing",
+        "stage_import",
+        "promote_replacement",
+    }:
+        if isinstance(session_raw, str) and Path(session_raw).is_dir():
+            cleanup_staging_area(ws, Path(session_raw))
+        transaction.commit()
+        return _ok("ok", "未完成的更新已取消", {})
+
+    apply_confirmed = phase in {"apply_done", "retire_old", "reconcile"}
+    if target.is_dir() and old.is_dir() and not apply_confirmed:
+        plan_raw = details.get("plan")
+        disk = _plan_disk_state(plan_raw) if isinstance(plan_raw, dict) else "empty"
+        if disk == "postimage":
+            apply_confirmed = True
+            transaction.set_phase(
+                "apply_done",
+                details={"old_manifest": directory_manifest_hash(old)},
+            )
+        elif disk == "mixed":
+            return _keep_scene(
+                transaction,
+                "update_inconsistent",
+                "续跑发现引用文件处于部分改写状态，已保留现场，未删除新程序",
+                {"old": str(old), "replacement": str(target)},
+            )
+        else:
+            try:
+                delete_recorded_product(transaction, ws, target)
+            except ProductCleanupConflict as exc:
+                return _keep_scene(
+                    transaction,
+                    "update_inconsistent",
+                    f"续跑无法安全清理未完成的更新产物，已保留现场：{exc}",
+                    {"target": str(target), "reason": exc.reason},
+                )
+            transaction.commit()
+            return _ok(
+                "ok",
+                "未完成的更新已回滚，旧程序保持原状",
+                {"old": str(old)},
+            )
+
+    transaction.begin_product_write()
+    expected_old = str(details.get("old_manifest") or "")
+    if old.is_dir():
+        if expected_old:
+            try:
+                actual = directory_manifest_hash(old)
+            except (ManifestError, OSError) as exc:
+                return _keep_scene(
+                    transaction,
+                    "product_unverifiable",
+                    f"续跑无法校验旧程序是否被第三方改动：{exc}",
+                    {"old": str(old)},
+                )
+            if actual != expected_old:
+                return _keep_scene(
+                    transaction,
+                    "product_modified",
+                    "续跑发现旧程序在崩溃后被改动，已保留现场",
+                    {"old": str(old)},
+                )
+        try:
+            if retire_mode == "retire_to_backup":
+                retire_asset_to_backup(
+                    transaction,
+                    ws,
+                    old,
+                    target,
+                    retired_by="update_asset",
+                )
+            else:
+                register_retire(ws, old)
+        except (QuarantineError, ManifestError, OSError, RetireBackupError) as exc:
+            return _keep_scene(
+                transaction,
+                "retire_failed",
+                f"续跑退位失败，两份暂时并存：{exc}",
+                {"old": str(old), "replacement": str(target)},
+            )
+    elif apply_confirmed:
+        if not _update_has_retire_evidence(
+            ws, old, target, retire_mode, expected_old
+        ):
+            return _keep_scene(
+                transaction,
+                "update_inconsistent",
+                "续跑发现旧程序已消失且没有本操作的退位证据，已保留现场",
+                {"old": str(old), "replacement": str(target)},
+            )
+    return _resume_update_reconcile(transaction, ws, old, target, log_fn)
+
+
+def _resume_update_reconcile(
+    transaction: WorkspaceTransaction,
+    ws: Path,
+    old: Path,
+    target: Path,
+    log_fn: Callable[..., None],
+) -> ServiceResult:
+    root = target.parent if target.is_dir() else old.parent
+    try:
+        reconcile_subtree(str(ws), str(root))
+    except (AssetIndexError, OSError) as exc:
+        transaction.commit()
+        log_fn(f"更新续跑后索引对账失败，需重新读取程序列表：{exc}")
+        return _ok(
+            "reindex_failed",
+            f"续跑更新后索引对账失败，请重新扫描程序列表：{exc}",
+            {"old": str(old), "replacement": str(target), "detail": str(exc)},
+        )
+    transaction.commit()
+    log_fn(f"更新续跑完成：{old} → {target}")
+    return _ok(
+        "ok",
+        f"已更新为「{target.name}」" if target.name else "已续跑完成更新",
+        {"old": str(old), "replacement": str(target)},
+    )
 
 
 class RetireBackupError(Exception):

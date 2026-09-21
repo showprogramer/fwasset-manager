@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import shutil
+import tomllib
 from pathlib import Path
 
 import pytest
 
 import fwasset.core.services.layout_update_service as layout_update_service
-from fwasset.core.managed_paths import RETIRED_VERSIONS_DIRNAME
+from fwasset.core.managed_paths import (
+    RETIRED_METADATA_FILENAME,
+    RETIRED_VERSIONS_DIRNAME,
+)
 from fwasset.core.model_config import SharedModuleRef, save_shared_module
 from fwasset.core.platform_config import (
     PlatformDefaults,
@@ -20,7 +25,11 @@ from fwasset.core.services.layout_update_service import (
     update_asset,
 )
 from fwasset.core.services.model_scheme_service import create_model
-from fwasset.core.workspace_transaction import load_workspace_status
+from fwasset.core.workspace_transaction import (
+    WorkspaceTransaction,
+    load_operation_log,
+    load_workspace_status,
+)
 
 
 def _model(workspace: Path, name: str = "L36程序") -> Path:
@@ -438,3 +447,470 @@ def test_inconsistent_scene_blocks_further_writes(
     status = load_workspace_status(tmp_path)
     assert status.state == "recovery_required"
     assert status.generation % 2 == 0  # seqlock 已收尾为偶数
+
+
+# ---------------------------------------------------------------------------
+# 6A-IMP-001 / 6A-IMP-002 / 6A-IMP-003
+# ---------------------------------------------------------------------------
+
+
+def test_update_backup_writes_minimum_retired_metadata(tmp_path: Path) -> None:
+    """6A-IMP-001：backup 副本必须写最小退位信息（原路径、时间戳、来源操作）。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+
+    result = update_asset(
+        str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_backup"
+    )
+
+    assert result["ok"] is True, result
+    replacement = Path(result["payload"]["replacement"])
+    backups = list((replacement / RETIRED_VERSIONS_DIRNAME).iterdir())
+    assert len(backups) == 1
+    meta_path = backups[0] / RETIRED_METADATA_FILENAME
+    assert meta_path.is_file()
+    data = tomllib.loads(meta_path.read_text(encoding="utf-8"))
+    assert str(data.get("retired_from") or data.get("original_path") or "").strip()
+    assert str(data.get("retired_at") or data.get("退位时间戳") or "").strip()
+    source_op = str(
+        data.get("retired_by") or data.get("operation") or data.get("来源") or ""
+    ).strip()
+    assert source_op
+
+
+def test_update_accepts_firmware_asset_mapping(tmp_path: Path) -> None:
+    """6A-IMP-003：公开契约是 FirmwareAsset，取其 path 后再冷扫，不能 Path(dict)。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+
+    result = update_asset(
+        str(tmp_path),
+        str(tmp_path),
+        {"path": str(old)},
+        source,
+        retire_mode="retire_to_trash",
+    )
+
+    assert result["ok"] is True, result
+    assert result["code"] in ("ok", "reindex_failed")
+    assert not old.exists()
+    _assert_converged_clean(tmp_path)
+
+
+def test_normalize_persists_staging_path_before_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6A-IMP-002：M → staging 之前必须把 staging 路径写入操作日志。"""
+    model = _model(tmp_path)
+    leaf = _leaf(model)
+
+    original_replace = layout_update_service.os.replace
+
+    def _crash_module_move(src: object, dst: object) -> None:
+        destination = Path(dst)
+        # 只打断产品目录搬进 staging 会话，不动事务日志的原子 replace。
+        if destination.parent.name == "staging":
+            raise RuntimeError("injected crash before replace")
+        original_replace(src, dst)
+
+    monkeypatch.setattr(layout_update_service.os, "replace", _crash_module_move)
+
+    result = normalize_module_leaf(str(tmp_path), str(tmp_path), leaf, "程序A")
+
+    assert result["ok"] is False
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+    log = load_operation_log(tmp_path)
+    assert log is not None
+    staging = str((log.get("details") or {}).get("staging") or "").strip()
+    assert staging
+    assert (leaf / "fw.bin").exists()  # replace 未发生，叶子仍在
+
+
+def test_normalize_resume_after_move_to_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """崩溃在 M 已进 staging、容器尚未创建：续跑完成归一。"""
+    model = _model(tmp_path)
+    leaf = _leaf(model)
+    save_platform_config(model, [PlatformDefaults("单3D", {"主板程序": ""})])
+    original_set_phase = WorkspaceTransaction.set_phase
+
+    def _crash_on_create(
+        self: WorkspaceTransaction,
+        phase: str,
+        *,
+        details: object = None,
+    ) -> None:
+        if phase == "create_container":
+            raise RuntimeError("injected crash after staging")
+        original_set_phase(self, phase, details=details)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WorkspaceTransaction, "set_phase", _crash_on_create)
+    crashed = normalize_module_leaf(str(tmp_path), str(tmp_path), leaf, "程序A")
+    assert crashed["ok"] is False
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+    assert not (leaf / "fw.bin").exists()
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import (
+        resume_normalize_module_leaf,
+    )
+
+    resumed = resume_normalize_module_leaf(str(tmp_path), tmp_path)
+    assert resumed["ok"] is True, resumed
+    assert (leaf / "程序A" / "fw.bin").exists()
+    assert load_platform_config(model)[0].defaults["主板程序"] == "程序A"
+    _assert_converged_clean(tmp_path)
+
+
+def test_update_resume_cleans_replacement_before_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """规格崩溃表：replacement 已提升、尚未成功 apply → 按 D1.4c 清理回原状。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+
+    def _crash(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("injected crash at build")
+
+    monkeypatch.setattr(layout_update_service, "build_rewrite_plan", _crash)
+    crashed = update_asset(
+        str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_trash"
+    )
+    assert crashed["ok"] is False
+    assert (old.parent / source.name).is_dir()
+    assert old.exists()
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import resume_update_asset
+
+    resumed = resume_update_asset(str(tmp_path), tmp_path)
+    assert resumed["ok"] is True, resumed
+    assert not (old.parent / source.name).exists()
+    assert (old / "fw.bin").read_bytes() == b"firmware"
+    _assert_converged_clean(tmp_path)
+
+
+def test_update_resume_continues_retire_after_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """规格崩溃表：apply 成功、旧程序尚未退位 → 续跑继续退位。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+
+    def _crash(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("injected crash at retire")
+
+    monkeypatch.setattr(layout_update_service, "register_retire", _crash)
+    crashed = update_asset(
+        str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_trash"
+    )
+    assert crashed["ok"] is False
+    replacement = old.parent / source.name
+    assert replacement.exists() and old.exists()
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import resume_update_asset
+
+    resumed = resume_update_asset(str(tmp_path), tmp_path)
+    assert resumed["ok"] is True, resumed
+    assert not old.exists()
+    assert (replacement / "fw.bin").read_bytes() == b"new-firmware"
+    kinds = [r["kind"] for r in list_records(tmp_path)]
+    assert "transactional_retire" in kinds
+    _assert_converged_clean(tmp_path)
+
+
+def test_update_resume_postimage_is_apply_done_not_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6A-IMP-004：apply 已写完 postimage 但日志仍是 apply_plan → 继续退位，不得删 replacement。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    save_platform_config(model, [PlatformDefaults("单3D", {"主板程序": "v1"})])
+    source = _source(tmp_path)
+    original_set_phase = WorkspaceTransaction.set_phase
+
+    def _crash_on_apply_done(
+        self: WorkspaceTransaction,
+        phase: str,
+        *,
+        details: object = None,
+    ) -> None:
+        if phase == "apply_done":
+            raise RuntimeError("injected crash after apply")
+        original_set_phase(self, phase, details=details)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WorkspaceTransaction, "set_phase", _crash_on_apply_done)
+    crashed = update_asset(
+        str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_trash"
+    )
+    assert crashed["ok"] is False
+    replacement = old.parent / source.name
+    assert replacement.exists() and old.exists()
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import resume_update_asset
+
+    resumed = resume_update_asset(str(tmp_path), tmp_path)
+    assert resumed["ok"] is True, resumed
+    assert not old.exists()
+    assert (replacement / "fw.bin").read_bytes() == b"new-firmware"
+    assert load_platform_config(model)[0].defaults["主板程序"] == source.name
+    _assert_converged_clean(tmp_path)
+
+
+def test_normalize_resume_postimage_does_not_reapply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6A-IMP-004：归一 apply 已成功，续跑不得因 preimage 失配而 stale_plan。"""
+    model = _model(tmp_path)
+    leaf = _leaf(model)
+    save_platform_config(model, [PlatformDefaults("单3D", {"主板程序": ""})])
+    original_set_phase = WorkspaceTransaction.set_phase
+
+    def _crash_on_apply_done(
+        self: WorkspaceTransaction,
+        phase: str,
+        *,
+        details: object = None,
+    ) -> None:
+        if phase == "apply_done":
+            raise RuntimeError("injected crash after normalize apply")
+        original_set_phase(self, phase, details=details)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WorkspaceTransaction, "set_phase", _crash_on_apply_done)
+    crashed = normalize_module_leaf(str(tmp_path), str(tmp_path), leaf, "程序A")
+    assert crashed["ok"] is False
+    assert (leaf / "程序A" / "fw.bin").exists()
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import (
+        resume_normalize_module_leaf,
+    )
+
+    resumed = resume_normalize_module_leaf(str(tmp_path), tmp_path)
+    assert resumed["ok"] is True, resumed
+    assert load_platform_config(model)[0].defaults["主板程序"] == "程序A"
+    _assert_converged_clean(tmp_path)
+
+
+def test_update_resume_stops_when_old_vanishes_without_retire_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6A-IMP-005：apply 后第三方删走旧程序 → 停止，不得 clean 提交。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+
+    def _crash(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("injected crash at retire")
+
+    monkeypatch.setattr(layout_update_service, "register_retire", _crash)
+    crashed = update_asset(
+        str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_trash"
+    )
+    assert crashed["ok"] is False
+    replacement = old.parent / source.name
+    assert old.exists() and replacement.exists()
+    shutil.rmtree(old)
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import resume_update_asset
+
+    resumed = resume_update_asset(str(tmp_path), tmp_path)
+    assert resumed["ok"] is False
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+    assert replacement.exists()
+
+
+def test_update_persists_session_before_staging_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6A-IMP-006：开始写入 staging 内容前必须把 session 路径写入操作日志。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+
+    def _crash(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("injected crash during staging copy")
+
+    monkeypatch.setattr(layout_update_service, "stage_import_directory", _crash)
+    crashed = update_asset(
+        str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_trash"
+    )
+    assert crashed["ok"] is False
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+    log = load_operation_log(tmp_path)
+    assert log is not None
+    session = str((log.get("details") or {}).get("session") or "").strip()
+    assert session
+    assert Path(session).is_dir()
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import resume_update_asset
+
+    resumed = resume_update_asset(str(tmp_path), tmp_path)
+    assert resumed["ok"] is True, resumed
+    assert not Path(session).exists()
+    assert (old / "fw.bin").exists()
+    _assert_converged_clean(tmp_path)
+
+
+def test_update_resume_rejects_stale_backup_as_retire_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6A-IMP-007：历史 旧版本 仅路径相同不算本次退位证据。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+
+    def _crash(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("injected crash at retire")
+
+    monkeypatch.setattr(layout_update_service, "retire_asset_to_backup", _crash)
+    crashed = update_asset(
+        str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_backup"
+    )
+    assert crashed["ok"] is False
+    replacement = old.parent / source.name
+    stale = replacement / RETIRED_VERSIONS_DIRNAME / "历史副本"
+    stale.mkdir(parents=True)
+    (stale / RETIRED_METADATA_FILENAME).write_text(
+        f"retired_from = {old.as_posix()!r}\n"
+        'content_hash = "deadbeef"\n'
+        'retired_at = "2020-01-01T00:00:00Z"\n'
+        'retired_by = "update_asset"\n',
+        encoding="utf-8",
+    )
+    shutil.rmtree(old)
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import resume_update_asset
+
+    resumed = resume_update_asset(str(tmp_path), tmp_path)
+    assert resumed["ok"] is False
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+    assert replacement.exists()
+
+
+def test_update_resume_verifies_product_after_backup_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6A-IMP-009：正式 backup 已在时，续跑仍须校验 replacement manifest。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+    original_set_phase = WorkspaceTransaction.set_phase
+
+    def _crash_on_reconcile(
+        self: WorkspaceTransaction,
+        phase: str,
+        *,
+        details: object = None,
+    ) -> None:
+        if phase == "reconcile":
+            raise RuntimeError("injected crash after backup")
+        original_set_phase(self, phase, details=details)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WorkspaceTransaction, "set_phase", _crash_on_reconcile)
+    crashed = update_asset(
+        str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_backup"
+    )
+    assert crashed["ok"] is False
+    replacement = old.parent / source.name
+    assert replacement.exists()
+    (replacement / "fw.bin").write_bytes(b"tampered-after-crash")
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import resume_update_asset
+
+    resumed = resume_update_asset(str(tmp_path), tmp_path)
+    assert resumed["ok"] is False
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+    assert (replacement / "fw.bin").read_bytes() == b"tampered-after-crash"
+
+
+class _InjectedCrash(BaseException):
+    """模拟进程在 except Exception 之外死亡。"""
+
+
+def test_update_resume_keeps_temp_when_destination_is_occupied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6A-IMP-010：destination 被占用且 temp 仍有旧程序时，不得清理 temp。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+    original_replace = layout_update_service.os.replace
+
+    def _occupy_destination(src: object, dst: object) -> None:
+        destination = Path(dst)
+        if destination.parent.name == RETIRED_VERSIONS_DIRNAME:
+            destination.mkdir(parents=True, exist_ok=True)
+            raise _InjectedCrash()
+        original_replace(src, dst)
+
+    monkeypatch.setattr(layout_update_service.os, "replace", _occupy_destination)
+    with pytest.raises(_InjectedCrash):
+        update_asset(
+            str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_backup"
+        )
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+    log = load_operation_log(tmp_path)
+    assert log is not None
+    temp = Path(str((log.get("details") or {}).get("retire_temp") or ""))
+    assert temp.is_dir()
+    assert (temp / "fw.bin").read_bytes() == b"firmware"
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import resume_update_asset
+
+    resumed = resume_update_asset(str(tmp_path), tmp_path)
+    assert resumed["ok"] is False
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+    assert (temp / "fw.bin").read_bytes() == b"firmware"
+
+
+def test_update_resume_stops_if_old_reappears_after_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """6A-IMP-011：正式 backup 完成后旧路径又出现 → 不得 clean 提交。"""
+    model = _model(tmp_path)
+    old = _variant(model)
+    source = _source(tmp_path)
+    original_set_phase = WorkspaceTransaction.set_phase
+
+    def _crash_on_reconcile(
+        self: WorkspaceTransaction,
+        phase: str,
+        *,
+        details: object = None,
+    ) -> None:
+        if phase == "reconcile":
+            raise RuntimeError("injected crash after backup")
+        original_set_phase(self, phase, details=details)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(WorkspaceTransaction, "set_phase", _crash_on_reconcile)
+    crashed = update_asset(
+        str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_backup"
+    )
+    assert crashed["ok"] is False
+    replacement = old.parent / source.name
+    assert replacement.exists()
+    assert not old.exists()
+    old.mkdir()
+    (old / "fw.bin").write_bytes(b"third-party-restored")
+    monkeypatch.undo()
+
+    from fwasset.core.services.layout_update_service import resume_update_asset
+
+    resumed = resume_update_asset(str(tmp_path), tmp_path)
+    assert resumed["ok"] is False
+    assert load_workspace_status(tmp_path).state == "recovery_required"
+    assert (old / "fw.bin").read_bytes() == b"third-party-restored"
+    assert replacement.exists()

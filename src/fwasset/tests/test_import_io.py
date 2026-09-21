@@ -163,6 +163,33 @@ def test_stage_directory_workspace_overlap_rejected(ws: Path):
         assert _staging_sessions(ws) == []
 
 
+def test_stage_directory_rejects_session_outside_staging(ws: Path, tmp_path: Path):
+    """6A-IMP-008：传入 session 必须是本事务 staging 会话目录。"""
+    src = tmp_path / "厂商包"
+    src.mkdir()
+    (src / "main.rom").write_bytes(b"ROM")
+    outsider = tmp_path / "outside-session"
+    outsider.mkdir()
+    with WorkspaceTransaction(ws, operation="import_asset") as tx:
+        with pytest.raises(StagingError):
+            stage_import_directory(tx, ws, src, session=outsider)
+        assert (outsider / "main.rom").exists() is False
+
+
+def test_stage_directory_rejects_nonempty_session(ws: Path, tmp_path: Path):
+    """6A-IMP-008：传入的 staging 会话在复制前必须为空。"""
+    from fwasset.core.staging_io import allocate_staging_area
+
+    src = tmp_path / "厂商包"
+    src.mkdir()
+    (src / "main.rom").write_bytes(b"ROM")
+    with WorkspaceTransaction(ws, operation="import_asset") as tx:
+        session = allocate_staging_area(ws, tx)
+        (session / "leftover.bin").write_bytes(b"x")
+        with pytest.raises(StagingError):
+            stage_import_directory(tx, ws, src, session=session)
+
+
 def test_stage_directory_managed_source_rejected(ws: Path, tmp_path: Path):
     src = tmp_path / "旧版本"
     src.mkdir()

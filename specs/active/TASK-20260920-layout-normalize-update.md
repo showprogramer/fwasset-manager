@@ -1,6 +1,6 @@
 # TASK-20260920 子任务 6a：legacy 布局归一（D0.3）+ 普通 update 事务（D1.4a）+ build_clear_defaults_plan（D1.3）
 
-- 状态：已实现，等待审查（规格 r1 + 实现候选；全量 Python 检查通过）
+- 状态：实现完成，审查通过（6A-IMP-001～011 已闭合）
 - 日期：2026-09-20
 - 分支/HEAD：main @ cde649f
 - 父规格：specs/active/TASK-20260903-crud-write-semantics.md
@@ -297,7 +297,17 @@ uv run python -m pytest -q
 
 类型新增：`types.py` 的 `ReferenceOperation` 增加 `"clear_defaults"`，新增 `ClearDefaultsKind`。
 
-**与第 7 节签名的已知偏差（保留待审查裁定，未回改规格）**：第 7 节写的是 `old_asset: FirmwareAsset`，实现收的是 `old_asset: str | Path`。理由是服务内部无论如何都要冷扫重读（5a 定下的「不信任调用方字段」），传入完整资产字典纯属多余，调用方反而要先扫一遍才能构造它。此处刻意不把规格改成与实现一致——签名属审查面，抹平偏差等于消掉审查线索。由审查者裁定改规格还是改实现。
+**6A-IMP-003**：审查裁定改实现、不改规格第 7 节。`update_asset` 接受 `FirmwareAsset`，只取其 `path` 再冷扫；`str | Path` 仍可用。不得 `Path(dict)`。
+
+**6A-IMP-001**：`retire_to_backup` 由 6b 的 `retire_asset_to_backup` 写入四字段 `退位信息.toml`，覆盖 6a 最小字段（原路径、时间戳、来源操作）。
+
+**6A-IMP-002**：新增 `resume_normalize_module_leaf` / `resume_update_asset`。归一在 `os.replace(M, staging)` 之前把 staging 路径写入操作日志；update 按规格崩溃表续跑（未成功 apply 则 D1.4c 清理 replacement，apply 成功则继续退位）。启动仍先由 `recover_interrupted_workspace` 置 `recovery_required`，再走操作级 `resume_*`。
+
+**6A-IMP-004**：续跑按序列化计划比对磁盘 preimage/postimage/混合；全部 postimage 视为 apply 完成并前进，全部 preimage 才回退，混合保留现场。
+
+**6A-IMP-005**：apply 后记录 `old_manifest`；旧路径消失时须有本操作退位证据，否则保持 `recovery_required`。
+
+**6A-IMP-006**：update 在写入 staging 内容前分配并持久化 session 路径；续跑在未提升时清理该会话。
 
 两处**复用既有实现而非另起一套**（沿用 5a 的 WES-001 教训）：
 
