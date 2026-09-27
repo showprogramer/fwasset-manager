@@ -122,6 +122,30 @@ def test_common_listing_does_not_mark_saved_defaults(
     assert all(card.default_badge == "" for card in cards)
 
 
+def test_common_handcontrol_img_is_visible_under_structural_model(tmp_path: Path) -> None:
+    """新增的单文件手控 UI 即使文件名含别的型号，也要出现在所属目录的列表。"""
+    root = tmp_path / "testprogram"
+    program = root / "L36" / "通用" / "手控UI" / "YJ_d12x_massage_lcd_L50S_V21.07"
+    _write(root / "L36" / "平台配置.toml", '[[platform]]\nname = "单3D"\n')
+    _write(program / "d12x_mzkj_v1.0.0.img")
+    _write(program / "bootcfg.txt")
+    _write(program / "程序信息.toml", 'vendor = "测试"\n')
+
+    model = _bind_model(root, tmp_path)
+
+    assert model.load_all_models() == ["L36"]
+    assert model.build_sidebar_tree("L36")["common"]["手控UI"] == 1
+    [card] = model.get_common_modules("L36", "手控UI")
+    assert card.asset["path"] == str(program)
+    assert card.asset["version"] == "V21.07"
+    assert card.asset["model"] == "L50S"
+    assert card.asset["flash_mode"] == "auto_usb"
+    assert card.asset["usb_flow"] == "paired_files"
+    assert "程序信息.toml" not in card.asset["files"]
+    assert "d12x_mzkj_v1.0.0.img" in card.asset["files"]
+    assert "bootcfg.txt" in card.asset["files"]
+
+
 def test_scheme_does_not_add_common_programs_from_saved_defaults(
     l36_tree: Path, tmp_path: Path
 ) -> None:

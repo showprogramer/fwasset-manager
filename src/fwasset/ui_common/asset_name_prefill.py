@@ -48,7 +48,10 @@ def prefill_asset_name(
     source: str | Path | None = None,
     files: list[str | Path] | None = None,
 ) -> str:
-    """按来源预填程序名。zip 只去掉末尾一次 ``.zip``。"""
+    """按来源预填程序名。zip 只去掉末尾一次 ``.zip``。
+
+    TXT+IMG 散选且都在同一文件夹时，用该文件夹名，不再取镜像或 txt 的文件名。
+    """
     if source_kind == "directory":
         return Path(source or "").name
     if source_kind == "archive":
@@ -60,9 +63,16 @@ def prefill_asset_name(
     roms = [item for item in paths if item.suffix.casefold() == ".rom"]
     if roms:
         return roms[0].stem
-    for item in paths:
-        if item.name != _METADATA_NAME:
-            return item.stem
+    visible = [item for item in paths if item.name != _METADATA_NAME]
+    images = [item for item in visible if item.suffix.casefold() == ".img"]
+    if images:
+        parents = {item.parent for item in visible}
+        if len(parents) == 1:
+            folder_name = next(iter(parents)).name
+            if folder_name and folder_name not in {".", ".."}:
+                return folder_name
+    for item in visible:
+        return item.stem
     return ""
 
 

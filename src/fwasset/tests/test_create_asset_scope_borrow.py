@@ -243,27 +243,25 @@ def test_borrow_mode_calls_register_not_create(qt_env) -> None:
     qt_env.host.borrow_candidates_for = lambda module_key: [source_asset]
 
     def drive(dialog) -> int:
+        from PySide6.QtWidgets import QComboBox, QLabel, QLineEdit
+
         buttons, _radios, _combos, _edits = _widgets(dialog)
         buttons["使用其他型号的程序"].click()
 
         source_combo = _combo_named(dialog, "borrow_source_combo")
-        mode_combo = _combo_named(dialog, "borrow_mode_combo")
         assert source_combo.isEnabled()
         assert source_combo.count() == 1
-        modes = [mode_combo.itemData(i) for i in range(mode_combo.count())]
-        assert modes == ["static", "follow_asset"]
-        assert "follow_default" not in modes
+        assert dialog.findChild(QComboBox, "borrow_mode_combo") is None
+        labels = [label.text() for label in dialog.findChildren(QLabel)]
+        assert not any("更新方式" in text or "固定版本" in text for text in labels)
 
         # 借用不产生新程序目录，程序名/厂商无意义；借用也只支持通用
-        from PySide6.QtWidgets import QLineEdit
-
         name_box = dialog.findChild(QLineEdit)
         assert name_box is not None and not name_box.isEnabled()
         assert not _combo_named(dialog, "vendor_combo").isEnabled()
         scope = _combo_named(dialog, "scope_combo")
         assert not scope.isEnabled() and scope.scheme() == ""
 
-        mode_combo.setCurrentIndex(1)  # follow_asset
         buttons["保存"].click()
         assert qt_env.borrowed, "应调用 register_shared_module"
         assert not qt_env.created, "借用不得调用 create_asset"

@@ -238,19 +238,12 @@ def open_create_asset(host: Any) -> None:
     layout.addWidget(QLabel("程序类型"))
     layout.addWidget(modules)
 
-    # 借用模式专属控件
+    # 借用只跟随来源程序的后续更新，不再选择固定版本。
     borrow_source = QComboBox(dialog)
     borrow_source.setObjectName("borrow_source_combo")
-    borrow_mode = QComboBox(dialog)
-    borrow_mode.setObjectName("borrow_mode_combo")
-    borrow_mode.addItem("固定版本", userData="static")
-    borrow_mode.addItem("自动更新", userData="follow_asset")
     borrow_source_label = QLabel("源程序", dialog)
-    borrow_mode_label = QLabel("更新方式", dialog)
     layout.addWidget(borrow_source_label)
     layout.addWidget(borrow_source)
-    layout.addWidget(borrow_mode_label)
-    layout.addWidget(borrow_mode)
 
     layout.addWidget(QLabel("程序名"))
     layout.addWidget(asset_name)
@@ -277,10 +270,7 @@ def open_create_asset(host: Any) -> None:
         on = bool(borrow_state["on"])
         borrow_source_label.setVisible(on)
         borrow_source.setVisible(on)
-        borrow_mode_label.setVisible(on)
-        borrow_mode.setVisible(on)
         borrow_source.setEnabled(on)
-        borrow_mode.setEnabled(on)
         # 借用不产生新程序目录，也只支持通用；程序类型由源程序决定
         modules.setEnabled(not on)
         asset_name.setEnabled(not on)
@@ -383,7 +373,6 @@ def open_create_asset(host: Any) -> None:
             QMessageBox.information(host, "新建程序", "请先选择要使用的程序。")
             return
         source_asset = assets[index]
-        mode = str(borrow_mode.currentData() or "static")
         buttons[1].setEnabled(False)
 
         def run(
@@ -394,7 +383,7 @@ def open_create_asset(host: Any) -> None:
                 host.root_dir,
                 model_root,
                 source_asset,
-                mode=mode,
+                mode="follow_asset",
                 overwrite_token=token,
                 log_fn=log,
             )

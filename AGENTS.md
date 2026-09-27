@@ -17,7 +17,7 @@
 - 新源文件使用 `from __future__ import annotations`；新 helper 和公共方法补类型标注。导入顺序：标准库、第三方、`fwasset.*`。
 - `core/types.py` 是 TypedDict / Literal 真源，字段变化同步生产者、消费者和测试。
 - `core/services/` 返回 `ServiceResult`，用户消息使用中文，不以裸异常代替服务错误码。
-- `firmware_catalog.toml` 条目顺序影响匹配；`handcontrol_ui` 同时有 `.rom` 和 `.pkg` 只用于既有资产扫描识别，不作为导入准入条件。
+- `firmware_catalog.toml` 条目顺序影响匹配；`handcontrol_ui` 的 ROM/PKG 成对规则只用于扫描识别，不作为导入准入条件。明确位于 `手控UI` 模块下的 ROM+PKG 与 TXT+IMG 都显示在列表中，并走同一流程：格式化 U 盘、把固件文件复制到 U 盘根目录、弹出。这不是自动烧录。ROM+PKG 的版本来自 `.rom` 文件名；TXT+IMG 的版本来自程序目录名（厂商文件夹或压缩包名），不读 `.img` 文件名。
 - `asset_index.py` 采用单工作区语义；目录树和 TOML 是真源，SQLite 是搜索缓存。
 - UI 只用 Qt：registry + `PanelHost`、组合式 ViewModel、后台线程与结果队列；取消使用 `threading.Event`。
 

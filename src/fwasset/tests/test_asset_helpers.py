@@ -157,6 +157,26 @@ def test_asset_primary_file_name_prefers_rom_for_handcontrol():
     assert asset_primary_file_name(asset) == "hc_v13.rom"
 
 
+def test_asset_primary_file_name_prefers_img_over_boot_text():
+    asset = _asset(
+        path="D:/root/L36/手控UI/A",
+        files=["bootcfg.txt", "d12x_mzkj_v1.0.0.img", "程序信息.toml"],
+    )
+    assert asset_primary_file_name(asset) == "d12x_mzkj_v1.0.0.img"
+
+
+def test_handcontrol_copy_filenames_keeps_firmware_pair_only():
+    from fwasset.core.asset_helpers import handcontrol_copy_filenames
+
+    assert handcontrol_copy_filenames(
+        ["a.pkg", "a.rom", "程序信息.toml", "note.pdf"]
+    ) == ["a.rom", "a.pkg"]
+    assert handcontrol_copy_filenames(
+        ["程序信息.toml", "bootcfg.txt", "d12x.img", "readme.pdf"]
+    ) == ["bootcfg.txt", "d12x.img"]
+    assert handcontrol_copy_filenames(["only.rom", "程序信息.toml"]) == []
+
+
 def test_asset_primary_file_name_empty_when_no_files():
     asset = _asset(path="D:/root/L36/主板/V1.0", files=[])
     assert asset_primary_file_name(asset) == ""

@@ -152,6 +152,26 @@ def _files_match_extensions(filenames: list[str], extensions: list[str]) -> bool
     return False
 
 
+def _is_explicit_handcontrol_image(
+    dirpath: str, filenames: list[str], cfg: FirmwareTypeConfig
+) -> bool:
+    """仅在明确的手控 UI 模块目录下识别单文件镜像。"""
+    if ".img" not in cfg.get("file_extensions", []):
+        return False
+    if not _files_match_extensions(filenames, [".img"]):
+        return False
+    folder = Path(dirpath)
+    module = folder if folder.name.casefold() == "手控ui" else folder.parent
+    if module.name.casefold() != "手控ui":
+        return False
+    parent = module.parent
+    return (
+        parent.name == _COMMON_DIR
+        or parent.parent.name == _CUSTOM_DIR
+        or (parent.name == _DUAL_CORE_DIR and parent.parent.name == _COMMON_DIR)
+    )
+
+
 def _match_catalog_type(
     dirpath: str, filenames: list[str], type_configs: list[FirmwareTypeConfig]
 ) -> FirmwareTypeConfig | None:
@@ -167,8 +187,9 @@ def _match_catalog_type(
             has_pkg = _files_match_extensions(filenames, SCAN_PKG_EXTENSIONS)
             if has_rom and has_pkg:
                 return cfg
-            # 仓库硬约束：handcontrol_ui 必须同时有 .rom 与 .pkg；缺任一不得
-            # 落入通用扩展名分支误认（R8 第五轮审查 P1-1）
+            if _is_explicit_handcontrol_image(dirpath, filenames, cfg):
+                return cfg
+            # 普通手控扫描仍要求 ROM/PKG 成对；缺任一不得落入通用扩展名分支。
             continue
         if keywords and not any(
             keyword in part for keyword in keywords for part in lower_parts
@@ -190,8 +211,8 @@ def classify_staged_content(
     ``target_dir`` 不要求已存在——``_match_catalog_type`` 只按路径文本做
     ``dir_keywords`` 匹配（模块名段），不读盘；``filenames`` 是调用方自行
     汇总的候选文件名清单（如 staging 会话或候选目录内容）。命中某个 catalog
-    条目即完整（``handcontrol_ui`` 天然要求同时有 ``.rom`` 与 ``.pkg``，
-    这条硬约束已在 ``_match_catalog_type`` 内，不需要调用方另判）；未命中
+    条目即完整（``handcontrol_ui`` 支持 ROM/PKG 成对，或明确手控 UI 目录中的
+    `.img` 镜像）；未命中
     任何条目即未按 catalog 识别。导入不再用它做准入；扫描识别仍用同一规则。
     不得直接调用私有 ``_match_catalog_type``。
     """
@@ -249,6 +270,16 @@ def _model_directory_for_asset(
         base_path = Path(folder_path.anchor)
     if not relative_parts:
         return folder_path
+    # 标准布局的型号根是「通用/定制」的上一级。程序名里的其他型号不能把
+    # 程序文件夹本身当成型号目录。
+    layout_index = next(
+        (index for index, part in enumerate(relative_parts) if part in {"通用", "定制"}),
+        None,
+    )
+    if layout_index == 0:
+        return base_path
+    if layout_index is not None:
+        return base_path.joinpath(*relative_parts[:layout_index])
     if _is_known_model(model):
         candidate = base_path
         matches: list[Path] = []
@@ -471,9 +502,23 @@ def _scan_assets(
             continue
 
         folder_path = Path(dirpath)
-        model, version = _extract_model_version(dirpath, filenames)
-        if str(cfg["key"]) == "handcontrol_ui":
-            model = _prefer_handcontrol_directory_model(folder_path, model)
+        # TXT+IMG 的程序名是厂商文件夹或压缩包名，版本不读镜像文件名。
+        # ROM+PKG 仍以 .rom 文件名为准。
+        image_only = (
+            str(cfg["key"]) == "handcontrol_ui"
+            and _is_explicit_handcontrol_image(dirpath, filenames, cfg)
+            and not (
+                _files_match_extensions(filenames, SCAN_ROM_EXTENSIONS)
+                and _files_match_extensions(filenames, SCAN_PKG_EXTENSIONS)
+            )
+        )
+        if image_only:
+            model = guess_model_from_path(dirpath)
+            version = guess_version_from_path(dirpath)
+        else:
+            model, version = _extract_model_version(dirpath, filenames)
+            if str(cfg["key"]) == "handcontrol_ui":
+                model = _prefer_handcontrol_directory_model(folder_path, model)
         model_directory = _model_directory_for_asset(
             root_path, folder_path, model, str(cfg["key"])
         )

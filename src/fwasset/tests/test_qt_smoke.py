@@ -347,6 +347,19 @@ def test_shared_source_picker_requires_explicit_selection(qapp, monkeypatch) -> 
     list_widget.setCurrentRow(0)
     qapp.processEvents()
     assert confirm_button.isEnabled() is True
+    from PySide6.QtWidgets import QComboBox, QLabel
+
+    labels = [label.text() for label in dialog.findChildren(QLabel)]
+    assert not any("更新方式" in text or "固定版本" in text for text in labels)
+    assert dialog.findChild(QComboBox) is None
+    registered: dict[str, object] = {}
+
+    def _capture_register(*args: object) -> None:
+        registered["mode"] = args[4]
+
+    monkeypatch.setattr(workbench, "_do_register_shared", _capture_register)
+    confirm_button.click()
+    assert registered["mode"] == "follow_asset"
 
 
 def test_setup_wizard_prefills_validates_and_writes_config(qapp, tmp_path) -> None:
@@ -576,6 +589,43 @@ def test_single_variant_collapses_with_directory_name_and_badge(qapp) -> None:
         "版本",
         "程序文件",
     ]
+
+
+def test_img_handcontrol_is_rendered_in_common_qt_grid(qapp, tmp_path) -> None:
+    from fwasset.core.asset_index import save_assets
+    from fwasset.core.file_scan import scan_firmware_assets
+    from fwasset.ui_common.view_models.scheme_workbench_model import (
+        SchemeWorkbenchModel,
+    )
+
+    root = tmp_path / "testprogram"
+    model_root = root / "L36"
+    model_root.mkdir(parents=True)
+    (model_root / "平台配置.toml").write_text(
+        '[[platform]]\nname = "单3D"\n', encoding="utf-8"
+    )
+    program = model_root / "通用" / "手控UI" / "YJ_d12x_massage_lcd_L50S_V21.07"
+    program.mkdir(parents=True)
+    (program / "d12x_mzkj_v1.0.0.img").write_bytes(b"firmware")
+    (program / "bootcfg.txt").write_text("boot", encoding="utf-8")
+    (program / "程序信息.toml").write_text('vendor = "测试"\n', encoding="utf-8")
+    assets, issues = scan_firmware_assets(str(root))
+    assert not issues
+    db = tmp_path / "index.db"
+    save_assets(assets, str(root), path=db)
+    model = SchemeWorkbenchModel()
+    model.bind(db, root, root)
+
+    grid = DataGrid(lambda _message: None)
+    grid.populate(model.get_common_modules("L36", "手控UI"))
+
+    assert grid.tree.topLevelItemCount() == 1
+    item = grid.tree.topLevelItem(0)
+    assert item.text(0) == "手控UI"
+    assert item.text(1) == program.name
+    assert item.text(2) == "通用"
+    assert item.text(3) == "V21.07"
+    assert item.text(4) == "d12x_mzkj_v1.0.0.img"
 
 
 def test_multi_variant_grouped_under_parent_row(qapp) -> None:
@@ -872,7 +922,7 @@ def test_qt_panel_registry_routes_all_four_modes(qapp) -> None:
     assert get_panel("nonexistent") is None
 
 
-def test_auto_usb_panel_paired_files_shows_one_click(qapp) -> None:
+def test_auto_usb_panel_paired_files_shows_copy_button(qapp) -> None:
     from qfluentwidgets import PrimaryPushButton
 
     from fwasset.ui_qt.operation_panels import get_panel
@@ -882,7 +932,24 @@ def test_auto_usb_panel_paired_files_shows_one_click(qapp) -> None:
     )
     panel.build()
     buttons = panel.findChildren(PrimaryPushButton)
-    assert any(b.text() == "一键烧录" for b in buttons)
+    texts = {b.text() for b in buttons}
+    assert "复制到 U 盘" in texts
+    assert "一键烧录" not in texts
+
+
+def test_auto_usb_panel_img_txt_uses_same_copy_button(qapp) -> None:
+    from qfluentwidgets import PrimaryPushButton
+
+    from fwasset.ui_qt.operation_panels import get_panel
+
+    panel = get_panel("auto_usb")(
+        asset=_op_asset(files=["bootcfg.txt", "d12x_mzkj_v1.0.0.img", "程序信息.toml"]),
+        log_fn=lambda _m: None,
+        panel_host=_FakeHost(),
+    )
+    panel.build()
+    buttons = panel.findChildren(PrimaryPushButton)
+    assert {b.text() for b in buttons} == {"复制到 U 盘"}
 
 
 def test_auto_usb_panel_missing_pkg_shows_warning(qapp) -> None:
@@ -976,6 +1043,34 @@ def test_run_task_busy_guard_and_completion(qapp) -> None:
     assert done == ["ok"], "on_done 回调应收到任务结果"
     assert any("已有任务执行中" in m for m in logs)
     assert any("测试任务完成" in m for m in logs)
+
+
+def test_wrapped_write_failure_is_not_logged_as_complete(qapp) -> None:
+    """run_write 把服务结果包在 epoch 里；失败不能再记成「完成」。"""
+    from fwasset.ui_qt.workbench_window import WorkbenchInterface
+
+    w = WorkbenchInterface()
+    logs: list[str] = []
+    w.log_message.connect(logs.append)
+    w._silent_tasks.add(7)
+    w._on_task_done(
+        7,
+        "登记借用",
+        {
+            "epoch": 1,
+            "result": {
+                "ok": False,
+                "code": "invalid_args",
+                "message": "来源型号必须已配置 id",
+                "payload": {},
+            },
+            "status": None,
+        },
+    )
+
+    assert any("登记借用失败" in message for message in logs)
+    assert any("来源型号必须已配置 id" in message for message in logs)
+    assert not any(message == "登记借用完成" for message in logs)
 
 
 def test_shared_badges_render_on_existing_variant_row() -> None:

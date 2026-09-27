@@ -5,6 +5,7 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from fwasset.core.managed_paths import should_exclude_managed_path
 from fwasset.core.types import FirmwareAsset
 
 
@@ -60,6 +61,28 @@ def asset_rom_pkg_files(asset: FirmwareAsset) -> tuple[str, str]:
     return rom_file, pkg_file
 
 
+def handcontrol_copy_filenames(filenames: list[str]) -> list[str]:
+    """手控要复制到 U 盘根目录的固件文件，排除程序元数据和其它附件。
+
+    同时有 ROM 与 PKG 时只取这一对；否则取 TXT 与 IMG。缺配对或没有 IMG 时返回空。
+    """
+    visible = [
+        str(name)
+        for name in filenames
+        if str(name).strip()
+        and not should_exclude_managed_path(str(name), is_dir=False)
+    ]
+    rom = next((name for name in visible if name.lower().endswith(".rom")), "")
+    pkg = next((name for name in visible if name.lower().endswith(".pkg")), "")
+    if rom and pkg:
+        return [rom, pkg]
+    images = [name for name in visible if name.lower().endswith(".img")]
+    if not images:
+        return []
+    texts = [name for name in visible if name.lower().endswith(".txt")]
+    return texts + images
+
+
 def asset_dir_path(asset: FirmwareAsset) -> str:
     return str(asset.get("path", "") or "")
 
@@ -75,7 +98,7 @@ def asset_primary_file_name(asset: FirmwareAsset) -> str:
     rom = next((name for name in files if name.lower().endswith(".rom")), "")
     if rom:
         return rom
-    preferred_exts = (".bin", ".hex", ".pkg", ".zip")
+    preferred_exts = (".bin", ".hex", ".img", ".pkg", ".zip")
     primary = next(
         (name for name in files if name.lower().endswith(preferred_exts)), ""
     )

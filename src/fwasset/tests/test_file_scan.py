@@ -323,6 +323,83 @@ def test_segmented_screen_before_handcontrol_ui_in_catalog(tmp_path: Path):
     )
 
 
+def test_handcontrol_img_requires_explicit_handcontrol_module(tmp_path: Path) -> None:
+    for module in ("主板程序", "断码屏亚克力手控"):
+        folder = tmp_path / "L36" / "通用" / module / "v1"
+        folder.mkdir(parents=True)
+        (folder / "firmware.img").write_bytes(b"firmware")
+    misleading_root = tmp_path / "手控UI" / "L50" / "通用" / "主板程序" / "v1"
+    misleading_root.mkdir(parents=True)
+    (misleading_root / "firmware.img").write_bytes(b"firmware")
+
+    assets, issues = scan_firmware_assets(str(tmp_path))
+
+    assert not issues
+    assert not any(asset["firmware_type"] == "handcontrol_ui" for asset in assets)
+
+
+def test_handcontrol_img_version_comes_from_directory_not_image_name(
+    tmp_path: Path,
+) -> None:
+    """厂商文件夹名才是程序版本；镜像文件名里的芯片版本不能覆盖它。"""
+    folder = (
+        tmp_path
+        / "L36"
+        / "通用"
+        / "手控UI"
+        / "YJ_d12x_massage_lcd_L50S_V21.07"
+    )
+    folder.mkdir(parents=True)
+    (folder / "bootcfg.txt").write_text("boot", encoding="utf-8")
+    (folder / "d12x_mzkj_v1.0.0.img").write_bytes(b"firmware")
+
+    assets, issues = scan_firmware_assets(str(tmp_path))
+
+    assert not issues
+    assert len(assets) == 1
+    assert assets[0]["version"] == "V21.07"
+    assert assets[0]["model"] == "L50S"
+    assert Path(assets[0]["model_directory_path"]) == tmp_path / "L36"
+
+
+def test_handcontrol_rom_version_still_comes_from_rom_filename(tmp_path: Path) -> None:
+    folder = tmp_path / "L36" / "通用" / "手控UI" / "包装名_V1.0"
+    folder.mkdir(parents=True)
+    (folder / "ITE_NOR_yj_massage_4d_music_L36_v34.3.2.ROM").write_text(
+        "rom", encoding="utf-8"
+    )
+    (folder / "ITEPKG03.PKG").write_text("pkg", encoding="utf-8")
+
+    assets, issues = scan_firmware_assets(str(tmp_path))
+
+    assert not issues
+    assert len(assets) == 1
+    assert assets[0]["version"] == "V34.3.2"
+    assert assets[0]["model"] == "L36"
+
+
+def test_handcontrol_img_under_dual_core_platform_is_scanned(tmp_path: Path) -> None:
+    folder = (
+        tmp_path
+        / "L36"
+        / "通用"
+        / "双机芯-上3D-下2D"
+        / "手控UI"
+        / "镜像版本"
+    )
+    folder.mkdir(parents=True)
+    (folder / "firmware.img").write_bytes(b"firmware")
+
+    assets, issues = scan_firmware_assets(str(tmp_path))
+
+    assert not issues
+    assert len(assets) == 1
+    assert assets[0]["firmware_type"] == "handcontrol_ui"
+    assert assets[0]["platform"] == "双机芯-上3D-下2D"
+    assert assets[0]["flash_mode"] == "auto_usb"
+    assert assets[0]["usb_flow"] == "paired_files"
+
+
 def test_music_bt_detects_mot_files(tmp_path: Path):
     """P0-2: Bluetooth directories with .mot files should be detected as music_bt."""
     bt_dir = tmp_path / "L36" / "蓝牙板"

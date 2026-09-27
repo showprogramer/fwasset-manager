@@ -86,6 +86,44 @@ def _ignore_managed_entries(directory: str, names: list[str]) -> set[str]:
     return ignored
 
 
+def copy_named_files_to_usb(
+    source_dir: str,
+    filenames: list[str],
+    drive: str,
+    log_fn: Callable[..., None] = print,
+) -> bool:
+    """把指定文件复制到 U 盘根目录，不创建程序文件夹。"""
+    src = Path(source_dir)
+    root = Path(drive)
+    if not src.is_dir():
+        log_fn(f"  复制失败: 源目录不存在 {source_dir}")
+        return False
+    if not root.is_dir():
+        log_fn(f"  复制失败: U盘路径无效 {drive}")
+        return False
+    if not filenames:
+        log_fn("  复制失败: 没有可复制的固件文件")
+        return False
+    try:
+        for name in filenames:
+            if not name or name != Path(name).name:
+                log_fn(f"  复制失败: 非法文件名 {name}")
+                return False
+            if should_exclude_managed_path(name, is_dir=False):
+                log_fn(f"  复制失败: 拒绝复制内部文件 {name}")
+                return False
+            file_path = src / name
+            if not file_path.is_file():
+                log_fn(f"  复制失败: 找不到 {name}")
+                return False
+            shutil.copy2(file_path, root / name)
+            log_fn(f"  已复制: {name}")
+        return True
+    except Exception as e:
+        log_fn(f"  复制失败: {e}")
+        return False
+
+
 def copy_directory_to_usb(
     source_dir: str, drive: str, log_fn: Callable[..., None] = print
 ) -> bool:

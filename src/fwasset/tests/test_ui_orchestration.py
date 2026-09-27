@@ -38,6 +38,12 @@ def test_prefill_uses_directory_zip_stem_and_skips_metadata() -> None:
     assert prefill_asset_name(source_kind="files", files=loose) == "readme"
 
 
+def test_prefill_img_pair_uses_unzipped_folder_name() -> None:
+    folder = Path("来料") / "YJ_d12x_massage_lcd_L50S_V21.07"
+    files = [folder / "bootcfg.txt", folder / "d12x_mzkj_v1.0.0.img"]
+    assert prefill_asset_name(source_kind="files", files=files) == folder.name
+
+
 def test_startup_runs_all_steps_and_skips_staging_root(tmp_path: Path) -> None:
     staging = tmp_path / ".fwasset" / "staging"
     first = staging / "s1"

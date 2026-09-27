@@ -280,6 +280,44 @@ def test_create_asset_index_write_failure_is_ok_with_index_pending(
 # ---------------------------------------------------------------------------
 
 
+def test_create_img_handcontrol_is_indexed_for_the_workbench(tmp_path: Path) -> None:
+    """新建 TXT+IMG 手控后，索引里要有这条程序，工作台才能列出来。"""
+    model_root = _make_model(tmp_path)
+    src_dir = _source_dir(tmp_path)
+    img = src_dir / "d12x_mzkj_v1.0.0.img"
+    txt = src_dir / "bootcfg.txt"
+    img.write_bytes(b"firmware")
+    txt.write_text("boot", encoding="utf-8")
+
+    result = create_asset(
+        str(tmp_path),
+        str(tmp_path),
+        source=[str(img), str(txt)],
+        source_kind="files",
+        model_root=model_root,
+        scope="通用",
+        module_name="手控UI",
+        asset_name="YJ_d12x_massage_lcd_L50S_V21.07",
+        vendor="测试",
+    )
+
+    assert result["ok"] is True
+    assets = [
+        asset
+        for asset in query_assets()
+        if asset.get("firmware_type") == "handcontrol_ui"
+    ]
+    assert len(assets) == 1
+    assert Path(assets[0]["path"]) == (
+        model_root / "通用" / "手控UI" / "YJ_d12x_massage_lcd_L50S_V21.07"
+    )
+    assert assets[0]["version"] == "V21.07"
+    assert assets[0]["flash_mode"] == "auto_usb"
+    assert assets[0]["usb_flow"] == "paired_files"
+    assert "d12x_mzkj_v1.0.0.img" in assets[0]["files"]
+    assert "程序信息.toml" not in assets[0]["files"]
+
+
 def test_create_asset_stores_handcontrol_rom_without_pkg(tmp_path: Path) -> None:
     """导入不做内容校验：缺 .pkg 的手控来源直接落在业务目录。"""
     model_root = _make_model(tmp_path)

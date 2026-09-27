@@ -12,6 +12,7 @@ from fwasset.core.asset_index import AssetIndexError
 from fwasset.core.file_scan import scan_firmware_subtree
 from fwasset.core.model_config import (
     SharedModuleRef,
+    load_model_config,
     load_shared_modules,
     save_shared_module,
 )
@@ -110,6 +111,32 @@ def test_set_asset_default_uses_asset_directory_name(tmp_path: Path) -> None:
 
     assert result["ok"] is True, result
     assert load_platform_config(model)[0].defaults["主板程序"] == "程序A"
+
+
+def test_register_img_handcontrol_uses_structural_model_id(tmp_path: Path) -> None:
+    """文件夹名里的 L50S 不是来源型号；借用要读 L36 目录上的 id。"""
+    source_model = _model(tmp_path, "L36")
+    target_model = _model(tmp_path, "L50S")
+    program = source_model / "通用" / "手控UI" / "YJ_d12x_massage_lcd_L50S_V21.07"
+    program.mkdir(parents=True)
+    (program / "bootcfg.txt").write_text("boot", encoding="utf-8")
+    (program / "d12x_mzkj_v1.0.0.img").write_bytes(b"img")
+
+    result = register_shared_module(
+        str(tmp_path),
+        str(tmp_path),
+        target_model,
+        _scanned_asset(tmp_path, program),
+        mode="follow_asset",
+    )
+
+    assert result["ok"] is True, result
+    refs = load_shared_modules(target_model)
+    assert len(refs) == 1
+    assert refs[0].mode == "follow_asset"
+    source_id, status, _detail = load_model_config(source_model)
+    assert status == "ok"
+    assert refs[0].source_model_id == source_id
 
 
 def test_register_shared_module_rejects_self_reference(tmp_path: Path) -> None:

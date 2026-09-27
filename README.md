@@ -157,7 +157,7 @@ Copy-Item config.example.toml config.toml
 | `dir_keywords` | 匹配目录关键字列表 |
 | `file_extensions` | 匹配文件后缀列表 |
 | `flash_mode` | 烧录模式：`auto_usb` / `tool_launch` / `manual_doc` / `disabled` |
-| `usb_flow` | USB 模式子类型：`paired_files`（ROM+PKG 配对）或 `directory_copy`（整目录拷贝） |
+| `usb_flow` | USB 模式子类型：`paired_files`（手控固件文件复制到 U 盘根目录）或 `directory_copy`（整目录拷贝） |
 | `tool_name` | 关联的外部工具名称 |
 | `tool_dir` | 工具所在子目录（相对于 `tool_root`） |
 | `enabled` | 是否启用该类型 |
@@ -226,13 +226,14 @@ L36程序/
 | `manual_doc` | 展示操作说明文档，不执行自动化 | 占座提醒 |
 | `disabled` | 该类型暂不提供操作 | 老化程序 |
 
-### 手控 UI 烧录流程 (`auto_usb` + `paired_files`)
+### 手控 UI 复制到 U 盘 (`auto_usb` + `paired_files`)
 
-1. 检测 U 盘盘符
-2. 清理 U 盘根目录下的旧 ROM/PKG 文件
-3. 复制新的 ROM + PKG 文件到 U 盘根目录
+ROM+PKG 与 TXT+IMG 使用同一流程，不是自动烧录：
+
+1. 选择 U 盘并确认格式化
+2. 将 U 盘格式化为 FAT32
+3. 把程序目录中的固件文件复制到 U 盘根目录（ROM+PKG，或 TXT+IMG；不复制 `程序信息.toml`，也不带上程序文件夹）
 4. 自动弹出 U 盘
-5. 用户将 U 盘插入手控器，完成刷写
 
 ### 音乐文件烧录流程 (`auto_usb` + `directory_copy`)
 

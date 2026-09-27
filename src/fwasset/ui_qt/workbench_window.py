@@ -15,7 +15,6 @@ from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QHBoxLayout,
-    QLabel,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -396,12 +395,20 @@ class WorkbenchInterface(QWidget):
                 on_done(result)
             except Exception as exc:  # noqa: BLE001
                 self._log(f"{name} 回调异常: {exc}")
-        # ServiceResult：按 ok 区分完成/失败，避免 copy_failed 仍显示「完成」
-        if isinstance(result, dict) and "ok" in result:
-            if result.get("ok"):
+        # run_write 把 ServiceResult 包在 epoch 里；按内层 ok 区分完成/失败。
+        reported = result
+        if (
+            isinstance(result, dict)
+            and "ok" not in result
+            and isinstance(result.get("result"), dict)
+            and "ok" in result["result"]
+        ):
+            reported = result["result"]
+        if isinstance(reported, dict) and "ok" in reported:
+            if reported.get("ok"):
                 self._log(f"{name}完成")
             else:
-                msg = str(result.get("message") or "未知错误")
+                msg = str(reported.get("message") or "未知错误")
                 self._log(f"{name}失败: {msg}")
                 if not silent:
                     QMessageBox.warning(self, f"{name}失败", msg)
@@ -1048,8 +1055,6 @@ class WorkbenchInterface(QWidget):
         module_label: str,
         candidates: list[FirmwareAsset],
     ) -> None:
-        from PySide6.QtWidgets import QComboBox
-
         dlg = QDialog(self)
         dlg.setWindowTitle(shared_register_dialog_title(module_label))
         dlg.setMinimumWidth(SHARED_SOURCE_PICKER_MIN_WIDTH)
@@ -1083,14 +1088,6 @@ class WorkbenchInterface(QWidget):
 
         _fill(candidates)
 
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("更新方式："))
-        mode_combo = QComboBox(dlg)
-        mode_combo.addItem("固定版本", userData="static")
-        mode_combo.addItem("自动更新", userData="follow_asset")
-        mode_row.addWidget(mode_combo, stretch=1)
-        layout.addLayout(mode_row)
-
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
         confirm_btn = PrimaryPushButton("确认登记", dlg)
@@ -1109,14 +1106,13 @@ class WorkbenchInterface(QWidget):
             if row < 0:
                 return
             source_asset = candidates[row]
-            chosen_mode = str(mode_combo.currentData() or "static")
             dlg.accept()
             self._do_register_shared(
                 target_model,
                 module_key,
                 module_label,
                 source_asset,
-                chosen_mode,
+                "follow_asset",
             )
 
         confirm_btn.clicked.connect(_confirm)
@@ -1129,7 +1125,7 @@ class WorkbenchInterface(QWidget):
         module_key: str,
         module_label: str,
         source_asset: FirmwareAsset,
-        mode: str = "static",
+        mode: str = "follow_asset",
         overwrite_token: dict | None = None,
     ) -> None:
         del module_key
