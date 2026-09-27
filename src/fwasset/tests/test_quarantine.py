@@ -7,9 +7,10 @@ from pathlib import Path
 
 import pytest
 
+import fwasset.core.quarantine as quarantine_module
 from fwasset.core.managed_paths import managed_root, should_exclude_managed_path
 from fwasset.core.quarantine import (
-    UNDO_WINDOW_SECONDS,
+    RETENTION_SECONDS,
     QuarantineError,
     TrashUnavailableError,
     UndoConflictError,
@@ -165,23 +166,33 @@ def test_transactional_retire_has_no_undo_entry(tmp_path) -> None:
         _locked_undo_delete(tmp_path, record["id"])
 
 
-def test_retire_committed_and_sent_to_recycle_bin_on_sweep(tmp_path, monkeypatch) -> None:
+def test_retire_committed_is_purged_on_sweep(tmp_path, monkeypatch) -> None:
+    """已提交的退位在 sweep 时永久删除；不经系统回收站（TASK-20260923）。"""
     _init_workspace(tmp_path)
     asset = _make_asset(tmp_path)
     record = _locked_register_retire(tmp_path, asset)
     _locked_mark_retire_committed(tmp_path, record["id"])
 
-    sent_paths: list[Path] = []
+    purged: list[Path] = []
+    original_purge = quarantine_module._purge
+
+    def _spy(path: Path) -> None:
+        purged.append(path)
+        original_purge(path)
+
+    monkeypatch.setattr(quarantine_module, "_purge", _spy)
     monkeypatch.setattr(
-        "fwasset.core.quarantine._send_to_system_recycle_bin",
-        lambda path: sent_paths.append(path),
+        quarantine_module,
+        "_send_to_system_recycle_bin",
+        lambda _p: (_ for _ in ()).throw(AssertionError("不得送进系统回收站")),
     )
 
     processed = _locked_sweep_expired(tmp_path)
 
     assert len(processed) == 1
     assert processed[0]["status"] == "sent"
-    assert sent_paths == [Path(record["quarantine_path"])]
+    assert purged == [Path(record["quarantine_path"])]
+    assert not Path(record["quarantine_path"]).exists()
     assert load_quarantine_manifest(tmp_path) == []
 
 
@@ -194,7 +205,7 @@ def test_retire_send_failure_keeps_manifest_for_startup_recovery(tmp_path, monke
     def _boom(path: Path) -> None:
         raise OSError("simulated failure")
 
-    monkeypatch.setattr("fwasset.core.quarantine._send_to_system_recycle_bin", _boom)
+    monkeypatch.setattr(quarantine_module, "_purge", _boom)
 
     processed = _locked_sweep_expired(tmp_path)
 
@@ -367,13 +378,15 @@ def test_schedule_sweep_expired_runs_asynchronously_and_acquires_its_own_lock(
     _locked_mark_retire_committed(tmp_path, record["id"])
 
     release = threading.Event()
-    sent_paths: list[Path] = []
+    purged_paths: list[Path] = []
+    original_purge = quarantine_module._purge
 
-    def _blocking_send(path: Path) -> None:
+    def _blocking_purge(path: Path) -> None:
         release.wait(timeout=2.0)
-        sent_paths.append(path)
+        purged_paths.append(path)
+        original_purge(path)
 
-    monkeypatch.setattr("fwasset.core.quarantine._send_to_system_recycle_bin", _blocking_send)
+    monkeypatch.setattr(quarantine_module, "_purge", _blocking_purge)
 
     thread = schedule_sweep_expired(tmp_path)
     assert thread.is_alive()
@@ -384,7 +397,7 @@ def test_schedule_sweep_expired_runs_asynchronously_and_acquires_its_own_lock(
     thread.join(timeout=2.0)
 
     assert thread.error is None
-    assert sent_paths == [Path(record["quarantine_path"])]
+    assert purged_paths == [Path(record["quarantine_path"])]
     assert load_quarantine_manifest(tmp_path) == []
 
 
@@ -754,7 +767,7 @@ def test_undo_delete_rejects_tampered_record_pointing_at_another_records_directo
         "manifest": "deadbeef",
         "status": "pending",
         "created_at": now,
-        "expires_at": now + UNDO_WINDOW_SECONDS,
+        "expires_at": now + RETENTION_SECONDS,
     }
     records = load_quarantine_manifest(tmp_path)
     records.append(tampered_record)
@@ -1200,3 +1213,133 @@ def test_undo_manifest_save_failure_maps_recovery_required(
     assert result["payload"]["recovery_required"] is True
     # service 未 commit：工作区保持 recovery_required，不得宣称零产物成功。
     assert load_workspace_status(ws2).state == "recovery_required"
+
+
+# ---------------------------------------------------------------------------
+# 内置回收站（TASK-20260923）：1 小时保留、真删、不进系统回收站
+# ---------------------------------------------------------------------------
+
+
+def _locked_discard_now(workspace_root: Path, record_ids):
+    from fwasset.core.quarantine import discard_now
+
+    with WorkspaceLock(workspace_root):
+        return discard_now(workspace_root, record_ids)
+
+
+def test_retention_is_one_hour_and_persisted_as_wall_clock(tmp_path) -> None:
+    """保留期 1 小时；expires_at 取墙钟并落盘，关掉软件也照常计时。"""
+    from fwasset.core.quarantine import RETENTION_SECONDS
+
+    assert RETENTION_SECONDS == 3600.0
+
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    _init_workspace(workspace_root)
+    asset = _make_asset(workspace_root)
+
+    before = time.time()
+    record = _locked_register_delete(workspace_root, asset)
+    after = time.time()
+
+    assert before + 3600.0 <= record["expires_at"] <= after + 3600.0
+    # 落盘的是绝对墙钟时刻，不依赖进程存活
+    raw = json.loads(
+        (managed_root(workspace_root, "workspace_state") / "quarantine-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    stored = [r for r in raw["records"] if r["id"] == record["id"]][0]
+    assert stored["expires_at"] == record["expires_at"]
+
+
+def test_sweep_purges_without_touching_system_recycle_bin(tmp_path, monkeypatch) -> None:
+    """到期清理是真删：不调系统回收站，目标路径彻底消失。"""
+    import fwasset.core.quarantine as quarantine_module
+
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    _init_workspace(workspace_root)
+    asset = _make_asset(workspace_root)
+    record = _locked_register_delete(workspace_root, asset)
+    quarantine_path = Path(record["quarantine_path"])
+    assert quarantine_path.exists()
+
+    def _must_not_be_called(_path: Path) -> None:
+        raise AssertionError("删除链路不得送进系统回收站")
+
+    monkeypatch.setattr(
+        quarantine_module, "_send_to_system_recycle_bin", _must_not_be_called
+    )
+
+    # 手动把这条记录改成已到期（等价于关掉软件过了一小时）
+    records = load_quarantine_manifest(workspace_root)
+    expired = [{**r, "expires_at": time.time() - 1.0} for r in records]
+    with WorkspaceLock(workspace_root):
+        _save_quarantine_manifest(workspace_root, expired)
+
+    processed = _locked_sweep_expired(workspace_root)
+
+    assert [r["id"] for r in processed] == [record["id"]]
+    assert not quarantine_path.exists(), "内容应被真删"
+    assert load_quarantine_manifest(workspace_root) == []
+
+
+def test_discard_now_purges_before_expiry(tmp_path, monkeypatch) -> None:
+    """彻底删除：未到期也能清，且不进系统回收站。"""
+    import fwasset.core.quarantine as quarantine_module
+
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    _init_workspace(workspace_root)
+    keep = _make_asset(workspace_root, "keep")
+    drop = _make_asset(workspace_root, "drop")
+    keep_record = _locked_register_delete(workspace_root, keep)
+    drop_record = _locked_register_delete(workspace_root, drop)
+
+    monkeypatch.setattr(
+        quarantine_module,
+        "_send_to_system_recycle_bin",
+        lambda _p: (_ for _ in ()).throw(AssertionError("不得送进系统回收站")),
+    )
+
+    processed = _locked_discard_now(workspace_root, [drop_record["id"]])
+
+    assert [r["id"] for r in processed] == [drop_record["id"]]
+    assert not Path(drop_record["quarantine_path"]).exists()
+    # 未指定的那条原样保留，仍可还原
+    remaining = load_quarantine_manifest(workspace_root)
+    assert [r["id"] for r in remaining] == [keep_record["id"]]
+    assert Path(keep_record["quarantine_path"]).exists()
+
+
+def test_discard_now_requires_lock(tmp_path) -> None:
+    from fwasset.core.quarantine import discard_now
+
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    _init_workspace(workspace_root)
+    asset = _make_asset(workspace_root)
+    record = _locked_register_delete(workspace_root, asset)
+
+    with pytest.raises(QuarantineError):
+        discard_now(workspace_root, [record["id"]])
+
+
+def test_discard_now_ignores_unknown_and_foreign_ids(tmp_path) -> None:
+    """未知 id 忽略；跨工作区记录跳过且原样保留。"""
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    _init_workspace(workspace_root)
+    asset = _make_asset(workspace_root)
+    record = _locked_register_delete(workspace_root, asset)
+
+    foreign = {**record, "id": "foreign-1", "workspace_root": str(tmp_path / "other")}
+    with WorkspaceLock(workspace_root):
+        _save_quarantine_manifest(workspace_root, [record, foreign])
+
+    processed = _locked_discard_now(workspace_root, ["nope", "foreign-1"])
+
+    assert processed == []
+    kept = {r["id"] for r in load_quarantine_manifest(workspace_root)}
+    assert kept == {record["id"], "foreign-1"}

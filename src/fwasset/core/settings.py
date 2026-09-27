@@ -1,6 +1,14 @@
+from __future__ import annotations
+
 import os
 import sys
 from pathlib import Path
+from typing import Any
+
+import tomli_w
+
+from fwasset.core.config_io import atomic_write_text
+from fwasset.core.types import ServiceResult
 
 
 def _find_project_root(start: Path) -> Path:
@@ -181,6 +189,151 @@ def load_vendor_candidates() -> list[str]:
     if any(not isinstance(item, str) for item in raw):
         return list(DEFAULT_VENDORS)
     return normalize_vendor_list(raw)
+
+
+def _result(
+    ok: bool, code: str, message: str, payload: dict[str, Any] | None = None
+) -> ServiceResult:
+    return {"ok": ok, "code": code, "message": message, "payload": payload or {}}
+
+
+def _same_config_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
+
+
+def _dump_config(document: dict[str, Any]) -> str:
+    return tomli_w.dumps(document)
+
+
+def _sync_process_cache(
+    document: dict[str, Any], *, created: bool, sync_paths: bool
+) -> None:
+    """成功写入当前 CONFIG_PATH 后更新 load 所读的缓存。
+
+    状态已是 ok 且本次只保存厂商时，只替换 vendors。
+    """
+    global _cfg, CONFIG_LOAD_STATUS, CONFIG_LOAD_ERROR
+    vendors = document.get("vendors")
+    stored = list(vendors) if isinstance(vendors, list) else None
+    paths = document.get("paths")
+    if created or CONFIG_LOAD_STATUS != "ok":
+        copied: dict[str, Any] = dict(document)
+        if stored is not None:
+            copied["vendors"] = stored
+        if isinstance(paths, dict):
+            copied["paths"] = dict(paths)
+        _cfg = copied
+        CONFIG_LOAD_STATUS = "ok"
+        CONFIG_LOAD_ERROR = ""
+        return
+    if stored is not None:
+        _cfg["vendors"] = stored
+    if not sync_paths or not isinstance(paths, dict):
+        return
+    current = _cfg.get("paths")
+    if not isinstance(current, dict):
+        current = {}
+        _cfg["paths"] = current
+    current.update(paths)
+
+
+def _write_config_document(
+    target: Path,
+    document: dict[str, Any],
+    *,
+    created: bool,
+    sync_paths: bool,
+) -> ServiceResult:
+    process = _same_config_path(target, CONFIG_PATH)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(target, _dump_config(document))
+    except OSError as exc:
+        return _result(False, "write_failed", f"配置保存失败：{exc}")
+    if process:
+        _sync_process_cache(document, created=created, sync_paths=sync_paths)
+    return _result(True, "ok", "厂商名单已保存")
+
+
+def save_vendor_candidates(
+    values: list[str], *, config_path: Path | None = None
+) -> ServiceResult:
+    """把规范化后的厂商名单写入 config.toml 顶层 ``vendors``。
+
+    成功写入当前 ``CONFIG_PATH`` 时同步进程缓存。其他路径不改缓存。
+    """
+    normalized = normalize_vendor_list(list(values))
+    target = CONFIG_PATH if config_path is None else Path(config_path)
+    process = _same_config_path(target, CONFIG_PATH)
+    if not target.exists():
+        return _write_config_document(
+            target, {"vendors": list(normalized)}, created=True, sync_paths=False
+        )
+
+    data, status, _detail = load_toml_config(target)
+    if status != "ok":
+        return _result(False, "config_corrupt", "配置文件已损坏，未修改厂商名单")
+    if "vendors" in data:
+        raw = data.get("vendors")
+        if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+            return _result(
+                False, "config_corrupt", "配置文件里的厂商名单无法读取，未写入"
+            )
+        on_disk = normalize_vendor_list(raw)
+    else:
+        on_disk = list(DEFAULT_VENDORS)
+    current = load_vendor_candidates() if process else on_disk
+    if current == normalized:
+        return _result(True, "unchanged", "厂商名单未变化")
+    data["vendors"] = list(normalized)
+    return _write_config_document(target, data, created=False, sync_paths=False)
+
+
+def save_path_settings(
+    root_dir: str,
+    tool_root: str,
+    *,
+    config_path: Path | None = None,
+) -> ServiceResult:
+    """只改 ``[paths]``，保留其他键。损坏的配置零写盘。"""
+    target = CONFIG_PATH if config_path is None else Path(config_path)
+    process = _same_config_path(target, CONFIG_PATH)
+    root = str(root_dir or "").replace("\\", "/")
+    tool = str(tool_root or "").replace("\\", "/")
+    if not target.exists():
+        vendors = load_vendor_candidates() if process else list(DEFAULT_VENDORS)
+        document: dict[str, Any] = {
+            "paths": {"root_dir": root, "tool_root": tool},
+            "vendors": list(vendors),
+        }
+        result = _write_config_document(
+            target, document, created=True, sync_paths=True
+        )
+        if result["ok"]:
+            result["message"] = "配置已保存"
+        return result
+
+    data, status, _detail = load_toml_config(target)
+    if status != "ok":
+        return _result(False, "config_corrupt", "配置文件已损坏，未修改路径")
+    raw = data.get("vendors")
+    if "vendors" in data and (
+        not isinstance(raw, list) or any(not isinstance(item, str) for item in raw)
+    ):
+        return _result(
+            False, "config_corrupt", "配置文件里的厂商名单无法读取，未修改路径"
+        )
+    paths = data.get("paths")
+    if not isinstance(paths, dict):
+        paths = {}
+        data["paths"] = paths
+    paths["root_dir"] = root
+    paths["tool_root"] = tool
+    result = _write_config_document(target, data, created=False, sync_paths=True)
+    if result["ok"]:
+        result["message"] = "配置已保存"
+    return result
+
 
 # USB 扫描常量（硬编码，不再从用户配置读取）
 SCAN_ROM_EXTENSIONS: list[str] = [".rom"]

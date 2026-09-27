@@ -21,6 +21,7 @@ from fwasset.core.reference_lookup import BLOCKING_ISSUE_CATEGORIES, find_refere
 from fwasset.core.services.asset_service import delete_asset
 from fwasset.core.services.layout_update_service import (
     change_asset_semantics,
+    list_retired_versions,
     restore_retired_version,
     resume_change_asset_semantics,
     resume_restore_retired_version,
@@ -100,6 +101,161 @@ def test_retire_asset_to_backup_writes_four_fields(tmp_path: Path) -> None:
     )
     assert not old.exists()
     _assert_converged_clean(workspace)
+
+
+def test_list_retired_versions_exposes_restorable_copy(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    old = _variant(workspace)
+    source = _source(tmp_path, name="v2")
+    updated = update_asset(
+        str(workspace),
+        workspace,
+        {"path": str(old)},
+        str(source),
+        retire_mode="retire_to_backup",
+    )
+    assert updated["ok"], updated
+    current = Path(str(updated["payload"]["replacement"]))
+
+    listed = list_retired_versions(str(workspace), workspace, current)
+
+    assert listed["ok"], listed
+    [entry] = listed["payload"]["versions"]
+    assert entry["name"].startswith("v1-")
+    assert entry["retired_from"] == str(old)
+    assert entry["can_restore"] is True
+    assert Path(entry["backup_path"]).is_dir()
+
+
+def test_list_retired_versions_marks_occupied_target_unavailable(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    old = _variant(workspace)
+    current = _variant(workspace, name="v2", payload=b"new")
+    with WorkspaceTransaction(workspace, operation="test_retire") as transaction:
+        transaction.begin_product_write()
+        retire_asset_to_backup(
+            transaction, workspace, old, current, retired_by="update_asset"
+        )
+        transaction.commit()
+    old.mkdir()
+
+    listed = list_retired_versions(str(workspace), workspace, current)
+
+    assert listed["ok"], listed
+    [entry] = listed["payload"]["versions"]
+    assert entry["can_restore"] is False
+    assert "已有程序" in entry["reason"]
+
+
+def test_list_retired_versions_marks_semantic_move_unavailable(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    old = _variant(workspace)
+    current = _variant(workspace, module="蓝牙程序", name="v2", payload=b"new")
+    with WorkspaceTransaction(workspace, operation="test_retire") as transaction:
+        transaction.begin_product_write()
+        retire_asset_to_backup(
+            transaction,
+            workspace,
+            old,
+            current,
+            retired_by="change_asset_semantics",
+        )
+        transaction.commit()
+
+    listed = list_retired_versions(str(workspace), workspace, current)
+
+    assert listed["ok"], listed
+    [entry] = listed["payload"]["versions"]
+    assert entry["can_restore"] is False
+    assert "跨类型或方案" in entry["reason"]
+
+
+def test_list_retired_versions_shows_invalid_metadata_without_restore(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    current = _variant(workspace, name="v2")
+    backup = current / RETIRED_VERSIONS_DIRNAME / "old"
+    backup.mkdir(parents=True)
+    (backup / "fw.bin").write_bytes(b"old")
+
+    listed = list_retired_versions(str(workspace), workspace, current)
+
+    assert listed["ok"], listed
+    [entry] = listed["payload"]["versions"]
+    assert entry["name"] == "old"
+    assert entry["can_restore"] is False
+    assert entry["reason"] == "退位信息无效"
+
+
+def test_list_retired_versions_shows_nested_history_as_not_directly_restorable(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    v1 = _variant(workspace, name="v1")
+    v2 = _variant(workspace, name="v2", payload=b"two")
+    with WorkspaceTransaction(workspace, operation="test_retire") as transaction:
+        transaction.begin_product_write()
+        retire_asset_to_backup(
+            transaction, workspace, v1, v2, retired_by="update_asset"
+        )
+        transaction.commit()
+    v3 = _variant(workspace, name="v3", payload=b"three")
+    with WorkspaceTransaction(workspace, operation="test_retire") as transaction:
+        transaction.begin_product_write()
+        retire_asset_to_backup(
+            transaction, workspace, v2, v3, retired_by="update_asset"
+        )
+        transaction.commit()
+
+    listed = list_retired_versions(str(workspace), workspace, v3)
+
+    assert listed["ok"], listed
+    by_old_name = {
+        Path(entry["retired_from"]).name: entry
+        for entry in listed["payload"]["versions"]
+    }
+    assert set(by_old_name) == {"v1", "v2"}
+    assert by_old_name["v2"]["can_restore"] is True
+    assert by_old_name["v1"]["can_restore"] is False
+    assert "先恢复上一层" in by_old_name["v1"]["reason"]
+
+
+def test_list_retired_versions_rejects_backup_as_current_program(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    old = _variant(workspace)
+    current = _variant(workspace, name="v2", payload=b"new")
+    with WorkspaceTransaction(workspace, operation="test_retire") as transaction:
+        transaction.begin_product_write()
+        backup = retire_asset_to_backup(
+            transaction, workspace, old, current, retired_by="update_asset"
+        )
+        transaction.commit()
+
+    listed = list_retired_versions(str(workspace), workspace, backup)
+
+    assert listed["ok"] is False
+    assert listed["code"] == "invalid_target"
+
+
+def test_list_retired_versions_marks_empty_current_unavailable(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    old = _variant(workspace)
+    current = _variant(workspace, name="v2", payload=b"new")
+    with WorkspaceTransaction(workspace, operation="test_retire") as transaction:
+        transaction.begin_product_write()
+        retire_asset_to_backup(
+            transaction, workspace, old, current, retired_by="update_asset"
+        )
+        transaction.commit()
+    (current / "fw.bin").unlink()
+
+    listed = list_retired_versions(str(workspace), workspace, current)
+
+    assert listed["ok"], listed
+    [entry] = listed["payload"]["versions"]
+    assert entry["can_restore"] is False
+    assert "当前程序" in entry["reason"]
 
 
 def test_retired_hash_excludes_metadata_and_mtime(tmp_path: Path) -> None:
@@ -285,6 +441,48 @@ def test_restore_retired_version_swaps_with_current(tmp_path: Path) -> None:
 
     assert load_platform_config(workspace / "L36程序")[0].defaults["主板程序"] == "v1"
     _assert_converged_clean(workspace)
+
+
+def test_restore_accepts_unrecognized_current_created_by_update(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    old = _variant(workspace)
+    source = tmp_path / "外部" / "v2"
+    source.mkdir(parents=True)
+    (source / "opaque.payload").write_bytes(b"new-firmware")
+    updated = update_asset(
+        str(workspace), workspace, old, source, retire_mode="retire_to_backup"
+    )
+    assert updated["ok"], updated
+    backup = Path(str(updated["payload"]["backup"]))
+
+    result = restore_retired_version(str(workspace), workspace, backup)
+
+    assert result["ok"], result
+    restored = Path(str(result["payload"]["restored"]))
+    retired = Path(str(result["payload"]["retired"]))
+    assert restored == old
+    assert (restored / "fw.bin").read_bytes() == b"firmware"
+    assert (retired / "opaque.payload").read_bytes() == b"new-firmware"
+
+
+def test_restore_rejects_current_with_only_metadata_and_backups(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    old = _variant(workspace)
+    current = _variant(workspace, name="v2", payload=b"new")
+    with WorkspaceTransaction(workspace, operation="test_retire") as transaction:
+        transaction.begin_product_write()
+        backup = retire_asset_to_backup(
+            transaction, workspace, old, current, retired_by="update_asset"
+        )
+        transaction.commit()
+    (current / "fw.bin").unlink()
+    (current / "程序信息.toml").write_text('vendor = "test"\n', encoding="utf-8")
+
+    result = restore_retired_version(str(workspace), workspace, backup)
+
+    assert result["ok"] is False
+    assert result["code"] == "invalid_target"
+    assert backup.is_dir()
 
 
 def test_restore_rejects_min_field_copy_without_hash(tmp_path: Path) -> None:

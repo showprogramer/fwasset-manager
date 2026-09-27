@@ -4,6 +4,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from fwasset.core.asset_index import query_assets
 from fwasset.core.model_config import (
@@ -36,7 +37,7 @@ from fwasset.core.shared_module_resolver import (
 from fwasset.core.shared_module_resolver import (
     resolve_shared_module as resolve_shared_module_core,
 )
-from fwasset.core.types import FirmwareAsset
+from fwasset.core.types import FirmwareAsset, ServiceResult
 
 _log = logging.getLogger(__name__)
 
@@ -87,17 +88,20 @@ class ModuleCardData:
     """右侧单张卡片的数据"""
 
     asset: FirmwareAsset
-    source_type: str  # "common_default" | "custom_exclusive" | "common_fallback" | "common_variant"
+    source_type: str  # "custom_exclusive" | "common_variant"（历史值仍可被展示层读取）
     source_label: str  # 用于显示的来源标签文本
-    is_fallback: bool  # 是否是回源模块
+    is_fallback: bool  # 历史字段；当前列表不自动回源
     source_kind: str = (
         ""  # "common" | "custom" — coarse bucket for the row-level 定制专属/通用 标签
     )
-    default_badge: str = ""  # 平台默认徽章文案（如 "★默认"），非默认为空串
+    default_badge: str = ""  # 历史字段；当前列表不展示默认徽章
     shared_state: str = "local"  # local / shared_hit / shared_missing
     shared_source_label: str = ""  # 来源型号显示名
     shared_reason: str = ""  # 缺失原因
     effective_asset: FirmwareAsset | None = None  # 命中时实际打开/烧录的来源资产
+    # 本型号没有该类型的程序、只登记了借用：asset 是源型号的程序（缺失时是占位），
+    # 删除不能作用在它上面。
+    borrowed_only: bool = False
 
 
 # 整机标准模块的固定展示顺序（按烧录习惯，大部分机型包含这些模块）
@@ -122,11 +126,12 @@ class ModuleVariant:
     version: str
     source_kind: str  # "custom"（定制专属）/ "common"（通用）
     source_label: str  # 用户可读来源文案，绝不含"回源"
-    default_badge: str = ""  # 平台默认徽章文案（如 "★默认"），非默认为空串
+    default_badge: str = ""  # 历史字段；当前列表不展示默认徽章
     shared_state: str = "local"  # local / shared_hit / shared_missing
     shared_source_label: str = ""  # 来源型号显示名
     shared_reason: str = ""  # 缺失原因
     effective_asset: FirmwareAsset | None = None  # 命中时实际打开/烧录的来源资产
+    borrowed_only: bool = False  # 见 ModuleCardData.borrowed_only
 
 
 @dataclass
@@ -178,6 +183,18 @@ class SchemeWorkbenchModel:
         self.root_dir = root_dir
         self.configured_root = Path(configured_root) if configured_root else None
         # Load once. Any view method on the hot path reads from this list.
+        # 写操作之后由 reload() 重新灌入，两者走同一套加载。
+        self.reload()
+
+    def reload(self) -> None:
+        """按当前绑定重新加载磁盘真源。
+
+        写操作只让服务改了磁盘与 SQLite，``_all_assets`` 这份进程缓存不会自己
+        变——不重载就要重启应用才看得到正确结果。平台配置与型号映射一并重载，
+        因为设默认写的是 ``平台配置.toml``。未绑定时什么都不做。
+        """
+        if self.root_dir is None:
+            return
         self._all_assets = list(query_assets(path=self.db_path))
         self._single_model_root = self._detect_single_model_root()
         self._load_multi_model_dirs()
@@ -416,6 +433,92 @@ class SchemeWorkbenchModel:
             log_fn=log_fn,
         )
 
+    def register_borrow(
+        self,
+        target_model_name: str,
+        source_asset: FirmwareAsset,
+        *,
+        mode: str = "static",
+        overwrite_token: dict | None = None,
+        log_fn: Callable[..., None] = print,
+    ) -> ServiceResult:
+        """右键登记借用。只调用 write_edit_service.register_shared_module。"""
+        if self.root_dir is None:
+            return {
+                "ok": False,
+                "code": "not_configured",
+                "message": "请先在设置中配置程序文件夹",
+                "payload": {},
+            }
+        target = self._model_root_path_for_name(target_model_name)
+        if target is None:
+            return {
+                "ok": False,
+                "code": "target_model_missing",
+                "message": f"目标型号不存在 ({target_model_name})",
+                "payload": {},
+            }
+        from fwasset.core.services.write_edit_service import register_shared_module
+
+        return register_shared_module(
+            self.root_dir,
+            self.root_dir,
+            target,
+            source_asset,
+            mode=mode,
+            overwrite_token=overwrite_token,
+            log_fn=log_fn,
+        )
+
+    def clear_borrow(
+        self,
+        target_model_name: str,
+        module_key: str,
+        log_fn: Callable[..., None] = print,
+    ) -> ServiceResult:
+        """解除借用。只调用 write_edit_service.clear_shared_module。"""
+        if self.root_dir is None:
+            return {
+                "ok": False,
+                "code": "not_configured",
+                "message": "请先在设置中配置程序文件夹",
+                "payload": {},
+            }
+        target = self._model_root_path_for_name(target_model_name)
+        if target is None:
+            return {
+                "ok": False,
+                "code": "target_model_missing",
+                "message": f"目标型号不存在 ({target_model_name})",
+                "payload": {},
+            }
+        from fwasset.core.services.write_edit_service import clear_shared_module
+
+        return clear_shared_module(
+            self.root_dir,
+            self.root_dir,
+            target,
+            module_key,
+            log_fn=log_fn,
+        )
+
+    def undo_clear_borrow(
+        self, undo_token: str, log_fn: Callable[..., None] = print
+    ) -> ServiceResult:
+        """撤销解除借用。令牌只在当前进程有效。"""
+        if self.root_dir is None:
+            return {
+                "ok": False,
+                "code": "not_configured",
+                "message": "请先在设置中配置程序文件夹",
+                "payload": {},
+            }
+        from fwasset.core.services.write_edit_service import undo_clear_shared_module
+
+        return undo_clear_shared_module(
+            self.root_dir, self.root_dir, undo_token, log_fn=log_fn
+        )
+
     def unregister_shared_module(
         self,
         target_model_name: str,
@@ -602,46 +705,6 @@ class SchemeWorkbenchModel:
             return rest[0], ""
         return rest[0], rest[-1]
 
-    def _common_assets_matching_module(
-        self, model_name: str, module_key: str
-    ) -> list[FirmwareAsset]:
-        """当前型号下、匹配平台配置模块键的全部通用资产。"""
-        assets = (
-            self._all_assets
-            if self._cache_loaded()
-            else query_assets(path=self.db_path)
-        )
-        out: list[FirmwareAsset] = []
-        for a in assets:
-            if str(a.get("category", "")) != "common":
-                continue
-            if not self._belongs_to_model(a, model_name):
-                continue
-            if _module_matches(a, module_key):
-                out.append(a)
-        return out
-
-    def _module_key_for_asset(self, asset: FirmwareAsset) -> str:
-        """模块键：catalog label 优先，否则路径段；并归一机芯板。"""
-        label = str(asset.get("firmware_label", "")).strip()
-        if label:
-            return canonical_module_dir(label)
-        module_dir, _ = self._common_module_parts(asset)
-        return canonical_module_dir(module_dir)
-
-    def _module_has_defaults_key(
-        self, platforms: list[PlatformDefaults], module_key: str
-    ) -> bool:
-        """任一配置块是否已有该模块（含版/板同义）的 defaults 键。"""
-        canon = canonical_module_dir(module_key)
-        if not canon:
-            return False
-        for p in platforms:
-            for key in p.defaults:
-                if canonical_module_dir(key) == canon:
-                    return True
-        return False
-
     @staticmethod
     def _preferred_default_items(defaults: dict[str, str]) -> list[tuple[str, str]]:
         """按规范模块键去重 defaults，规范键优先于同义历史键。"""
@@ -658,13 +721,11 @@ class SchemeWorkbenchModel:
     def default_platforms_for(self, asset: FirmwareAsset) -> list[str]:
         """返回把该通用变体配置为默认程序的平台名列表（只看资产所属型号的配置）。
 
-        平台配置约定：
-        - ``defaults[模块] = "量产_默认"``：变体目录名精确匹配；
-        - ``defaults[模块] = ""``：该模块**唯一**通用变体即默认（可嵌套在
-          ``通用/语音程序/中文唯一版/``，不要求文件直接落在模块目录下）。
-          若匹配该模块的通用资产不止一份，视为配置异常，不标默认。
-        - **A4 无键推断**：配置块存在但该模块无键、且通用区仅一份变体 → 视为
-          各块隐式默认（不猜多变体）。
+        平台配置唯一约定：``defaults[模块] = "量产_默认"``，变体目录名精确匹配。
+        默认只能来自右键「设为默认」写入的这个键，没有任何自动推断：
+        - ``defaults[模块] = ""``（历史空串）按「该模块未设默认」处理，不报错；
+        - 模块只有一份通用变体也不隐式成为默认；
+        - 目录名带 ``_默认`` 不带来默认身份。
         """
         if str(asset.get("category", "")) != "common":
             return []
@@ -672,34 +733,16 @@ class SchemeWorkbenchModel:
         if not dir_name:
             return []
         model_name = self._model_of_asset(asset)
-        asset_path = str(asset.get("path", ""))
         platforms = self._platforms_for(model_name)
         names: list[str] = []
         for p in platforms:
             for module_key, variant_name in self._preferred_default_items(p.defaults):
                 if not _module_matches(asset, module_key):
                     continue
-                configured = str(variant_name or "").strip()
-                if configured == "":
-                    peers = self._common_assets_matching_module(model_name, module_key)
-                    if len(peers) == 1 and str(peers[0].get("path", "")) == asset_path:
-                        names.append(p.platform_name)
-                        break
-                elif configured == dir_name:
+                if str(variant_name or "").strip() == dir_name:
                     names.append(p.platform_name)
                     break
-        if names:
-            return names
-        # A4：无键且唯一变体 → 隐式默认（有配置块时标全部块名；无块时标空列表由徽章处理）
-        module_key = self._module_key_for_asset(asset)
-        if not module_key or self._module_has_defaults_key(platforms, module_key):
-            return []
-        peers = self._common_assets_matching_module(model_name, module_key)
-        if len(peers) == 1 and str(peers[0].get("path", "")) == asset_path:
-            if platforms:
-                return [p.platform_name for p in platforms]
-            return ["*"]
-        return []
+        return names
 
     def default_badge(self, asset: FirmwareAsset) -> str:
         """默认徽章文案：该型号单平台只标 ★默认，多平台附上平台名。"""
@@ -707,13 +750,9 @@ class SchemeWorkbenchModel:
         if not names:
             return ""
         platforms = self._platforms_for(self._model_of_asset(asset))
-        # A4 无配置块时的隐式唯一默认：只标 ★默认，不展示内部名
-        if not platforms or names == ["*"] or len(platforms) <= 1:
+        if len(platforms) <= 1 or len(names) <= 1:
             return "★默认"
-        real = [n for n in names if n != "*"]
-        if len(real) <= 1:
-            return "★默认"
-        return "★默认·" + "/".join(real)
+        return "★默认·" + "/".join(names)
 
     def _platform_config_root(self, model_name: str) -> str:
         """平台配置.toml 的落盘目录。
@@ -782,6 +821,33 @@ class SchemeWorkbenchModel:
         if result["ok"]:
             self._load_platforms_for_all_models()
         return result
+
+    def apply_asset_default(
+        self,
+        asset: FirmwareAsset,
+        log_fn: Callable[..., None] = print,
+    ) -> ServiceResult:
+        """右键设默认。只调用 write_edit_service.set_asset_default。"""
+        if self.root_dir is None:
+            return {
+                "ok": False,
+                "code": "not_configured",
+                "message": "请先在设置中配置程序文件夹",
+                "payload": {},
+            }
+        from fwasset.core.services.write_edit_service import set_asset_default
+
+        return set_asset_default(
+            self.root_dir, self.root_dir, asset, log_fn=log_fn
+        )
+
+    def ensure_model_directory(self, directory_name: str) -> None:
+        """把尚无资产的型号目录记入芯片查找表。"""
+        name = str(directory_name or "").strip()
+        if not name or self.root_dir is None:
+            return
+        self._multi_model_dirs.setdefault(name, name)
+        self._model_root_paths.setdefault(name, str(self.root_dir / name))
 
     def is_model_module_default(self, asset: FirmwareAsset) -> bool:
         """该通用变体是否已是本型号下该模块的默认（所有配置块一致指向它）。
@@ -906,6 +972,13 @@ class SchemeWorkbenchModel:
                 if scheme:
                     custom_schemes.add(scheme)
 
+        # 只登记了借用的模块也要在侧栏出现，否则点不进去
+        present = {canonical_module_dir(label) for label in common_counts}
+        for ref in self.get_shared_modules(model_name):
+            if ref.module_key not in present:
+                common_counts[ref.module_key] = 1
+                present.add(ref.module_key)
+
         return {"common": common_counts, "custom": sorted(list(custom_schemes))}
 
     def _shared_source_assets(
@@ -971,6 +1044,71 @@ class SchemeWorkbenchModel:
             )
         return cards
 
+    def _borrowed_only_cards(
+        self,
+        model_name: str,
+        existing: list[ModuleCardData],
+        *,
+        firmware_label: str = "",
+        keyword: str = "",
+    ) -> list[ModuleCardData]:
+        """本型号没有该类型程序、只登记了借用的模块，补一行借用来源。
+
+        ``_decorate_shared_cards`` 只给已有的本地行加借用信息；空型号借用后若不补行，
+        列表和侧栏都看不到它。
+        """
+        covered = {
+            canonical_module_dir(str(card.asset.get("firmware_label", "")))
+            for card in existing
+            if card.source_kind == "common"
+        }
+        wanted = canonical_module_dir(firmware_label) if firmware_label else ""
+        cards: list[ModuleCardData] = []
+        for ref in self.get_shared_modules(model_name):
+            if ref.module_key in covered or (wanted and ref.module_key != wanted):
+                continue
+            resolution = self.resolve_shared_module(model_name, ref.module_key)
+            if resolution is None:
+                continue
+            source_assets = (
+                self._shared_source_assets(resolution)
+                if resolution.status == "hit"
+                else []
+            )
+            if source_assets:
+                asset = source_assets[0]
+                state, reason = "shared_hit", ""
+            else:
+                asset = cast(
+                    FirmwareAsset,
+                    {
+                        "firmware_label": ref.module_key,
+                        "category": "common",
+                        "path": "",
+                        "directory_name": "",
+                    },
+                )
+                state = "shared_missing"
+                reason = resolution.reason or "path_not_found"
+            if not self._asset_matches_keyword(asset, keyword):
+                continue
+            source_root = self.model_root_for_id(ref.source_model_id)
+            cards.append(
+                ModuleCardData(
+                    asset=asset,
+                    source_type="common_variant",
+                    source_label="通用",
+                    is_fallback=False,
+                    source_kind="common",
+                    shared_state=state,
+                    shared_source_label=self._shared_label_for_ref(ref, source_root),
+                    shared_reason=reason,
+                    effective_asset=asset if source_assets else None,
+                    borrowed_only=True,
+                )
+            )
+        return cards
+
     def _shared_label_for_ref(
         self, ref: SharedModuleRef, source_root: Path | None
     ) -> str:
@@ -981,7 +1119,11 @@ class SchemeWorkbenchModel:
             else ref.source_model_id
         )
         if ref.mode == "follow_default":
-            return f"同{model_name}"
+            return f"跟随默认（旧）·{model_name}"
+        if ref.mode == "static":
+            return f"固定版本·{model_name}"
+        if ref.mode == "follow_asset":
+            return f"自动更新·{model_name}"
         return f"来自{model_name}"
 
     def get_source_platforms_for_asset(self, source_asset: FirmwareAsset) -> list[str]:
@@ -1027,169 +1169,45 @@ class SchemeWorkbenchModel:
             ):
                 continue
 
-            # 判断是否是默认变体
-            dir_name = str(a.get("directory_name", ""))
-            is_default = "_默认" in dir_name
-
-            source_type = "common_default" if is_default else "common_variant"
-            # 用户可见归属：仅「通用」（禁内部路径/回源字样）
-            source_label = "通用"
-
             results.append(
                 ModuleCardData(
                     asset=a,
-                    source_type=source_type,
-                    source_label=source_label,
+                    source_type="common_variant",
+                    source_label="通用",
                     is_fallback=False,
                     source_kind="common",
-                    default_badge=self.default_badge(a),
                 )
             )
 
-        return self._decorate_shared_cards(model_name, results)
+        cards = self._decorate_shared_cards(model_name, results)
+        return cards + self._borrowed_only_cards(
+            model_name, cards, firmware_label=firmware_label, keyword=keyword
+        )
 
     def get_scheme_modules(
         self, model_name: str, scheme_name: str, keyword: str = ""
     ) -> list[ModuleCardData]:
-        """点击定制方案时，返回完整模块清单（含回源）。
+        """点击定制方案时，只返回该方案实际存放的程序。
 
         keyword 过滤与 ``_filter_assets`` / ``query_assets`` 一致（空格分词 + 多字段）。
-        UI 层进入方案时应清空搜索框，使默认展示满树（Issue 19-A）。
+        UI 层进入方案时应清空搜索框，使默认展示方案全部程序。
         """
-        # 1. 本方案定制模块（keyword 走统一分词，不再只扫 label/directory_name）
         custom_assets = self._filter_assets(
             category="custom",
             scheme_name=scheme_name,
             keyword=keyword,
         )
-        # 回源覆盖判定必须基于「未按 keyword 缩小」的完整方案定制集，
-        # 否则搜「手控」时会把未命中的主板当成「未覆盖」而错误回源一份通用主板。
-        all_scheme_custom = self._filter_assets(
-            category="custom", scheme_name=scheme_name
-        )
-
-        model_root = self._get_model_root(model_name)
-        # 方案 platform：优先 方案配置.toml / discover_schemes；资产字段仅旧索引兼容回退
-        platform_name = self._resolve_scheme_platform(
-            model_name, scheme_name, all_scheme_custom
-        )
-
-        results: list[ModuleCardData] = []
-        # 平台配置 defaults 的键是模块目录名（如 主板程序 / 3D机芯板程序）。
-        # 磁盘与历史 toml 可能误写「机芯版」；_module_matches 统一为「机芯板」再比对。
-        # 覆盖判定：标签/规范名相等，或键命中资产路径任一段。
-        covered_assets = list(all_scheme_custom)
-
-        for a in custom_assets:
-            results.append(
-                ModuleCardData(
-                    asset=a,
-                    source_type="custom_exclusive",
-                    source_label="定制专属",
-                    is_fallback=False,
-                    source_kind="custom",
-                )
+        return [
+            ModuleCardData(
+                asset=asset,
+                source_type="custom_exclusive",
+                source_label="定制专属",
+                is_fallback=False,
+                source_kind="custom",
             )
-
-        # 2. 从 platform_config 中寻找缺失的通用模块（回源）
-        # 平台按型号隔离；方案声明了 platform 则必须匹配配置块（A5）。
-        # 回源作用域 = 本型号根内通用 + 本型号默认/A4 推断；禁止跨型号静默补。
-        # B4b：已登记 shared_modules 的键（hit/missing 皆然）不得把保留本地副本当回源。
-        model_platforms = self._platforms_for(model_name)
-        if platform_name:
-            relevant_platforms = [
-                p for p in model_platforms if p.platform_name == platform_name
-            ]
-            # 方案声明了 platform 但 TOML 无对应块 → 通用回源失败（含禁止 A4）
-            if not relevant_platforms:
-                return results
-        else:
-            # 未声明 platform：退化用该型号全部配置块
-            relevant_platforms = model_platforms
-
-        if model_root:
-            common_assets = self._filter_assets(category="common")
-            model_common = [
-                a for a in common_assets if self._belongs_to_model(a, model_name)
-            ]
-            shared_keys = {
-                canonical_module_dir(ref.module_key)
-                for ref in self.get_shared_modules(model_name)
-                if canonical_module_dir(ref.module_key)
-            }
-
-            def _module_is_shared(module_key: str) -> bool:
-                key = canonical_module_dir(module_key)
-                return bool(key) and key in shared_keys
-
-            def _append_fallback(fallback_asset: FirmwareAsset) -> None:
-                if not self._asset_matches_keyword(fallback_asset, keyword):
-                    return
-                covered_assets.append(fallback_asset)
-                results.append(
-                    ModuleCardData(
-                        asset=fallback_asset,
-                        source_type="common_fallback",
-                        source_label="通用",
-                        is_fallback=True,
-                        source_kind="common",
-                        default_badge=self.default_badge(fallback_asset),
-                    )
-                )
-
-            def _pick_fallback(
-                module_key: str, default_dir: str
-            ) -> FirmwareAsset | None:
-                """按 defaults 值选回源变体，与 default_platforms_for 契约一致。
-
-                - 非空：按 directory_name 精确匹配；
-                - 空串 ``""``：仅当该模块通用区**唯一**变体时返回，多变体视为配置异常不猜。
-                """
-                candidates = [
-                    ca for ca in model_common if _module_matches(ca, module_key)
-                ]
-                if not candidates:
-                    return None
-                if default_dir:
-                    for ca in candidates:
-                        if str(ca.get("directory_name", "")) == default_dir:
-                            return ca
-                    return None
-                if len(candidates) == 1:
-                    return candidates[0]
-                return None
-
-            for p in relevant_platforms:
-                for module_key, default_dir in self._preferred_default_items(
-                    p.defaults
-                ):
-                    if _module_is_shared(module_key):
-                        continue
-                    if any(_module_matches(a, module_key) for a in covered_assets):
-                        continue
-                    fallback_asset = _pick_fallback(module_key, str(default_dir or ""))
-                    if fallback_asset:
-                        _append_fallback(fallback_asset)
-
-            # A4：配置无该模块键时，唯一通用变体可作回源。
-            # 注意：方案已声明 platform 且块匹配失败时已在上方 return，不会走到这里。
-            seen_module_keys: set[str] = set()
-            for ca in model_common:
-                mkey = self._module_key_for_asset(ca)
-                if not mkey or mkey in seen_module_keys:
-                    continue
-                seen_module_keys.add(mkey)
-                if _module_is_shared(mkey):
-                    continue
-                if any(_module_matches(a, mkey) for a in covered_assets):
-                    continue
-                if self._module_has_defaults_key(relevant_platforms, mkey):
-                    continue
-                peers = self._common_assets_matching_module(model_name, mkey)
-                if len(peers) == 1:
-                    _append_fallback(peers[0])
-
-        return results
+            for asset in custom_assets
+            if self._belongs_to_model(asset, model_name)
+        ]
 
     def _scheme_discovery_roots(self, model_name: str) -> list[Path]:
         """用于 ``discover_schemes`` 的候选型号根（有序去重）。
@@ -1330,11 +1348,9 @@ class SchemeWorkbenchModel:
             if not self._belongs_to_model(a, model_name):
                 continue
             cat = str(a.get("category", ""))
-            dir_name = str(a.get("directory_name", ""))
 
             if cat == "common":
-                is_default = "_默认" in dir_name
-                source_type = "common_default" if is_default else "common_variant"
+                source_type = "common_variant"
                 source_label = "通用"
             elif cat == "custom":
                 scheme = str(a.get("scheme_name", "")).strip()
@@ -1351,7 +1367,7 @@ class SchemeWorkbenchModel:
                     source_label=source_label,
                     is_fallback=False,
                     source_kind="common" if cat == "common" else "custom",
-                    default_badge=self.default_badge(a) if cat == "common" else "",
                 )
             )
-        return self._decorate_shared_cards(model_name, results)
+        cards = self._decorate_shared_cards(model_name, results)
+        return cards + self._borrowed_only_cards(model_name, cards, keyword=keyword)

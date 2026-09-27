@@ -35,6 +35,9 @@ def l36_tree(tmp_path: Path) -> Path:
     通用 has 主板程序 (量产_默认 default + 防夹功能 variant), a single-variant
     3D机芯版程序 and 腿部程序 (no _默认 subdir → dir itself is the asset).
     定制/西班牙 only ships 主板程序 → everything else should fall back.
+
+    默认一律显式写变体目录名：单变体模块的 directory_name 就是模块目录名。
+    空串不再表示「唯一变体即默认」，见 test_empty_default_value_means_no_default。
     """
     root = tmp_path / "L36程序"
 
@@ -47,8 +50,8 @@ def l36_tree(tmp_path: Path) -> Path:
                 'name = "标准单机芯3D"',
                 "[platform.defaults]",
                 '"主板程序" = "量产_默认"',
-                '"3D机芯版程序" = ""',
-                '"腿部程序" = ""',
+                '"3D机芯版程序" = "3D机芯版程序"',
+                '"腿部程序" = "腿部程序"',
             ]
         ),
     )
@@ -95,20 +98,37 @@ def test_scheme_includes_custom_exclusive_module(
     assert "主板程序" in labels
 
 
-def test_scheme_falls_back_to_common_default_variant(
+def test_scheme_lists_only_its_own_programs_even_with_saved_defaults(
     l36_tree: Path, tmp_path: Path
 ) -> None:
-    """主板 is custom, but the scheme has no 3D机芯/腿部 → fall back to 通用."""
+    model = _bind_model(l36_tree, tmp_path)
+
+    cards = model.get_scheme_modules("L36", "西班牙")
+
+    assert {card.asset["firmware_label"] for card in cards} == {"主板程序"}
+    assert all(card.source_type == "custom_exclusive" for card in cards)
+    assert all(not card.is_fallback for card in cards)
+
+
+def test_common_listing_does_not_mark_saved_defaults(
+    l36_tree: Path, tmp_path: Path
+) -> None:
+    model = _bind_model(l36_tree, tmp_path)
+
+    cards = model.get_common_modules("L36", "主板程序")
+
+    assert cards
+    assert all(card.source_type == "common_variant" for card in cards)
+    assert all(card.default_badge == "" for card in cards)
+
+
+def test_scheme_does_not_add_common_programs_from_saved_defaults(
+    l36_tree: Path, tmp_path: Path
+) -> None:
+    """旧配置即使指定通用程序，也不向定制方案自动补入。"""
     model = _bind_model(l36_tree, tmp_path)
     cards = model.get_scheme_modules("L36", "西班牙")
-    fallback = [c for c in cards if c.is_fallback]
-    fb_labels = {c.asset["firmware_label"] for c in fallback}
-    # single-variant modules with empty default_dir must still fall back.
-    # NOTE: firmware_label comes from the catalog ("3D机芯板程序", 板), while the
-    # 通用/ directory and 平台配置.toml key are "3D机芯版程序" (版) — the matcher
-    # tolerates this discrepancy, so we assert on the catalog label here.
-    assert "3D机芯板程序" in fb_labels
-    assert "腿部程序" in fb_labels
+    assert {c.asset["firmware_label"] for c in cards} == {"主板程序"}
 
 
 def test_load_all_models_filters_filename_noise(tmp_path: Path) -> None:
@@ -165,14 +185,13 @@ def test_scheme_module_tree_groups_variants_under_one_row(tmp_path: Path) -> Non
 def test_scheme_module_tree_marks_custom_vs_common(
     l36_tree: Path, tmp_path: Path
 ) -> None:
-    """每个模块行应标明是 定制专属 还是 通用默认（不含'回源'字样）。"""
+    """方案树只展示定制程序。"""
     model = _bind_model(l36_tree, tmp_path)
     tree = model.get_scheme_module_tree("L36", "西班牙")
     by_label = {row.label: row for row in tree}
     # 西班牙 ships 主板程序 → 定制专属
     assert by_label["主板程序"].source_kind == "custom"
-    # 西班牙 lacks 3D机芯/腿部 → 通用默认
-    assert by_label["3D机芯板程序"].source_kind == "common"
+    assert set(by_label) == {"主板程序"}
     # the literal word "回源" must never appear in any user-facing label
     for row in tree:
         assert "回源" not in row.source_label
@@ -494,16 +513,15 @@ def test_register_does_not_break_scheme_isolation(tmp_path: Path) -> None:
         a for a in model._all_assets if str(a.get("firmware_label", "")) == "快捷键程序"
     )
     model.register_shared_module("L36双机芯-上3D-下2D", src_asset)
-    # 方案树 / 模块列表仍不含快捷键程序共享行
+    # 方案树仍不含快捷键程序共享行；全部模块补一行只借用的行（TASK-20260923）
     tree = model.get_scheme_module_tree("L36双机芯-上3D-下2D", "方案A")
     all_modules = model.get_all_modules("L36双机芯-上3D-下2D")
-    # 共享已登记但不应在方案树/全部模块中出现
     shared_refs = model.get_shared_modules("L36双机芯-上3D-下2D")
     assert len(shared_refs) == 1
     scheme_labels = {row.label for row in tree}
-    all_labels = {c.asset.get("firmware_label", "") for c in all_modules}
+    borrowed = [c for c in all_modules if c.asset.get("firmware_label") == "快捷键程序"]
     assert "快捷键程序" not in scheme_labels
-    assert "快捷键程序" not in all_labels
+    assert [c.borrowed_only for c in borrowed] == [True]
 
 
 def test_register_target_root_not_in_common(tmp_path: Path) -> None:
@@ -551,10 +569,9 @@ def test_multi_model_sidebar_and_fallback_work_per_model(
     assert tree["common"].get("主板程序") == 2
     assert tree["custom"] == ["西班牙"]
 
-    # 西班牙 缺主板 → 回源到 L36 自己的通用默认
+    # 西班牙缺主板，方案页只保留自己的腿部程序。
     cards = model.get_scheme_modules("L36", "西班牙")
-    fb = [c for c in cards if c.is_fallback and c.asset["firmware_label"] == "主板程序"]
-    assert fb and fb[0].asset["directory_name"] == "量产_默认"
+    assert {c.asset["firmware_label"] for c in cards} == {"腿部程序"}
 
     # 未整理的双机芯型号没有 通用/定制 → 侧边树为空，但「全部」视图能看到资产
     dual_tree = model.build_sidebar_tree("L36双机芯-上3D-下2D")
@@ -585,20 +602,19 @@ def test_multi_model_set_default_writes_into_model_dir(
 # ---------------------------------------------------------------------------
 
 
-def test_default_badge_marks_configured_variant(l36_tree: Path, tmp_path: Path) -> None:
-    """平台配置里指定的变体带 ★默认 徽章，其余变体不带。"""
+def test_saved_default_does_not_add_badge(l36_tree: Path, tmp_path: Path) -> None:
+    """旧平台配置不会在通用列表显示默认身份。"""
     model = _bind_model(l36_tree, tmp_path)
     cards = model.get_common_modules("L36", "主板程序")
     badges = {c.asset["directory_name"]: c.default_badge for c in cards}
-    assert badges["量产_默认"] == "★默认"  # 单平台 → 不附平台名
-    assert badges["防夹功能"] == ""
+    assert badges == {"量产_默认": "", "防夹功能": ""}
 
 
-def test_shortcut_alias_duplicate_prefers_catalog_key_for_badge_and_fallback(
+def test_shortcut_alias_defaults_do_not_affect_lists(
     l36_tree: Path,
     tmp_path: Path,
 ) -> None:
-    """历史短键与规范键并存时，徽章和方案补齐都以规范键为准。"""
+    """历史短键与规范键并存也不影响通用和定制列表。"""
     _write(
         l36_tree / "平台配置.toml",
         "\n".join(
@@ -617,14 +633,11 @@ def test_shortcut_alias_duplicate_prefers_catalog_key_for_badge_and_fallback(
     model = _bind_model(l36_tree, tmp_path)
     shortcuts = model.get_common_modules("L36", "快捷键程序")
     badges = {card.asset["directory_name"]: card.default_badge for card in shortcuts}
-    assert badges == {"量产_默认": "", "贝乐": "★默认"}
-
-    fallback = next(
-        card
+    assert badges == {"量产_默认": "", "贝乐": ""}
+    assert not any(
+        card.asset["firmware_label"] == "快捷键程序"
         for card in model.get_scheme_modules("L36", "西班牙")
-        if card.is_fallback and card.asset["firmware_label"] == "快捷键程序"
     )
-    assert fallback.asset["directory_name"] == "贝乐"
 
 
 def test_common_module_parts_resolves_variant_and_single_level(
@@ -641,10 +654,10 @@ def test_common_module_parts_resolves_variant_and_single_level(
     assert model._common_module_parts(leg_cards[0].asset) == ("腿部程序", "")
 
 
-def test_set_default_variant_writes_config_and_moves_badge(
+def test_legacy_set_default_variant_writes_config_without_badge(
     l36_tree: Path, tmp_path: Path
 ) -> None:
-    """设默认后：toml 落盘、平台配置就地重载、徽章移动，无需重新扫描。"""
+    """旧写入口仍可读写配置，但不影响当前列表。"""
     model = _bind_model(l36_tree, tmp_path)
     cards = model.get_common_modules("L36", "主板程序")
     fangjia = next(c.asset for c in cards if c.asset["directory_name"] == "防夹功能")
@@ -658,44 +671,32 @@ def test_set_default_variant_writes_config_and_moves_badge(
     loaded = load_platform_config(l36_tree)
     assert loaded[0].defaults["主板程序"] == "防夹功能"
 
-    # 徽章立即移动（平台已重载）
     badges = {
         c.asset["directory_name"]: c.default_badge
         for c in model.get_common_modules("L36", "主板程序")
     }
-    assert badges["防夹功能"] == "★默认"
+    assert badges["防夹功能"] == ""
     assert badges["量产_默认"] == ""
 
 
-def test_set_default_variant_changes_scheme_fallback(
+def test_legacy_set_default_variant_does_not_change_scheme_list(
     l36_tree: Path, tmp_path: Path
 ) -> None:
-    """回源跟随新默认：缺主板的方案设默认后应回源到新变体。"""
-    # 增加一个不带主板的方案，让主板走回源
+    """变更旧默认配置不会改变定制方案展示。"""
     scheme = l36_tree / "定制" / "葡萄牙"
     _write(scheme / "方案配置.toml", 'name = "葡萄牙"\nplatform = "标准单机芯3D"\n')
     _write(scheme / "腿部程序" / "Yj_Foot_L36_葡萄牙_V6.hex")
 
     model = _bind_model(l36_tree, tmp_path)
 
-    def _mainboard_fallback_dir() -> str:
-        cards = model.get_scheme_modules("L36", "葡萄牙")
-        fb = [
-            c
-            for c in cards
-            if c.is_fallback and c.asset["firmware_label"] == "主板程序"
-        ]
-        assert fb, "葡萄牙 lacks 主板程序 → must fall back to 通用"
-        return str(fb[0].asset["directory_name"])
-
-    assert _mainboard_fallback_dir() == "量产_默认"
+    assert {c.asset["firmware_label"] for c in model.get_scheme_modules("L36", "葡萄牙")} == {"腿部程序"}
 
     cards = model.get_common_modules("L36", "主板程序")
     fangjia = next(c.asset for c in cards if c.asset["directory_name"] == "防夹功能")
     result = model.set_default_variant("L36", fangjia, log_fn=lambda _m: None)
     assert result["ok"] is True, result["message"]
 
-    assert _mainboard_fallback_dir() == "防夹功能"
+    assert {c.asset["firmware_label"] for c in model.get_scheme_modules("L36", "葡萄牙")} == {"腿部程序"}
 
 
 def test_set_default_variant_rewrites_typo_module_key_to_board(
@@ -751,10 +752,10 @@ def test_set_default_variant_damaged_platform_config_is_not_overwritten(
     assert model._platforms_for("L36") == []
 
 
-def test_first_set_default_without_toml_uses_scheme_platform_names(
+def test_legacy_first_set_default_without_toml_does_not_fill_scheme(
     tmp_path: Path,
 ) -> None:
-    """验收场景 5：无 toml 但方案有 platform → 首次设默认建同名块，回源立即生效。"""
+    """旧写入口建配置后，方案页仍只显示方案自己的程序。"""
     root = tmp_path / "L36程序"
     _write(root / "通用" / "主板程序" / "量产_默认" / "main.bin")
     _write(root / "通用" / "主板程序" / "防夹功能" / "fang.bin")
@@ -789,13 +790,13 @@ def test_first_set_default_without_toml_uses_scheme_platform_names(
         for c in scheme_cards
         if c.is_fallback and c.asset.get("firmware_label") == "主板程序"
     ]
-    assert fb and fb[0].asset["directory_name"] == "防夹功能"
+    assert fb == []
 
 
-def test_unique_common_module_inferred_as_fallback_without_defaults_key(
+def test_unique_common_module_without_defaults_key_does_not_fall_back(
     tmp_path: Path,
 ) -> None:
-    """A4：配置块无该模块键时，唯一通用变体仍可回源到方案。"""
+    """配置块无该模块键时不回源：默认只来自显式「设为默认」，不猜唯一变体。"""
     root = tmp_path / "L36程序"
     _write(
         root / "平台配置.toml",
@@ -806,7 +807,7 @@ def test_unique_common_module_inferred_as_fallback_without_defaults_key(
     scheme = root / "定制" / "西班牙"
     _write(scheme / "方案配置.toml", 'name = "西班牙"\nplatform = "标准单机芯3D"\n')
     _write(scheme / "手控UI" / "ui.rom")
-    _write(scheme / "手控UI" / "ui.pkg")  # 手控 UI 硬约束：.rom + .pkg 成对
+    _write(scheme / "手控UI" / "ui.pkg")
 
     model = _bind_model(root, tmp_path)
     cards = model.get_scheme_modules("L36", "西班牙")
@@ -815,16 +816,42 @@ def test_unique_common_module_inferred_as_fallback_without_defaults_key(
         for c in cards
         if c.is_fallback and c.asset.get("firmware_label") == "腿部程序"
     ]
-    assert leg_fb, "unique 腿部 should fall back without defaults key"
-    assert leg_fb[0].asset["directory_name"] == "腿部程序" or "only" in str(
-        leg_fb[0].asset.get("path", "")
+    assert not leg_fb, "未设默认的唯一腿部不应回源"
+
+
+def test_empty_default_value_means_no_default(tmp_path: Path) -> None:
+    """历史 defaults[模块] = "" 按「未设默认」处理：无徽章、不回源、不报错。"""
+    root = tmp_path / "L36程序"
+    _write(
+        root / "平台配置.toml",
+        '[[platform]]\nname = "标准单机芯3D"\n[platform.defaults]\n"腿部程序" = ""\n',
     )
+    _write(root / "通用" / "腿部程序" / "only_leg.hex")
+    scheme = root / "定制" / "西班牙"
+    _write(scheme / "方案配置.toml", 'name = "西班牙"\nplatform = "标准单机芯3D"\n')
+    _write(scheme / "主板程序" / "main.bin")
+
+    model = _bind_model(root, tmp_path)
+    legs = [
+        a
+        for a in model._filter_assets()
+        if str(a.get("firmware_label", "")) == "腿部程序"
+    ]
+    assert legs
+    assert model.default_platforms_for(legs[0]) == []
+    assert model.default_badge(legs[0]) == ""
+    cards = model.get_scheme_modules("L36", "西班牙")
+    assert not [
+        c
+        for c in cards
+        if c.is_fallback and c.asset.get("firmware_label") == "腿部程序"
+    ]
 
 
-def test_empty_scheme_uses_platform_from_scheme_toml_not_asset(
+def test_empty_scheme_stays_empty_with_saved_platform_defaults(
     tmp_path: Path,
 ) -> None:
-    """仅有方案配置、无定制固件：按 方案配置.toml 的 platform 选配置块，不扫全部块。"""
+    """仅有方案配置、无定制固件时，旧默认值也不生成程序行。"""
     root = tmp_path / "L36程序"
     _write(
         root / "平台配置.toml",
@@ -856,9 +883,8 @@ def test_empty_scheme_uses_platform_from_scheme_toml_not_asset(
         for c in cards
         if c.is_fallback and c.asset.get("firmware_label") == "蓝牙程序"
     ]
-    assert len(bt) == 1
-    assert bt[0].asset["directory_name"] == "英文版本"
-    assert not any(c.asset.get("directory_name") == "中文版本" for c in bt)
+    assert bt == []
+    assert cards == []
 
 
 def test_scheme_platform_mismatch_blocks_all_common_fallback(
@@ -1033,7 +1059,8 @@ def cached_model(
     from fwasset.core.platform_config import PlatformDefaults
 
     platform = PlatformDefaults(
-        platform_name="标准单机芯3D", defaults={"3D机芯版程序": ""}
+        platform_name="标准单机芯3D",
+        defaults={"3D机芯版程序": "YJ_ZD_3D_Core_L36_V20"},
     )
     monkeypatch.setattr(model_module, "load_platform_config", lambda _dir: [platform])
 
@@ -1126,10 +1153,8 @@ def test_cache_keyword_matches_across_fields_not_just_directory_name(
         assert "V40" in str(c.asset.get("version", "")).upper()
 
 
-def test_cache_preserves_scheme_fallback_behavior(cached_model) -> None:
-    """The 西班牙 scheme ships only 主板程序; 3D机芯 must still come from 通用
-    via the platform-config fallback. Caching must not break this.
-    """
+def test_cache_preserves_scheme_only_behavior(cached_model) -> None:
+    """缓存中的旧默认配置不能使方案页出现通用程序。"""
     model, _counter = cached_model
     cards = model.get_scheme_modules("L36", "西班牙")
     by_label: dict[str, list] = {}
@@ -1137,22 +1162,7 @@ def test_cache_preserves_scheme_fallback_behavior(cached_model) -> None:
         by_label.setdefault(c.asset["firmware_label"], []).append(c)
 
     assert "主板程序" in by_label
-    assert "3D机芯板程序" in by_label
-    # 3D机芯 should be a fallback (no _默认 directory but platform_config
-    # covered it).
-    assert by_label["3D机芯板程序"][0].is_fallback is True
-    # 主板 must be 定制专属, not fallback.
-    assert all(c.source_type == "custom_exclusive" for c in by_label["主板程序"])
-    by_label: dict[str, list] = {}
-    for c in cards:
-        by_label.setdefault(c.asset["firmware_label"], []).append(c)
-
-    assert "主板程序" in by_label
-    assert "3D机芯板程序" in by_label
-    # 3D机芯 should be a fallback (no _默认 directory but platform_config
-    # covered it).
-    assert by_label["3D机芯板程序"][0].is_fallback is True
-    # 主板 must be 定制专属, not fallback.
+    assert "3D机芯板程序" not in by_label
     assert all(c.source_type == "custom_exclusive" for c in by_label["主板程序"])
 
 
@@ -1225,31 +1235,22 @@ def test_scheme_modules_never_expose_huanyuan_in_card_label(
             assert c.source_label == "定制专属"
 
 
-def test_scheme_module_tree_fallback_carries_default_badge(
+def test_scheme_module_tree_excludes_common_defaults(
     l36_tree: Path, tmp_path: Path
 ) -> None:
-    """Issue 13：方案视图回源变体应带 ★默认（含 toml 空默认 = 模块唯一变体）。"""
+    """方案树不自动补入通用程序，也不显示默认徽章。"""
     model = _bind_model(l36_tree, tmp_path)
     tree = model.get_scheme_module_tree("L36", "西班牙")
-    # 西班牙缺 3D / 腿部 → 回源；平台配置二者均为 "" 空默认
-    row_3d = next((r for r in tree if r.label == "3D机芯板程序"), None)
-    assert row_3d is not None and row_3d.variants
-    assert row_3d.variants[0].default_badge == "★默认"
-
-    row_leg = next((r for r in tree if r.label == "腿部程序"), None)
-    assert row_leg is not None and row_leg.variants
-    assert row_leg.variants[0].default_badge == "★默认"
-
-    # 通用区直接列腿部也应有徽章（空默认语义）
+    assert [row.label for row in tree] == ["主板程序"]
     leg_cards = model.get_common_modules("L36", "腿部程序")
     assert leg_cards
-    assert leg_cards[0].default_badge == "★默认"
+    assert leg_cards[0].default_badge == ""
 
 
-def test_empty_default_badge_for_unique_nested_variant(tmp_path: Path) -> None:
-    """空默认 "" 覆盖「唯一嵌套变体」，不要求文件直接位于模块目录。
+def test_nested_variant_has_no_default_badge(tmp_path: Path) -> None:
+    """嵌套变体即使被旧配置引用，也不显示默认徽章。
 
-    结构：通用/语音程序/中文唯一版/voice.bin + defaults 语音程序 = ""
+    结构：通用/语音程序/中文唯一版/voice.bin + defaults 语音程序 = "中文唯一版"
     """
     root = tmp_path / "L36程序"
     _write(
@@ -1259,12 +1260,11 @@ def test_empty_default_badge_for_unique_nested_variant(tmp_path: Path) -> None:
                 "[[platform]]",
                 'name = "标准单机芯3D"',
                 "[platform.defaults]",
-                '"语音程序" = ""',
+                '"语音程序" = "中文唯一版"',
             ]
         ),
     )
     _write(root / "通用" / "语音程序" / "中文唯一版" / "voice.bin")
-    # 多变体主板：空默认不应误标（此处不配置主板空默认；另建对照）
     _write(root / "通用" / "主板程序" / "量产_默认" / "a.bin")
     _write(root / "通用" / "主板程序" / "防夹功能" / "b.bin")
     scheme = root / "定制" / "西班牙"
@@ -1275,14 +1275,17 @@ def test_empty_default_badge_for_unique_nested_variant(tmp_path: Path) -> None:
     voice = model.get_common_modules("L36", "语音程序")
     assert len(voice) == 1
     assert voice[0].asset["directory_name"] == "中文唯一版"
-    assert voice[0].default_badge == "★默认"
+    assert voice[0].default_badge == ""
+    # 未设默认的主板变体不得因目录名含 _默认 而带徽章
+    boards = model.get_common_modules("L36", "主板程序")
+    assert boards
+    assert all(c.default_badge == "" for c in boards)
+    assert all(c.source_type == "common_variant" for c in boards)
 
-    # 方案回源语音也应带徽章
+    # 方案页不自动补入通用语音
     tree = model.get_scheme_module_tree("L36", "西班牙")
     row_voice = next((r for r in tree if r.label == "语音程序"), None)
-    assert row_voice is not None and row_voice.variants
-    assert row_voice.variants[0].default_badge == "★默认"
-    assert row_voice.variants[0].name == "中文唯一版"
+    assert row_voice is None
 
 
 def test_empty_default_does_not_badge_when_multiple_variants(tmp_path: Path) -> None:
@@ -1349,13 +1352,12 @@ def test_empty_default_multi_variant_does_not_scheme_fallback(tmp_path: Path) ->
 def test_scheme_modules_empty_keyword_returns_full_tree(
     l36_tree: Path, tmp_path: Path
 ) -> None:
-    """Issue 19-A：无 keyword 时方案满树（定制 + 回源），不因路径名关键字而缩水。"""
+    """无 keyword 时显示方案的全部定制程序。"""
     model = _bind_model(l36_tree, tmp_path)
     full = model.get_scheme_modules("L36", "西班牙")
     labels = {str(c.asset.get("firmware_label", "")) for c in full}
     assert "主板程序" in labels
-    # 西班牙缺 3D → 回源
-    assert "3D机芯板程序" in labels
+    assert "3D机芯板程序" not in labels
 
 
 def test_scheme_modules_keyword_uses_tokenized_multi_field_filter(
@@ -1379,7 +1381,7 @@ def test_scheme_modules_keyword_uses_tokenized_multi_field_filter(
 def test_scheme_keyword_does_not_fake_fallback_for_filtered_custom(
     l36_tree: Path, tmp_path: Path
 ) -> None:
-    """搜仅命中回源模块的词时，不得把已有定制主板当「未覆盖」再回源一份。"""
+    """搜索通用程序的关键词不会在方案内产生程序行。"""
     model = _bind_model(l36_tree, tmp_path)
     # 用足够长的类型标签，避免路径里偶然出现的短 token「3D」
     cards = model.get_scheme_modules("L36", "西班牙", keyword="3D机芯板")
@@ -1387,7 +1389,7 @@ def test_scheme_keyword_does_not_fake_fallback_for_filtered_custom(
     assert mainboards == [], (
         "filtered-out custom mainboard must not reappear as fallback"
     )
-    assert any(c.asset.get("firmware_label") == "3D机芯板程序" for c in cards)
+    assert cards == []
 
 
 def test_unbound_model_falls_back_to_query_assets(
@@ -1525,7 +1527,7 @@ def test_all_modules_decorate_existing_row_with_shared_source(tmp_path: Path) ->
     assert len(shortcut) == 1
     card = shortcut[0]
     assert card.shared_state == "shared_hit"
-    assert card.shared_source_label == "\u6765\u81eaL36"
+    assert card.shared_source_label == "固定版本·L36"
     assert card.asset["path"] == str(target_path)
     assert card.effective_asset is not None
     assert card.effective_asset["path"] == str(source_path)
@@ -1554,6 +1556,74 @@ def test_missing_shared_source_does_not_fall_back_to_local(tmp_path: Path) -> No
 
     assert card.shared_state == "shared_missing"
     assert card.shared_reason == "source_not_imported"
+    assert card.effective_asset is None
+
+
+def _borrow_only_workspace(tmp_path: Path, *, with_source: bool = True):
+    """目标型号没有快捷键程序，只登记了对源型号的借用。"""
+    workspace = tmp_path / "workspace"
+    source_root = workspace / "L36程序"
+    target_root = workspace / "L36双机芯-上3D-下2D程序"
+    _write(source_root / "型号配置.toml", 'model_id = "l36"\n')
+    _write(target_root / "型号配置.toml", 'model_id = "l36-dual"\n')
+    source_path = source_root / "通用" / "快捷键程序"
+    if with_source:
+        _write(source_path / "shortcut.bin")
+    _write(target_root / "通用" / "主板程序" / "main.bin")
+    save_shared_module(
+        target_root,
+        SharedModuleRef(
+            module_key="快捷键程序",
+            source_model_id="l36",
+            source_group="l36-common",
+            source_module="快捷键程序",
+            source_relative_path="L36程序/通用/快捷键程序",
+        ),
+    )
+    return _bind_workspace(workspace, tmp_path / "index.db"), source_path
+
+
+def test_borrow_without_local_row_still_listed(tmp_path: Path) -> None:
+    """空型号借用后：列表、通用分类、侧栏都要出现借用行。"""
+    model, source_path = _borrow_only_workspace(tmp_path)
+    target = "L36双机芯-上3D-下2D"
+
+    cards = model.get_all_modules(target)
+    shortcut = [c for c in cards if c.asset["firmware_label"] == "快捷键程序"]
+    assert len(shortcut) == 1
+    card = shortcut[0]
+    assert card.borrowed_only
+    assert card.shared_state == "shared_hit"
+    assert card.shared_source_label == "固定版本·L36"
+    assert card.asset["path"] == str(source_path)
+    assert card.effective_asset is not None
+
+    common = model.get_common_modules(target, "快捷键程序")
+    assert [c.borrowed_only for c in common] == [True]
+    assert model.get_common_modules(target, "主板程序")[0].borrowed_only is False
+    assert "快捷键程序" in model.build_sidebar_tree(target)["common"]
+
+    # 源型号自己的列表不受影响
+    assert not any(c.borrowed_only for c in model.get_all_modules("L36"))
+
+
+def test_borrow_without_local_row_respects_keyword(tmp_path: Path) -> None:
+    model, _source = _borrow_only_workspace(tmp_path)
+    target = "L36双机芯-上3D-下2D"
+    assert not any(c.borrowed_only for c in model.get_all_modules(target, "main"))
+    assert any(c.borrowed_only for c in model.get_all_modules(target, "快捷键"))
+
+
+def test_borrow_without_local_row_missing_source_shows_placeholder(
+    tmp_path: Path,
+) -> None:
+    """来源缺失也要出一行，用户才能看到并取消借用。"""
+    model, _source = _borrow_only_workspace(tmp_path, with_source=False)
+    cards = model.get_all_modules("L36双机芯-上3D-下2D")
+    card = next(c for c in cards if c.borrowed_only)
+    assert card.shared_state == "shared_missing"
+    assert card.asset["firmware_label"] == "快捷键程序"
+    assert card.asset["path"] == ""
     assert card.effective_asset is None
 
 
@@ -1591,7 +1661,7 @@ def _setup_dual_with_shared_shortcut(
                 'name = "标准单机芯3D"',
                 "[platform.defaults]",
                 '"主板程序" = "量产_默认"',
-                '"快捷键程序" = ""',
+                '"快捷键程序" = "本地变体"',
             ]
         ),
     )
@@ -1701,8 +1771,8 @@ def test_shared_missing_does_not_fall_back_in_list_or_scheme(tmp_path: Path) -> 
     assert not any("快捷键" in x for x in labels)
 
 
-def test_clear_shared_restores_scheme_fallback_and_local_list(tmp_path: Path) -> None:
-    """取消共享后：列表恢复 local；方案可再回源本地通用。"""
+def test_clear_shared_restores_local_list_without_scheme_inheritance(tmp_path: Path) -> None:
+    """取消共享后通用列表恢复 local，方案页仍不继承通用程序。"""
     model, target_root, _source = _setup_dual_with_shared_shortcut(
         tmp_path, with_local_copy=True
     )
@@ -1724,10 +1794,7 @@ def test_clear_shared_restores_scheme_fallback_and_local_list(tmp_path: Path) ->
     scheme_shortcut = [
         c for c in scheme_cards if "快捷键" in str(c.asset.get("firmware_label", ""))
     ]
-    assert len(scheme_shortcut) == 1
-    assert scheme_shortcut[0].is_fallback is True
-    assert scheme_shortcut[0].source_kind == "common"
-    assert "快捷键" in str(scheme_shortcut[0].asset.get("path", ""))
+    assert scheme_shortcut == []
 
 
 # ---------------------------------------------------------------------------

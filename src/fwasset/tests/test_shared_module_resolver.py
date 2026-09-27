@@ -403,7 +403,8 @@ def test_follow_default_prefers_canonical_shortcut_key(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_follow_default_leaf_module(tmp_path: Path):
+def test_follow_default_empty_value_means_no_source_default(tmp_path: Path):
+    """空串不再表示「模块目录即默认」：源型号未设默认，报 no_source_default。"""
     ws = tmp_path / "ws"
     src = _make_source_root(ws, "L50S程序", "l50s")
     module_dir = src / "通用" / "语音程序"
@@ -423,8 +424,34 @@ def test_follow_default_leaf_module(tmp_path: Path):
         source_platform="标准单机芯",
     )
     res = resolve_shared_module(ref, ws)
+    assert res.status == "missing"
+    assert res.reason == "no_source_default"
+
+
+def test_follow_default_explicit_variant_hits(tmp_path: Path):
+    """显式写了变体目录名才命中。"""
+    ws = tmp_path / "ws"
+    src = _make_source_root(ws, "L50S程序", "l50s")
+    module_dir = src / "通用" / "语音程序"
+    variant = module_dir / "中文版"
+    variant.mkdir(parents=True, exist_ok=True)
+    (variant / "voice.bin").write_bytes(b"V")
+    save_platform_config(
+        src,
+        [
+            PlatformDefaults("标准单机芯", {"语音程序": "中文版"}),
+        ],
+    )
+
+    ref = _make_ref(
+        source_root_dir="L50S程序",
+        module_rel="通用/语音程序",
+        source_module="语音程序",
+        source_platform="标准单机芯",
+    )
+    res = resolve_shared_module(ref, ws)
     assert res.status == "hit"
-    assert res.resolved_path == module_dir.resolve()
+    assert res.resolved_path == variant.resolve()
 
 
 # ---------------------------------------------------------------------------

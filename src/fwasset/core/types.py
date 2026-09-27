@@ -337,6 +337,17 @@ class RetiredVersionMetadata(TypedDict):
     retired_by: RetiredBy
 
 
+class RetiredVersionView(TypedDict):
+    """工作台展示的一份备用副本及当前可恢复状态。"""
+
+    backup_path: str
+    name: str
+    retired_from: str
+    retired_at: str
+    can_restore: bool
+    reason: str
+
+
 @dataclass
 class ReferenceSemantics:
     """程序的身份语义快照：update 级联用其判定「身份不变」。

@@ -132,7 +132,7 @@ def create_asset(
     vendor: str = "",
     log_fn: Callable[..., None] = print,
 ) -> ServiceResult:
-    """新增程序：catalog 完整 → 正式提升；不完整 → 存入待补齐候选区（D0.2/D7.5）。"""
+    """新增程序：来源内容原样提升到业务目录，不做 catalog 完整性分流。"""
     gate = check_reference_gate(configured_root, workspace_root)
     if gate is not None:
         return gate
@@ -175,14 +175,6 @@ def create_asset(
         except AssetImportError as exc:
             transaction.commit()
             return _error(exc.code, exc.message, exc.payload)
-
-        filenames = _session_filenames(session)
-        matched = classify_staged_content(target, filenames)
-
-        if matched is None:
-            return _create_incomplete_candidate(
-                transaction, ws, session, vendor=vendor, log_fn=log_fn
-            )
 
         try:
             # gate 已确认 configured_root 非空且与 workspace_root 一致。

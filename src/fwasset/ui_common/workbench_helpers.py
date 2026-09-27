@@ -88,45 +88,45 @@ def set_default_confirm_message(
 
 
 def shared_register_action_label(module: str) -> str:
-    """右键项：为目标模块登记共享来源。"""
+    """右键项：为目标模块登记借用。"""
     mod = (module or "").strip() or "该模块"
-    return f"为「{mod}」登记共享来源…"
+    return f"为「{mod}」登记借用…"
 
 
 def shared_replace_action_label(module: str) -> str:
-    """右键项：替换目标模块已经登记的共享来源。"""
+    """右键项：替换目标模块已经登记的借用。"""
     mod = (module or "").strip() or "该模块"
-    return f"更换「{mod}」的共享来源…"
+    return f"更换「{mod}」的借用…"
 
 
 def shared_unregister_action_label(module: str) -> str:
-    """右键项：取消目标模块的共享来源登记。"""
+    """右键项：解除目标模块的借用。"""
     mod = (module or "").strip() or "该模块"
-    return f"取消「{mod}」的共享来源"
+    return f"解除「{mod}」的借用"
 
 
 def shared_register_dialog_title(module: str) -> str:
     mod = (module or "").strip() or "该模块"
-    return f"为「{mod}」登记共享来源"
+    return f"为「{mod}」登记借用"
 
 
 def shared_unregister_confirm_message(module: str) -> str:
     mod = (module or "").strip() or "该模块"
     return (
-        f"确认取消「{mod}」的共享来源登记？\n\n"
-        "仅删除共享引用，不会删除任何本地固件文件；取消后该模块恢复为本地有效资产。"
+        f"确认解除「{mod}」的借用？\n\n"
+        "只删除借用记录，不会删除固件文件。"
     )
 
 
 def shared_conflict_prompt_message(module: str) -> str:
     mod = (module or "").strip() or "该模块"
-    return f"「{mod}」已登记共享来源，是否覆盖为新的来源？"
+    return f"「{mod}」已有借用登记，是否覆盖为新的来源？"
 
 
 def shared_source_picker_caption(module: str) -> str:
     """来源选择对话框顶部说明。"""
     mod = (module or "").strip() or "该模块"
-    return f"从其它型号选择一个「{mod}」版本作为共享来源"
+    return f"从其它型号选择一个「{mod}」程序作为借用"
 
 
 def write_gate_check(

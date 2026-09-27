@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -46,6 +47,8 @@ class SetupWizard(QDialog):
         self._root_edit: QLineEdit
         self._tool_edit: QLineEdit
         self._error_label: CaptionLabel
+        self._config_written = None
+        self._before_write: Callable[[], bool] | None = None
         self._build_ui()
 
     # ------------------------------------------------------------------ UI
@@ -140,9 +143,21 @@ class SetupWizard(QDialog):
         self._error_label.setText(error)
         if error:
             return
+        if self._before_write is not None and not self._before_write():
+            self._error_label.setText("已取消切换，配置未修改。")
+            return
+        written = self.write_config()
+        self._config_written = written
+        if isinstance(written, dict) and not written.get("ok"):
+            self._error_label.setText(str(written.get("message") or ""))
+            return
         self.accept()
 
     # ------------------------------------------------------------------ Public helpers
+    def set_before_write(self, callback: Callable[[], bool] | None) -> None:
+        """写盘前的确认。返回假则不写、不关闭，草稿留在表单里。"""
+        self._before_write = callback
+
     def root_dir(self) -> str:
         return self._root_edit.text().strip()
 
@@ -178,15 +193,12 @@ class SetupWizard(QDialog):
             return "工具根目录不存在或不是目录，请重新选择。"
         return ""
 
-    def write_config(self, config_path: Path | None = None) -> None:
-        """将已校验的路径写入指定配置文件或 ``settings.CONFIG_PATH``。"""
-        if config_path is None:
-            from fwasset.core.settings import CONFIG_PATH
+    def write_config(self, config_path: Path | None = None):
+        """将已校验的路径写入配置，保留厂商名单等其他键。"""
+        from fwasset.core.settings import save_path_settings
 
-            config_path = CONFIG_PATH
-
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        root = self.resolved_root_dir().replace("\\", "/")
-        tool = self.resolved_tool_root().replace("\\", "/")
-        content = f'[paths]\nroot_dir = "{root}"\ntool_root = "{tool}"\n'
-        config_path.write_text(content, encoding="utf-8")
+        return save_path_settings(
+            self.resolved_root_dir(),
+            self.resolved_tool_root(),
+            config_path=config_path,
+        )

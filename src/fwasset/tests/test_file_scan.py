@@ -546,5 +546,8 @@ def test_scan_excludes_internal_managed_roots(tmp_path: Path):
 
     assets, errors = scan_firmware_assets(str(tmp_path))
 
-    assert errors == []
+    assert [item for item in errors if item.get("severity") == "error"] == []
+    warnings = [item for item in errors if item.get("severity") == "warning"]
+    assert len(warnings) == 1
+    assert "历史待补齐" in str(warnings[0]["message"])
     assert [item["path"] for item in assets] == [str(normal)]

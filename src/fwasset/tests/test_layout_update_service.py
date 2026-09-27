@@ -335,8 +335,8 @@ def test_update_reports_retire_failure_keeping_both_copies(
     assert (old / "fw.bin").exists()  # 旧程序保留，不出现「旧已退位但新不可用」
 
 
-def test_update_rejects_incomplete_replacement(tmp_path: Path) -> None:
-    """D1.5：staging 内容不是完整合法资产 → incomplete_replacement。"""
+def test_update_replaces_unrecognized_files(tmp_path: Path) -> None:
+    """更新不再因内容对不上 catalog 而取消，来源文件原样替换。"""
     model = _model(tmp_path)
     old = _variant(model)
     source = tmp_path / "外部" / "空来源"
@@ -347,9 +347,10 @@ def test_update_rejects_incomplete_replacement(tmp_path: Path) -> None:
         str(tmp_path), str(tmp_path), old, source, retire_mode="retire_to_trash"
     )
 
-    assert result["ok"] is False
-    assert result["code"] == "incomplete_replacement"
-    assert (old / "fw.bin").exists()
+    assert result["ok"] is True, result
+    replacement = old.parent / source.name
+    assert (replacement / "readme.txt").read_text(encoding="utf-8") == "不是固件"
+    assert not old.exists()
     _assert_converged_clean(tmp_path)
 
 

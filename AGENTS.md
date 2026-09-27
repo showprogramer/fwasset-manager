@@ -7,7 +7,7 @@
 - 明确的任务直接执行；只有缺失信息会影响正确性、范围或授权时才询问。已有决定不反复确认。
 - 回复先说结果，只补充必要验证、阻塞和下一步；不复述需求、工具操作或逐步思考。
 - 小改动不建 Task；跨模块、多阶段或需后续接手的任务才在 `specs/active/` 留当前规格。
-- 默认一名 Agent 负责实现、验证和提交；需要独立审查时按需加入第二名，不设常驻主控或文档 Agent。启用条件与交接规则见流程中的“多 Agent 协作”；派单后使用平台等待机制，不持续轮询或读取其他 Agent 会话；仅由本任务指定的提交负责人操作暂存与提交。
+- 默认一名 Agent 负责实现、验证和提交；需要独立审查时按需加入第二名，不设常驻主控或文档 Agent。启用条件与交接规则见流程中的“多 Agent 协作”；通过当前环境可用的 Agent 机制协作，不持续轮询或读取其他 Agent 会话；用户要求跨会话交接时写 handoff 文档交给用户，由用户选择接手 Agent；仅由本任务指定的提交负责人操作暂存与提交。
 - 同一事实只保留一处，其他文档引用；不保存会话流水账、废弃方案、重复验证或占位章节。
 - 修改前检查工作区，保留用户已有改动；不默认读取 `config.toml`、`.env`、缓存、构建产物或 Agent 本地状态。配置参考 `config.example.toml`。
 
@@ -17,7 +17,7 @@
 - 新源文件使用 `from __future__ import annotations`；新 helper 和公共方法补类型标注。导入顺序：标准库、第三方、`fwasset.*`。
 - `core/types.py` 是 TypedDict / Literal 真源，字段变化同步生产者、消费者和测试。
 - `core/services/` 返回 `ServiceResult`，用户消息使用中文，不以裸异常代替服务错误码。
-- `firmware_catalog.toml` 条目顺序影响匹配；`handcontrol_ui` 必须同时有 `.rom` 和 `.pkg`。
+- `firmware_catalog.toml` 条目顺序影响匹配；`handcontrol_ui` 同时有 `.rom` 和 `.pkg` 只用于既有资产扫描识别，不作为导入准入条件。
 - `asset_index.py` 采用单工作区语义；目录树和 TOML 是真源，SQLite 是搜索缓存。
 - UI 只用 Qt：registry + `PanelHost`、组合式 ViewModel、后台线程与结果队列；取消使用 `threading.Event`。
 

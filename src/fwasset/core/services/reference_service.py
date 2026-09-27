@@ -332,8 +332,14 @@ def build_rewrite_plan(
     workspace_root: str | Path,
     request: RewriteRequest,
     log_fn: Callable[..., None] = print,
+    *,
+    allow_unrecognized_target: bool = False,
+    allow_unrecognized_replacement: bool = False,
 ) -> ServiceResult:
-    """按操作矩阵产出改写计划（纯函数，不改盘；规则 2/4）。"""
+    """按操作矩阵产出改写计划（纯函数，不改盘；规则 2/4）。
+
+    ``allow_unrecognized_target`` 只供已单独验证当前程序内容的恢复流程使用。
+    """
     ws = Path(workspace_root).resolve()
     gate = check_reference_gate(configured_root, workspace_root)
     if gate is not None:
@@ -345,7 +351,11 @@ def build_rewrite_plan(
     except PathGuardError as exc:
         return _error_result("out_of_workspace", f"目标不在工作区内：{exc}")
 
-    kind_detail = _validate_target_kind(old_path, request.target_kind)
+    kind_detail = _validate_target_kind(
+        old_path,
+        request.target_kind,
+        allow_unrecognized_files=allow_unrecognized_target,
+    )
     if kind_detail is not None:
         return _error_result("invalid_target", f"目标类型不匹配：{kind_detail}")
 
@@ -398,7 +408,11 @@ def build_rewrite_plan(
             return _error_result(
                 "invalid_operation", f"新程序目录不存在：{replacement}"
             )
-        kind_detail_repl = _validate_target_kind(replacement, "asset")
+        kind_detail_repl = _validate_target_kind(
+            replacement,
+            "asset",
+            allow_unrecognized_files=allow_unrecognized_replacement,
+        )
         if kind_detail_repl is not None:
             return _error_result(
                 "invalid_operation", f"新程序目录结构不合法：{kind_detail_repl}"

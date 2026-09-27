@@ -15,6 +15,8 @@ from fwasset.core.firmware_catalog import (
 )
 from fwasset.core.managed_paths import (
     ASSET_METADATA_FILENAME,
+    managed_path_reason,
+    managed_root,
     should_exclude_managed_path,
 )
 from fwasset.core.path_guard import assert_within_workspace
@@ -65,6 +67,41 @@ def _normalize_version(value: str) -> str:
 def _has_allowed_extension(filename: str, extensions: list[str]) -> bool:
     lower_name = filename.lower()
     return any(lower_name.endswith(ext) for ext in extensions)
+
+
+def _note_legacy_incomplete(
+    dirpath: str, workspace_root: Path, issues: list[ScanIssue]
+) -> None:
+    """历史候选目录不再管理。扫到候选区根时，为每个子目录报一条 warning。"""
+    if (
+        managed_path_reason(dirpath, is_dir=True, workspace_root=workspace_root)
+        != "incomplete_candidate"
+    ):
+        return
+    try:
+        root = managed_root(workspace_root, "incomplete_candidate")
+        if os.path.normcase(str(Path(dirpath).resolve())) != os.path.normcase(
+            str(root.resolve())
+        ):
+            return
+        entries = sorted(path for path in root.iterdir() if path.is_dir())
+    except OSError as exc:
+        issues.append(
+            {
+                "severity": "warning",
+                "message": f"历史待补齐目录无法读取，请手动处理：{exc}",
+                "path": dirpath,
+            }
+        )
+        return
+    for entry in entries:
+        issues.append(
+            {
+                "severity": "warning",
+                "message": f"发现历史待补齐目录，应用已不再管理，请手动移走或删除：{entry}",
+                "path": str(entry),
+            }
+        )
 
 
 def _is_excluded_dir(dirpath: str, workspace_root: Path | None = None) -> bool:
@@ -155,7 +192,7 @@ def classify_staged_content(
     汇总的候选文件名清单（如 staging 会话或候选目录内容）。命中某个 catalog
     条目即完整（``handcontrol_ui`` 天然要求同时有 ``.rom`` 与 ``.pkg``，
     这条硬约束已在 ``_match_catalog_type`` 内，不需要调用方另判）；未命中
-    任何条目即不完整。服务层据此判据分流「新增程序」与「待补齐候选区」，
+    任何条目即未按 catalog 识别。导入不再用它做准入；扫描识别仍用同一规则。
     不得直接调用私有 ``_match_catalog_type``。
     """
     type_configs = enabled_firmware_types(
@@ -426,6 +463,7 @@ def _scan_assets(
 
         if _is_excluded_dir(dirpath, root_path):
             # 排除目录整棵子树可剪（排除语义是整枝不要，与 mtime 无关）
+            _note_legacy_incomplete(dirpath, root_path, issues)
             dirnames[:] = []
             continue
         cfg = _match_catalog_type(dirpath, filenames, type_configs)

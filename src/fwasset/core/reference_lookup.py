@@ -619,6 +619,8 @@ def _collect_defaults_hits(
 def _validate_target_kind(
     target: Path,
     target_kind: ReferenceTargetKind,
+    *,
+    allow_unrecognized_files: bool = False,
 ) -> str | None:
     """target_kind 领域身份验证（现存路径，结构规则写死；审查 P1-2）。
 
@@ -660,6 +662,8 @@ def _validate_target_kind(
     module_dir = target if at_module_leaf else target.parent
     matched = _is_catalog_asset_dir(target, types)
     if matched is None:
+        if allow_unrecognized_files and _directory_contains_file(target):
+            return None
         return "目录内没有可识别的程序文件，不是程序目录"
     # 模块类型一致性：matched cfg 的 label/dir_keywords 须与模块目录对应。
     # 全部比较统一 casefold（与 scanner 的小写关键词匹配一致，审查第六轮 P1-1）。
@@ -678,6 +682,13 @@ def _validate_target_kind(
             f"「{matched.get('label', '')}」不一致，不能作为程序目录"
         )
     return None
+
+
+def _directory_contains_file(target: Path) -> bool:
+    try:
+        return any(path.is_file() for path in target.rglob("*"))
+    except OSError:
+        return False
 
 
 def _catalog_context() -> tuple[set[str], list[FirmwareTypeConfig]] | None:

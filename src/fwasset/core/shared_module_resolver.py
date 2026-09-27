@@ -186,6 +186,9 @@ def _resolve_follow_default(
 
     ``module_dir`` 是共同前置校验后的 abs_path；
     C2 service 注册时已保证它指向模块目录而非变体目录。
+
+    默认只认显式写入的变体目录名。键缺失或值为空串都报 ``no_source_default``，
+    不回落到模块目录下的唯一变体。
     """
     if not module_dir.is_dir():
         return SharedModuleResolution(
@@ -212,23 +215,23 @@ def _resolve_follow_default(
             return SharedModuleResolution(
                 ref=ref, status="missing", reason="no_source_default"
             )
-        variant_name = block.defaults[matched_key]
+        variant_name = str(block.defaults[matched_key] or "").strip()
     else:
         # 自动检测：依次试所有 platform，取第一个含该模块默认的
         variant_name = ""
         for p in platforms:
             matched_key = _find_default_key(p, ref.source_module)
             if matched_key:
-                variant_name = p.defaults[matched_key]
+                variant_name = str(p.defaults[matched_key] or "").strip()
                 break
-        if variant_name == "" and not any(
-            _find_default_key(p, ref.source_module) for p in platforms
-        ):
-            return SharedModuleResolution(
-                ref=ref, status="missing", reason="no_source_default"
-            )
 
-    resolved_path = module_dir / variant_name if variant_name else module_dir
+    if not variant_name:
+        # 源型号该模块未设默认（无键或空串），不猜唯一变体
+        return SharedModuleResolution(
+            ref=ref, status="missing", reason="no_source_default"
+        )
+
+    resolved_path = module_dir / variant_name
 
     if not resolved_path.exists():
         return SharedModuleResolution(

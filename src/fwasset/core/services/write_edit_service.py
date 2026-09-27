@@ -447,7 +447,7 @@ def register_shared_module(
     if gate is not None:
         return gate
     if mode not in ("static", "follow_asset"):
-        return _error("invalid_args", "新借用只支持固定或跟随该程序")
+        return _error("invalid_args", "新借用只支持固定版本或自动更新")
     ws = Path(workspace_root).resolve()
     try:
         target = assert_within_workspace(target_model_root, ws)

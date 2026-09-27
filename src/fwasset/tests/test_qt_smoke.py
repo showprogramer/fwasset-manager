@@ -83,6 +83,8 @@ def _capture_workbench_context_menu(
     is_default: bool,
     shared: bool,
     gate_ok: bool = True,
+    shared_state: str = "local",
+    borrowed_only: bool = False,
 ) -> tuple[list[QAction], int]:
     """构建工作台资产右键菜单，并返回其中的动作列表。"""
     from PySide6.QtCore import QPoint
@@ -129,6 +131,8 @@ def _capture_workbench_context_menu(
         source_kind="common",
         source_label="通用",
     )
+    variant.shared_state = shared_state
+    variant.borrowed_only = borrowed_only
 
     workbench._on_grid_right_click(variant, QPoint(0, 0))
     return captured["menu"].actions(), separator_count
@@ -149,25 +153,57 @@ def test_context_menu_hides_default_status_and_uses_replace_actions(
     visible = [action for action in actions if not action.isSeparator()]
 
     assert [action.text() for action in visible] == [
-        "更换「快捷键程序」的共享来源…",
-        "取消「快捷键程序」的共享来源",
+        "更换「快捷键程序」的借用…",
+        "解除「快捷键程序」的借用",
         "打开所在目录",
         "复制目录路径",
+        "删除",
     ]
     assert [action.fluentIcon for action in visible] == [
         FluentIcon.SYNC,
         FluentIcon.CANCEL,
         FluentIcon.FOLDER,
         FluentIcon.COPY,
+        FluentIcon.DELETE,
     ]
     assert all("已是" not in action.text() for action in visible)
-    assert separator_count == 1
+    assert separator_count == 2
 
 
-def test_context_menu_groups_default_register_and_directory_actions(
+def test_context_menu_does_not_offer_setting_default(qapp, monkeypatch) -> None:
+    actions, _ = _capture_workbench_context_menu(
+        qapp, monkeypatch, is_default=False, shared=False
+    )
+
+    assert all("默认" not in action.text() for action in actions)
+
+
+def test_context_menu_borrow_only_row_has_no_default_or_delete(
     qapp, monkeypatch
 ) -> None:
-    """未设默认且未登记共享时，三个操作区按顺序由分隔线隔开。"""
+    """只借用的行 asset 在源型号：只给换借用/解除与目录操作（TASK-20260923）。"""
+    for state in ("shared_hit", "shared_missing"):
+        actions, _separators = _capture_workbench_context_menu(
+            qapp,
+            monkeypatch,
+            is_default=False,
+            shared=True,
+            shared_state=state,
+            borrowed_only=True,
+        )
+        texts = [a.text() for a in actions if not a.isSeparator()]
+        assert texts == [
+            "更换「快捷键程序」的借用…",
+            "解除「快捷键程序」的借用",
+            "打开所在目录",
+            "复制目录路径",
+        ]
+
+
+def test_context_menu_groups_register_and_directory_actions(
+    qapp, monkeypatch
+) -> None:
+    """未登记共享时，只显示借用、目录和删除操作。"""
     from qfluentwidgets import FluentIcon
 
     actions, separator_count = _capture_workbench_context_menu(
@@ -179,18 +215,31 @@ def test_context_menu_groups_default_register_and_directory_actions(
     visible = [action for action in actions if not action.isSeparator()]
 
     assert [action.text() for action in visible] == [
-        "设为「L36」快捷键程序默认版本",
-        "为「快捷键程序」登记共享来源…",
+        "为「快捷键程序」登记借用…",
         "打开所在目录",
         "复制目录路径",
+        "删除",
     ]
     assert [action.fluentIcon for action in visible] == [
-        FluentIcon.EDIT,
         FluentIcon.LINK,
         FluentIcon.FOLDER,
         FluentIcon.COPY,
+        FluentIcon.DELETE,
     ]
     assert separator_count == 2
+
+
+def test_context_menu_hides_delete_on_borrowed_row(qapp, monkeypatch) -> None:
+    """借用来源行不给删除——那份程序不属于本型号（TASK-20260923）。"""
+    actions, _separator_count = _capture_workbench_context_menu(
+        qapp,
+        monkeypatch,
+        is_default=False,
+        shared=True,
+        shared_state="shared_hit",
+    )
+    visible = [action for action in actions if not action.isSeparator()]
+    assert "删除" not in [action.text() for action in visible]
 
 
 def test_context_menu_hides_write_actions_when_gate_blocks(qapp, monkeypatch) -> None:
@@ -240,7 +289,9 @@ def test_shared_source_picker_excludes_other_modules(qapp, monkeypatch) -> None:
         lambda *args: captured.update(args=args),
     )
 
-    workbench._register_shared_source(SimpleNamespace(asset=target_asset))
+    workbench._register_shared_source(
+        SimpleNamespace(asset=target_asset, borrowed_only=False)
+    )
 
     assert captured["args"] == (
         "目标型号",
@@ -716,6 +767,8 @@ def test_click_filtered_scheme_reselects_its_new_row_after_sidebar_rebuild(
     w = WorkbenchInterface()
     w._search_timer.stop()
     w._model_switch_timer.stop()
+    w._cached_load_timer.stop()
+    w._usb_timer.stop()
     w._refresh_main_grid = lambda: None  # type: ignore[method-assign]
     w.workbench_model.build_sidebar_tree = lambda _model: {  # type: ignore[method-assign]
         "common": {"主板程序": 2, "手控UI": 3, "语音程序": 1},
@@ -934,4 +987,327 @@ def test_shared_badges_render_on_existing_variant_row() -> None:
 
     assert DataGrid._variant_text(hit, "快捷键程序").endswith("L36")
     assert "共享自" not in DataGrid._variant_text(hit, "快捷键程序")
-    assert "共享来源缺失" in DataGrid._variant_text(missing, "快捷键程序")
+    assert "借用来源缺失" in DataGrid._variant_text(missing, "快捷键程序")
+
+
+def test_present_result_keeps_resume_for_recovery_required(qapp) -> None:
+    from fwasset.ui_common.workspace_actions import recovery_banner_text
+    from fwasset.ui_qt.entry_flows import present_result
+    from fwasset.ui_qt.workbench_window import WorkbenchInterface
+
+    workbench = WorkbenchInterface()
+    workbench._search_timer.stop()
+    workbench._model_switch_timer.stop()
+    workbench.apply_recovery_hold(
+        recovery_banner_text("update_asset"), "resume_update_asset"
+    )
+    present_result(
+        workbench,
+        {
+            "ok": False,
+            "code": "recovery_required",
+            "message": "需要恢复",
+            "payload": {},
+        },
+        "update_asset",
+    )
+    assert workbench._resume_name == "resume_update_asset"
+    assert workbench.resume_button.isHidden() is False
+
+
+def test_failed_cache_scan_holds_writes_and_starts_recovery(
+    qapp, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fwasset.core.settings as settings
+    from fwasset.ui_common.workspace_actions import StartupRecovery
+    from fwasset.ui_qt import workbench_window as window_module
+
+    monkeypatch.setattr(settings, "DEFAULT_ROOT", str(tmp_path))
+    monkeypatch.setattr(window_module, "DEFAULT_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        window_module,
+        "build_cached_scan_result",
+        lambda **_kwargs: {
+            "ok": False,
+            "code": "failed",
+            "message": "缓存不可用",
+            "payload": {},
+        },
+    )
+    started: list[str] = []
+
+    def fake_recovery(root: str, **_kwargs: object) -> StartupRecovery:
+        started.append((str(root), window.workbench._writes_held))
+        return StartupRecovery(True, None, None, [])
+
+    class InlineThread:
+        def __init__(self, *, target, daemon: bool) -> None:
+            self._target = target
+
+        def start(self) -> None:
+            self._target()
+
+    monkeypatch.setattr(window_module, "run_startup_recovery", fake_recovery)
+    monkeypatch.setattr(window_module.threading, "Thread", InlineThread)
+    window = window_module.QtWorkbenchWindow()
+    workbench = window.workbench
+    workbench._search_timer.stop()
+    workbench._model_switch_timer.stop()
+
+    assert workbench._writes_held is False
+    assert started == []
+    workbench._load_cached_assets()
+    assert started == []
+    assert workbench._writes_held is False
+    window.show()
+    qapp.processEvents()
+    assert started == [(str(tmp_path), True)]
+
+
+def test_repair_page_previews_when_shown(
+    qapp, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time as _time
+
+    from fwasset.ui_qt.repair_interface import RepairInterface
+
+    model = tmp_path / "M"
+    model.mkdir()
+    calls: list[str] = []
+
+    def fake_preview(_configured: str, _workspace: str, model_root) -> dict:
+        calls.append(model_root.name)
+        return {
+            "ok": True,
+            "code": "ok",
+            "message": "",
+            "payload": {"preview": {"already_normalized": False}},
+        }
+
+    monkeypatch.setattr(
+        "fwasset.ui_qt.repair_interface.preview_platform_normalize", fake_preview
+    )
+    monkeypatch.setattr(
+        "fwasset.ui_qt.repair_interface.scan_legacy_excluded_dirs", lambda _root: []
+    )
+    monkeypatch.setattr(
+        "fwasset.ui_qt.repair_interface.enumerate_model_roots", lambda _root: [model]
+    )
+    page = RepairInterface()
+    page.set_workspace(str(tmp_path))
+    assert calls == []
+    assert page.caption.text() != "没有需要处理的项目"
+
+    page.show()
+    deadline = _time.time() + 3
+    while page.rows.count() == 0 and _time.time() < deadline:
+        qapp.processEvents()
+        _time.sleep(0.02)
+
+    assert calls == ["M"]
+    assert page.rows.count() == 1
+    assert "需要归一" in page.rows.item(0).text()
+
+
+def test_wizard_keeps_draft_when_config_is_corrupt(
+    qapp, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fwasset.core.settings as settings
+    from fwasset.ui_qt.setup_wizard import SetupWizard
+
+    broken = tmp_path / "config.toml"
+    broken.write_bytes(b"[\n")
+    monkeypatch.setattr(settings, "CONFIG_PATH", broken)
+    root = tmp_path / "firmware"
+    root.mkdir()
+    wizard = SetupWizard(root_dir=str(root), tool_root="", allow_skip=False)
+    wizard._root_edit.setText(str(root))
+
+    wizard._on_accept()
+
+    assert wizard.result() == 0
+    assert "损坏" in wizard._error_label.text()
+    assert wizard.root_dir() == str(root)
+    assert broken.read_bytes() == b"[\n"
+
+
+def test_declining_root_switch_does_not_write(
+    qapp, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    import fwasset.core.settings as settings
+    from fwasset.ui_qt import workbench_window as window_module
+    from fwasset.ui_qt.setup_wizard import SetupWizard
+
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(
+        'vendors = ["摩众"]\n\n[paths]\nroot_dir = "D:/keep"\ntool_root = ""\n',
+        encoding="utf-8",
+    )
+    before = config.read_bytes()
+    monkeypatch.setattr(settings, "CONFIG_PATH", config)
+    monkeypatch.setattr(settings, "DEFAULT_ROOT", str(old))
+    monkeypatch.setattr(settings, "TOOL_ROOT", "")
+    asked: list[str] = []
+
+    def decline(*_args, **_kwargs):
+        asked.append("切换程序文件夹")
+        return QMessageBox.StandardButton.No
+
+    def finish(wizard: SetupWizard) -> int:
+        wizard._root_edit.setText(str(new))
+        wizard._on_accept()
+        return int(wizard.result())
+
+    monkeypatch.setattr(QMessageBox, "question", decline)
+    monkeypatch.setattr(SetupWizard, "exec", finish)
+    window = window_module.QtWorkbenchWindow()
+    window.workbench._cached_load_timer.stop()
+    window.workbench._usb_timer.stop()
+
+    window._open_configuration()
+
+    assert asked == ["切换程序文件夹"]
+    held = window.findChild(SetupWizard)
+    assert held is not None
+    assert held.result() == 0
+    assert held.root_dir() == str(new)
+    assert config.read_bytes() == before
+
+
+def test_accepting_root_switch_writes_only_after_confirm(
+    qapp, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    import fwasset.core.settings as settings
+    from fwasset.ui_common.workspace_actions import StartupRecovery
+    from fwasset.ui_qt import workbench_window as window_module
+    from fwasset.ui_qt.setup_wizard import SetupWizard
+
+    old = tmp_path / "old"
+    new = tmp_path / "new"
+    old.mkdir()
+    new.mkdir()
+    monkeypatch.setattr(settings, "DEFAULT_ROOT", str(old))
+    monkeypatch.setattr(settings, "TOOL_ROOT", "")
+    order: list[str] = []
+
+    def accept_switch(*_args, **_kwargs):
+        order.append("ask")
+        return QMessageBox.StandardButton.Yes
+
+    def record_write(_self, _config_path=None):
+        order.append("write")
+        return {"ok": True, "code": "ok", "message": "配置已保存", "payload": {}}
+
+    def finish(wizard: SetupWizard) -> int:
+        wizard._root_edit.setText(str(new))
+        wizard._on_accept()
+        return int(wizard.result())
+
+    monkeypatch.setattr(QMessageBox, "question", accept_switch)
+    monkeypatch.setattr(SetupWizard, "write_config", record_write)
+    monkeypatch.setattr(SetupWizard, "exec", finish)
+    monkeypatch.setattr(
+        window_module,
+        "_reload_runtime_settings",
+        lambda: (str(new), ""),
+    )
+    monkeypatch.setattr(
+        window_module,
+        "run_startup_recovery",
+        lambda *_args, **_kwargs: StartupRecovery(True, None, None, []),
+    )
+    window = window_module.QtWorkbenchWindow()
+    window.workbench._cached_load_timer.stop()
+    window.workbench._usb_timer.stop()
+    window.workbench._auto_scan = lambda _root: None  # type: ignore[method-assign]
+
+    window._open_configuration()
+
+    assert order == ["ask", "write"]
+    assert window.workbench.root_dir == str(new)
+
+
+def test_borrow_candidates_excludes_current_model_and_other_modules(qapp) -> None:
+    """借用候选排除本型号；给定类型时只留同类型（TASK-20260923）。"""
+    from types import SimpleNamespace
+
+    from fwasset.ui_qt.workbench_window import WorkbenchInterface
+
+    host = WorkbenchInterface.__new__(WorkbenchInterface)
+    host.current_selection = SimpleNamespace(model_name="L36")
+    host.workbench_model = SimpleNamespace(
+        _all_assets=[
+            {"firmware_label": "主板程序", "model": "L36", "directory_name": "本型号"},
+            {"firmware_label": "主板程序", "model": "L50S", "directory_name": "可借用"},
+            {"firmware_label": "腿部程序", "model": "L50S", "directory_name": "别的模块"},
+        ],
+        _model_of_asset=lambda a: str(a.get("model", "")),
+    )
+
+    names = [
+        a["directory_name"] for a in host.borrow_candidates_for("主板程序")
+    ]
+    assert names == ["可借用"]
+    # 新建程序不按类型过滤：列出其他型号的全部程序
+    all_names = [a["directory_name"] for a in host.borrow_candidates_for("")]
+    assert all_names == ["可借用", "别的模块"]
+
+    host.current_selection = SimpleNamespace(model_name="")
+    assert host.borrow_candidates_for("主板程序") == []
+    assert host.asset_model_name({"model": "L50S"}) == "L50S"
+
+
+def test_recycle_page_lists_pending_deletes_and_empty_state(qapp, tmp_path) -> None:
+    """回收站页：空状态 + 只列可还原的删除项（TASK-20260923）。"""
+    import time
+
+    from fwasset.ui_qt.recycle_interface import RecycleInterface
+
+    page = RecycleInterface()
+    page.bind(None, str(tmp_path))
+    page.reload()
+    assert page.rows.count() == 0
+    assert "回收站是空的" in page.caption.text()
+    assert not page.empty_button.isEnabled()
+
+    import fwasset.ui_qt.recycle_interface as module
+
+    now = time.time()
+    records = [
+        {
+            "id": "a",
+            "kind": "undoable_delete",
+            "status": "pending",
+            "original_path": str(tmp_path / "L36" / "通用" / "主板程序" / "量产_默认"),
+            "created_at": now,
+            "expires_at": now + 3600.0,
+        },
+        {
+            "id": "b",
+            "kind": "transactional_retire",
+            "status": "committed",
+            "original_path": str(tmp_path / "旧版"),
+            "created_at": now,
+            "expires_at": 0.0,
+        },
+    ]
+    original = module.list_records
+    module.list_records = lambda _root: records
+    try:
+        page.reload()
+    finally:
+        module.list_records = original
+
+    assert page.rows.count() == 1
+    assert "量产_默认" in page.rows.item(0).text()
+    assert page.empty_button.isEnabled()
+    # 未选中行时逐项操作不可用
+    assert not page.restore_button.isEnabled()

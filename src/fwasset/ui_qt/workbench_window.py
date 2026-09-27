@@ -4,9 +4,11 @@ import importlib
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QItemSelectionModel, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCompleter,
@@ -42,14 +44,28 @@ from qfluentwidgets import (
 
 from fwasset.core.asset_helpers import open_path_in_explorer
 from fwasset.core.logging_utils import FileLogger
+from fwasset.core.quarantine import recover_on_startup, sweep_expired
+from fwasset.core.reference_lookup import enumerate_model_roots
+from fwasset.core.services.layout_update_service import (
+    resume_change_asset_semantics,
+    resume_normalize_module_leaf,
+    resume_restore_retired_version,
+    resume_update_asset,
+)
 from fwasset.core.services.platform_default_service import canonical_module_dir
 from fwasset.core.services.scan_service import (
     build_cached_scan_result,
     build_scan_result,
 )
 from fwasset.core.settings import DEFAULT_ROOT
-from fwasset.core.types import FirmwareAsset, ServiceResult
+from fwasset.core.staging_io import cleanup_staging_area
+from fwasset.core.types import FirmwareAsset, QuarantineRecord, ServiceResult
 from fwasset.core.usb_ops import get_usb_drives
+from fwasset.core.workspace_transaction import (
+    WorkspaceLock,
+    load_workspace_status,
+    recover_interrupted_workspace,
+)
 from fwasset.ui_common.view_models.scan_state_model import ScanStateModel
 from fwasset.ui_common.view_models.scheme_workbench_model import (
     ModuleCardData,
@@ -61,8 +77,6 @@ from fwasset.ui_common.workbench_helpers import (
     flash_mode_label,
     model_chip_values,
     module_label_from_asset,
-    set_default_action_label,
-    set_default_confirm_message,
     shared_conflict_prompt_message,
     shared_register_action_label,
     shared_register_dialog_title,
@@ -71,6 +85,13 @@ from fwasset.ui_common.workbench_helpers import (
     shared_unregister_action_label,
     shared_unregister_confirm_message,
     write_gate_check,
+)
+from fwasset.ui_common.workspace_actions import (
+    borrow_resubmit,
+    recovery_banner_text,
+    resume_function_name,
+    run_startup_recovery,
+    undo_bar_callable,
 )
 from fwasset.ui_qt.data_grid import DataGrid
 from fwasset.ui_qt.design_tokens import (
@@ -86,8 +107,19 @@ from fwasset.ui_qt.design_tokens import (
     SPACE_XXS,
     USB_COMBO_MIN_WIDTH,
 )
+from fwasset.ui_qt.entry_flows import (
+    open_change_vendor,
+    open_create_asset,
+    open_create_model,
+    open_delete_asset,
+    open_retired_versions,
+    open_update_program,
+    present_result,
+)
 from fwasset.ui_qt.log_panel import LogPanel
 from fwasset.ui_qt.operation_panels import get_panel
+from fwasset.ui_qt.recycle_interface import RecycleInterface
+from fwasset.ui_qt.repair_interface import RepairInterface
 from fwasset.ui_qt.settings_interface import SettingsInterface
 
 SEARCH_REFRESH_DEBOUNCE_MS = 180
@@ -124,6 +156,7 @@ class WorkbenchInterface(QWidget):
     # 日志跨线程回投：worker 线程里调用 _log 时不能直写 QPlainTextEdit
     log_message = Signal(str)
     settings_requested = Signal()
+    _recovery_ready = Signal(str, object)
 
     busy_message = "已有任务执行中，请稍后"
     scanning_message = "正在读取程序文件夹，请稍后再执行任务"
@@ -145,6 +178,18 @@ class WorkbenchInterface(QWidget):
         self.active_operation_panel = None
         self._task_seq = 0
         self._pending_task_callbacks: dict[int, object] = {}
+        self._silent_tasks: set[int] = set()
+        self._dialog_epoch = 0
+        self._writes_held = False
+        self._recovery_running = False
+        self._recovered_for = ""
+        self._resume_name: str | None = None
+        self._recovery_message = ""
+        self._undo_token = ""
+        self._undo_started = 0.0
+        self._undo_caller = None
+        self.repair_interface = None
+        self.recycle_interface = None
 
         self._build_layout()
 
@@ -152,6 +197,10 @@ class WorkbenchInterface(QWidget):
         self._task_done.connect(self._on_task_done)
         self._task_failed.connect(self._on_task_failed)
         self.log_message.connect(self._append_log)
+        self._recovery_ready.connect(self._on_recovery_ready)
+        self._undo_timer = QTimer(self)
+        self._undo_timer.setSingleShot(True)
+        self._undo_timer.timeout.connect(self._expire_undo)
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -168,8 +217,14 @@ class WorkbenchInterface(QWidget):
         self._model_switch_timer.setInterval(250)
         self._model_switch_timer.timeout.connect(self._apply_pending_model)
 
-        QTimer.singleShot(100, self._refresh_usb)
-        QTimer.singleShot(100, self._load_cached_assets)
+        self._usb_timer = QTimer(self)
+        self._usb_timer.setSingleShot(True)
+        self._usb_timer.timeout.connect(self._refresh_usb)
+        self._usb_timer.start(100)
+        self._cached_load_timer = QTimer(self)
+        self._cached_load_timer.setSingleShot(True)
+        self._cached_load_timer.timeout.connect(self._load_cached_assets)
+        self._cached_load_timer.start(100)
 
     # ------------------------------------------------------------------ 布局
     def _build_layout(self) -> None:
@@ -214,6 +269,41 @@ class WorkbenchInterface(QWidget):
         )
         self.configuration_notice.setVisible(not bool(self.root_dir.strip()))
         main.addWidget(self.configuration_notice)
+
+        banner_row = QHBoxLayout()
+        self.recovery_banner = CaptionLabel("", self)
+        self.recovery_banner.setWordWrap(True)
+        self.recovery_banner.hide()
+        self.resume_button = PushButton("继续恢复", self)
+        self.resume_button.hide()
+        self.resume_button.clicked.connect(self._continue_recovery)
+        banner_row.addWidget(self.recovery_banner, stretch=1)
+        banner_row.addWidget(self.resume_button)
+        main.addLayout(banner_row)
+
+        self.undo_frame = QFrame(self)
+        undo_row = QHBoxLayout(self.undo_frame)
+        self.undo_label = CaptionLabel("", self.undo_frame)
+        self.undo_button = PushButton("撤销", self.undo_frame)
+        self.undo_button.clicked.connect(self._click_undo)
+        undo_row.addWidget(self.undo_label, stretch=1)
+        undo_row.addWidget(self.undo_button)
+        self.undo_frame.hide()
+        main.addWidget(self.undo_frame)
+
+        entry_row = QHBoxLayout()
+        for label, slot in (
+            ("新增型号", lambda: open_create_model(self)),
+            ("新建程序", lambda: open_create_asset(self)),
+            ("更新程序", lambda: open_update_program(self)),
+            ("备用版本", lambda: open_retired_versions(self)),
+            ("改厂商", lambda: open_change_vendor(self)),
+        ):
+            button = PushButton(label, self)
+            button.clicked.connect(slot)
+            entry_row.addWidget(button)
+        entry_row.addStretch(1)
+        main.addLayout(entry_row)
 
         # 头部：过滤行（型号 chips + 搜索 + U盘）
         filter_row = QHBoxLayout()
@@ -271,7 +361,7 @@ class WorkbenchInterface(QWidget):
         self._file_logger.log(message)
 
     # ------------------------------------------------------------------ 后台任务（PanelHost）
-    def _run_task(self, name: str, fn, on_done=None) -> None:
+    def _run_task(self, name: str, fn, on_done=None, *, silent: bool = False) -> None:
         if self._busy:
             self._log(self.busy_message)
             return
@@ -284,6 +374,8 @@ class WorkbenchInterface(QWidget):
         # 回调只存 UI 侧 map，Signal 不传 callable
         if callable(on_done):
             self._pending_task_callbacks[task_id] = on_done
+        if silent:
+            self._silent_tasks.add(task_id)
 
         def worker():
             try:
@@ -297,6 +389,8 @@ class WorkbenchInterface(QWidget):
     def _on_task_done(self, task_id: int, name: str, result) -> None:
         self._busy = False
         on_done = self._pending_task_callbacks.pop(task_id, None)
+        silent = task_id in self._silent_tasks
+        self._silent_tasks.discard(task_id)
         if callable(on_done):
             try:
                 on_done(result)
@@ -309,7 +403,8 @@ class WorkbenchInterface(QWidget):
             else:
                 msg = str(result.get("message") or "未知错误")
                 self._log(f"{name}失败: {msg}")
-                QMessageBox.warning(self, f"{name}失败", msg)
+                if not silent:
+                    QMessageBox.warning(self, f"{name}失败", msg)
         else:
             self._log(f"{name}完成")
 
@@ -378,8 +473,17 @@ class WorkbenchInterface(QWidget):
 
     def set_configured_root(self, root_dir: str) -> None:
         """更新当前会话的根目录，并同步隐藏配置提示。"""
+        previous = os.path.normcase((self.root_dir or "").strip())
         self.root_dir = root_dir
         self.set_configuration_required(not bool(root_dir.strip()))
+        if self.repair_interface is not None:
+            self.repair_interface.set_workspace(root_dir)
+        if self.recycle_interface is not None:
+            self.recycle_interface.bind(self, root_dir)
+        current = os.path.normcase(root_dir.strip())
+        if current and current != previous:
+            self._recovered_for = ""
+            self._maybe_start_recovery(root_dir)
 
     # ------------------------------------------------------------------ 扫描
     @property
@@ -479,7 +583,7 @@ class WorkbenchInterface(QWidget):
         root_dir = Path(root) if root else Path(".")
         self.workbench_model.bind(None, root_dir, configured_root)
 
-        models = self.workbench_model.load_all_models()
+        models = self._directory_chip_names()
         self._refresh_model_selector(models)
 
         if models:
@@ -519,6 +623,7 @@ class WorkbenchInterface(QWidget):
         chips, _overflow = model_chip_values(
             self._available_models, self.current_selection.model_name
         )
+        self.model_hint.setText("还没有型号" if not self._available_models else "")
         self.model_hint.setVisible(not chips)
         for model in chips:
             btn = TogglePushButton(model, self)
@@ -705,7 +810,15 @@ class WorkbenchInterface(QWidget):
         self._refresh_main_grid()
 
     # ------------------------------------------------------------------ 主表格
-    def _refresh_main_grid(self) -> None:
+    def _refresh_main_grid(self, *, reload_data: bool = False) -> None:
+        """重绘网格。``reload_data`` 为真时先把磁盘真源重新读进缓存。
+
+        写操作只改磁盘与 SQLite，进程缓存不会自己变；不重载就要重启应用
+        才看得到正确结果。
+        """
+        if reload_data:
+            self.workbench_model.reload()
+            self._refresh_sidebar_tree()
         model_name = self.current_selection.model_name
         node_type = self.current_selection.node_type
         search_kw = self.search_edit.text().lower().strip()
@@ -756,8 +869,8 @@ class WorkbenchInterface(QWidget):
             return
 
         if variant.shared_state == "shared_missing":
-            self.selection_summary.setText("共享来源缺失 · 不可烧录")
-            self.ops_placeholder.setText("共享来源缺失，未回落本地副本")
+            self.selection_summary.setText("借用来源缺失 · 不可烧录")
+            self.ops_placeholder.setText("借用来源缺失，未回落本地副本")
             self.ops_placeholder.show()
             return
 
@@ -784,7 +897,7 @@ class WorkbenchInterface(QWidget):
         self.ops_layout.addWidget(panel)
         self.active_operation_panel = panel
 
-    # ------------------------------------------------------------------ 右键菜单（设为「型号」模块默认版本 + 共享登记 B2）
+    # ------------------------------------------------------------------ 右键菜单（共享登记与目录操作）
     def _on_grid_right_click(self, variant: ModuleVariant, global_pos) -> None:
         menu = RoundMenu(parent=self)
 
@@ -792,23 +905,10 @@ class WorkbenchInterface(QWidget):
         model_name = self.current_selection.model_name
         module = module_label_from_asset(asset)
         module_key = canonical_module_dir(module)
-        is_common = (
-            variant.source_kind == "common"
-            and str(asset.get("category", "")) == "common"
+        gate = write_gate_check(
+            DEFAULT_ROOT, self.root_dir, self._shared_write_target(variant)
         )
-        is_default = is_common and self.workbench_model.is_model_module_default(asset)
-        gate = write_gate_check(DEFAULT_ROOT, self.root_dir, asset.get("path", ""))
         write_ok = gate["ok"]
-        if is_common:
-            # 默认状态已在表格的 ★默认 徽章表达，菜单只保留可执行操作。
-            if not is_default and write_ok:
-                action = Action(
-                    FluentIcon.EDIT, set_default_action_label(model_name, module), menu
-                )
-                action.triggered.connect(
-                    lambda _c=False: self._set_default_variant(variant)
-                )
-                menu.addAction(action)
 
         # --- 共享登记（B2）：右键目标型号的模块行 → 登记/取消共享来源 ---
         if module_key:
@@ -816,9 +916,6 @@ class WorkbenchInterface(QWidget):
                 model_name, module_key
             )
 
-            if is_common and not is_default:
-                if write_ok:
-                    menu.addSeparator()
             if shared_res is not None and write_ok:
                 reg_action = Action(
                     FluentIcon.SYNC, shared_replace_action_label(module), menu
@@ -853,14 +950,34 @@ class WorkbenchInterface(QWidget):
         )
         menu.addAction(copy_action)
 
+        # 删除：借用来源行不给——那份程序不属于本型号，要删得去源型号。
+        if (
+            write_ok
+            and variant.shared_state != "shared_hit"
+            and not variant.borrowed_only
+        ):
+            menu.addSeparator()
+            delete_action = Action(FluentIcon.DELETE, "删除", menu)
+            delete_action.triggered.connect(
+                lambda _c=False: open_delete_asset(self, variant.asset)
+            )
+            menu.addAction(delete_action)
+
         menu.exec(global_pos)
 
     def _write_gate(self, target_path: str | Path) -> bool:
         """统一写入门闩（TASK-20260806 R1/R10）。
 
         先叠加「扫描/烧录进行中」两态，再走三检查纯函数；不通过时弹提示并
-        返回 False，调用方必须据此中止写操作。
+        返回 False，调用方必须据此中止写操作。恢复未完成时普通写入保持禁用。
         """
+        if self._writes_held:
+            QMessageBox.warning(
+                self,
+                "无法写入",
+                self._recovery_message or "完成恢复前不能写入。",
+            )
+            return False
         if self.scan_state_model.is_scanning:
             QMessageBox.warning(self, "无法写入", self.scanning_message)
             return False
@@ -873,32 +990,47 @@ class WorkbenchInterface(QWidget):
             return False
         return True
 
-    def _set_default_variant(self, variant: ModuleVariant) -> None:
-        if not self._write_gate(variant.asset.get("path", "")):
-            return
-        asset = variant.asset
-        model_name = self.current_selection.model_name
-        module = module_label_from_asset(asset)
-        shown = variant.name or str(asset.get("directory_name", ""))
-        answer = QMessageBox.question(
-            self,
-            "设为默认版本",
-            set_default_confirm_message(model_name, module, shown),
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        result = self.workbench_model.set_default_variant(
-            model_name, asset, log_fn=self._log
-        )
-        if not result["ok"]:
-            self._log(result["message"])
-            QMessageBox.critical(self, "设置失败", result["message"])
-            return
-        self._refresh_main_grid()
+    def borrow_candidates_for(self, module: str = "") -> list[FirmwareAsset]:
+        """其他型号的程序，供借用选择；``module`` 为空时不按程序类型过滤。
+
+        新建程序的「使用其他型号的程序」列出全部其他型号的程序，程序类型跟随
+        所选源程序；右键登记借用（``_register_shared_source``）按所在行的模块过滤。
+        """
+        target_model = self.current_selection.model_name
+        if not target_model:
+            return []
+        module_key = canonical_module_dir(str(module)) if module else ""
+        candidates: list[FirmwareAsset] = []
+        for a in self.workbench_model._all_assets:
+            try:
+                owner = self.workbench_model._model_of_asset(a)
+            except Exception:  # noqa: BLE001
+                continue
+            if not owner or owner == target_model:
+                continue
+            label = canonical_module_dir(module_label_from_asset(a))
+            if module_key and label != module_key:
+                continue
+            candidates.append(a)
+        return candidates
+
+    def asset_model_name(self, asset: FirmwareAsset) -> str:
+        """按所在型号目录给出型号名；资产自带的 model 来自文件名解析，可能不准。"""
+        try:
+            return str(self.workbench_model._model_of_asset(asset))
+        except Exception:  # noqa: BLE001
+            return ""
 
     # --- 共享登记入口对话框（B2）---
+    def _shared_write_target(self, variant: ModuleVariant) -> str:
+        """借用登记写的是当前型号的型号配置；只借用的行 asset 在源型号，不能拿它过门闩。"""
+        if variant.borrowed_only:
+            root = self.model_root_for(self.current_selection.model_name)
+            return str(root) if root is not None else ""
+        return str(variant.asset.get("path", ""))
+
     def _register_shared_source(self, variant: ModuleVariant) -> None:
-        if not self._write_gate(variant.asset.get("path", "")):
+        if not self._write_gate(self._shared_write_target(variant)):
             return
         target_model = self.current_selection.model_name
         if not target_model:
@@ -906,16 +1038,7 @@ class WorkbenchInterface(QWidget):
             return
         module = module_label_from_asset(variant.asset)
         module_key = canonical_module_dir(module)
-        candidates: list[FirmwareAsset] = []
-        for a in self.workbench_model._all_assets:
-            try:
-                if self.workbench_model._model_of_asset(a) == target_model:
-                    continue
-            except Exception:  # noqa: BLE001
-                continue
-            if canonical_module_dir(str(a.get("firmware_label", ""))) != module_key:
-                continue
-            candidates.append(a)
+        candidates = self.borrow_candidates_for(module)
         self._show_shared_source_picker(target_model, module_key, module, candidates)
 
     def _show_shared_source_picker(
@@ -935,7 +1058,7 @@ class WorkbenchInterface(QWidget):
         layout.setContentsMargins(SPACE_LG, SPACE_LG, SPACE_LG, SPACE_LG)
         layout.setSpacing(SPACE_MD)
 
-        layout.addWidget(SubtitleLabel("选择共享来源", dlg))
+        layout.addWidget(SubtitleLabel("选择借用", dlg))
 
         caption = CaptionLabel(shared_source_picker_caption(module_label), dlg)
         caption.setWordWrap(True)
@@ -948,9 +1071,7 @@ class WorkbenchInterface(QWidget):
         def _fill(items: list[FirmwareAsset]) -> None:
             list_widget.clear()
             if not items:
-                empty_item = QListWidgetItem(
-                    f"其它型号中没有可登记的「{module_label}」来源。"
-                )
+                empty_item = QListWidgetItem("其他型号还没有这个程序类型的程序")
                 empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
                 list_widget.addItem(empty_item)
                 return
@@ -962,52 +1083,13 @@ class WorkbenchInterface(QWidget):
 
         _fill(candidates)
 
-        # --- Phase C：mode 选择器 ---
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("登记模式："))
+        mode_row.addWidget(QLabel("更新方式："))
         mode_combo = QComboBox(dlg)
         mode_combo.addItem("固定版本", userData="static")
-        mode_combo.addItem("自动更新", userData="follow_default")
+        mode_combo.addItem("自动更新", userData="follow_asset")
         mode_row.addWidget(mode_combo, stretch=1)
         layout.addLayout(mode_row)
-
-        # --- Phase C：source_platform 下拉（仅 follow_default 显示）---
-        platform_row = QHBoxLayout()
-        platform_lbl = QLabel("来源平台：")
-        platform_combo = QComboBox(dlg)
-        platform_combo.addItem("（自动检测）", userData="")
-        platform_row.addWidget(platform_lbl)
-        platform_row.addWidget(platform_combo, stretch=1)
-        layout.addLayout(platform_row)
-        # 初始隳藏平台行
-        platform_lbl.setVisible(False)
-        platform_combo.setVisible(False)
-
-        def _refresh_platforms() -> None:
-            row = list_widget.currentRow()
-            platform_combo.blockSignals(True)
-            platform_combo.clear()
-            platform_combo.addItem("（自动检测）", userData="")
-            if row >= 0:
-                asset = candidates[row]
-                names = self.workbench_model.get_source_platforms_for_asset(asset)
-                for n in names:
-                    platform_combo.addItem(n, userData=n)
-            platform_combo.blockSignals(False)
-
-        def _on_mode_changed(_idx: int) -> None:
-            is_follow = mode_combo.currentData() == "follow_default"
-            platform_lbl.setVisible(is_follow)
-            platform_combo.setVisible(is_follow)
-            if is_follow:
-                _refresh_platforms()
-
-        def _on_source_selected() -> None:
-            if mode_combo.currentData() == "follow_default":
-                _refresh_platforms()
-
-        mode_combo.currentIndexChanged.connect(_on_mode_changed)
-        list_widget.currentRowChanged.connect(_on_source_selected)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch(1)
@@ -1027,12 +1109,7 @@ class WorkbenchInterface(QWidget):
             if row < 0:
                 return
             source_asset = candidates[row]
-            chosen_mode = mode_combo.currentData() or "static"
-            chosen_platform = (
-                str(platform_combo.currentData() or "")
-                if chosen_mode == "follow_default"
-                else ""
-            )
+            chosen_mode = str(mode_combo.currentData() or "static")
             dlg.accept()
             self._do_register_shared(
                 target_model,
@@ -1040,7 +1117,6 @@ class WorkbenchInterface(QWidget):
                 module_label,
                 source_asset,
                 chosen_mode,
-                chosen_platform,
             )
 
         confirm_btn.clicked.connect(_confirm)
@@ -1054,65 +1130,82 @@ class WorkbenchInterface(QWidget):
         module_label: str,
         source_asset: FirmwareAsset,
         mode: str = "static",
-        source_platform: str = "",
+        overwrite_token: dict | None = None,
     ) -> None:
-        # 登记写入的是目标型号的 型号配置.toml：目标根也必须通过门闩，
-        # 不能只检查右键选中的资产路径（R10 新增/复制额外检查）。
-        model_root = str(
-            self.workbench_model._model_root_paths.get(target_model, "") or ""
-        )
-        if not self._write_gate(model_root):
+        del module_key
+        model_root = str(self.model_root_for(target_model) or "")
+        if not self._write_gate(model_root or target_model):
             return
-        result = self.workbench_model.register_shared_module(
-            target_model,
-            source_asset,
-            module_key=module_key,
-            overwrite=False,
-            mode=mode,
-            source_platform=source_platform,
-        )
-        if not result["ok"]:
-            if result["code"] == "conflict":
+
+        def run(log):
+            return self.workbench_model.register_borrow(
+                target_model,
+                source_asset,
+                mode=mode,
+                overwrite_token=overwrite_token,
+                log_fn=log,
+            )
+
+        def done(result: dict) -> None:
+            if result.get("code") == "confirmation_required":
                 answer = QMessageBox.question(
                     self,
-                    "已存在共享来源",
-                    shared_conflict_prompt_message(module_label),
+                    "覆盖借用",
+                    str(result.get("message") or shared_conflict_prompt_message(module_label)),
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     return
-                result = self.workbench_model.register_shared_module(
-                    target_model,
-                    source_asset,
-                    module_key=module_key,
-                    overwrite=True,
-                    mode=mode,
-                    source_platform=source_platform,
+                again = borrow_resubmit(
+                    {"mode": mode, "overwrite_token": overwrite_token},
+                    result.get("payload") or {},
                 )
-            if not result["ok"]:
-                QMessageBox.critical(self, "登记失败", result["message"])
+                self._do_register_shared(
+                    target_model,
+                    "",
+                    module_label,
+                    source_asset,
+                    str(again["mode"]),
+                    again["overwrite_token"],
+                )
                 return
-        self._log(result["message"])
-        self._refresh_main_grid()
+            present_result(self, result, "register_borrow")
+            if result.get("ok"):
+                self._refresh_main_grid(reload_data=True)
+
+        self.run_write("登记借用", run, done)
 
     def _unregister_shared(self, variant: ModuleVariant) -> None:
-        if not self._write_gate(variant.asset.get("path", "")):
+        if not self._write_gate(self._shared_write_target(variant)):
             return
         target_model = self.current_selection.model_name
         module = module_label_from_asset(variant.asset)
         module_key = canonical_module_dir(module)
         answer = QMessageBox.question(
             self,
-            "取消共享来源",
+            "解除借用",
             shared_unregister_confirm_message(module),
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        result = self.workbench_model.unregister_shared_module(target_model, module_key)
-        if not result["ok"]:
-            QMessageBox.critical(self, "取消失败", result["message"])
-            return
-        self._log(result["message"])
-        self._refresh_main_grid()
+
+        def run(log):
+            return self.workbench_model.clear_borrow(target_model, module_key, log)
+
+        def done(result: dict) -> None:
+            present_result(self, result, "clear_borrow")
+            token = str((result.get("payload") or {}).get("undo_token") or "")
+            if result.get("code") == "ok" and token:
+                self.show_undo_bar(
+                    "已解除借用",
+                    token,
+                    lambda undo_token, log: self.workbench_model.undo_clear_borrow(
+                        undo_token, log
+                    ),
+                )
+            if result.get("ok"):
+                self._refresh_main_grid(reload_data=True)
+
+        self.run_write("解除借用", run, done)
 
     # ------------------------------------------------------------------ 工具
     def _open_asset_dir(self, variant: ModuleVariant) -> None:
@@ -1123,6 +1216,204 @@ class WorkbenchInterface(QWidget):
             return
         QApplication.clipboard().setText(text)
         self._log(f"已复制: {text}")
+
+    def run_write(self, name: str, fn, on_done) -> None:
+        """后台执行一次写入。晚到的结果若对话框代次已变，则丢弃。"""
+        self._dialog_epoch += 1
+        epoch = self._dialog_epoch
+
+        def wrapped(log):
+            result = fn(log)
+            status = None
+            if self.root_dir:
+                try:
+                    status = load_workspace_status(self.root_dir)
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"读取工作区状态失败: {exc}")
+            return {"epoch": epoch, "result": result, "status": status}
+
+        def done(payload: dict) -> None:
+            if payload.get("epoch") != self._dialog_epoch:
+                return
+            status = payload.get("status")
+            if status is not None and getattr(status, "state", "") == "recovery_required":
+                self.apply_recovery_hold(
+                    recovery_banner_text(getattr(status, "operation", None)),
+                    resume_function_name(getattr(status, "operation", None)),
+                )
+            on_done(payload.get("result") or {})
+
+        self._run_task(name, wrapped, done, silent=True)
+
+    def model_root_for(self, model_name: str) -> Path | None:
+        found = self.workbench_model._model_root_path_for_name(model_name)
+        if found is not None:
+            return found
+        if self.root_dir and model_name:
+            candidate = Path(self.root_dir) / model_name
+            if candidate.is_dir():
+                return candidate
+        return None
+
+    def refresh_model_chips(self, select: str | None = None) -> None:
+        names = self._directory_chip_names()
+        if select and select not in names:
+            self.workbench_model.ensure_model_directory(select)
+            names = [*names, select]
+        self._refresh_model_selector(names)
+        if select:
+            self._on_model_changed(select)
+
+    def _directory_chip_names(self) -> list[str]:
+        root = Path(self.root_dir) if self.root_dir else None
+        if root is None or not root.is_dir():
+            return self.workbench_model.load_all_models()
+        roots = enumerate_model_roots(root)
+        if len(roots) == 1 and roots[0].resolve() == root.resolve():
+            return self.workbench_model.load_all_models()
+        for path in roots:
+            self.workbench_model.ensure_model_directory(path.name)
+        return [path.name for path in roots]
+
+    def show_undo_bar(self, text: str, token: str, caller) -> None:
+        self._undo_token = token
+        self._undo_caller = caller
+        self._undo_started = time.monotonic()
+        self.undo_label.setText(text)
+        self.undo_frame.show()
+        self._undo_timer.start(5000)
+
+    def _expire_undo(self) -> None:
+        self._undo_token = ""
+        self._undo_caller = None
+        self.undo_frame.hide()
+
+    def _click_undo(self) -> None:
+        token = self._undo_token
+        caller = self._undo_caller
+        started = self._undo_started
+        if not token or caller is None:
+            return
+        if not undo_bar_callable(started_at=started, now=time.monotonic()):
+            self._expire_undo()
+            return
+        self._expire_undo()
+
+        def run(log):
+            return caller(token, log)
+
+        def done(result: dict) -> None:
+            present_result(self, result, "undo")
+            if result.get("ok"):
+                self._refresh_main_grid(reload_data=True)
+
+        self.run_write("撤销", run, done)
+
+    def apply_recovery_hold(self, message: str, resume_name: str | None) -> None:
+        self._writes_held = True
+        self._recovery_message = message
+        self._resume_name = resume_name
+        self.recovery_banner.setText(message)
+        self.recovery_banner.show()
+        self.resume_button.setVisible(bool(resume_name))
+
+    def _hide_recovery_banner(self) -> None:
+        self.recovery_banner.hide()
+        self.resume_button.hide()
+        self._recovery_message = ""
+
+    def _hold_writes_until_recovery(self) -> None:
+        """根目录已经可用时，三步恢复完成前禁止普通写入。"""
+        root = (self.root_dir or "").strip()
+        if not root or not Path(root).is_dir():
+            return
+        key = os.path.normcase(root)
+        if self._recovery_running or key == self._recovered_for:
+            return
+        self.apply_recovery_hold("正在检查未完成的写入…", None)
+
+    def _maybe_start_recovery(self, root: str) -> None:
+        key = os.path.normcase((root or "").strip())
+        if not key or not Path(root).is_dir():
+            return
+        if self._recovery_running or key == self._recovered_for:
+            return
+        self._recovery_running = True
+        self._writes_held = True
+        self.apply_recovery_hold("正在检查未完成的写入…", None)
+
+        def sweep(workspace_root: Path) -> list[QuarantineRecord]:
+            # sweep_expired 要求调用方已持锁；与前三步一样自取自放。
+            with WorkspaceLock(workspace_root):
+                return sweep_expired(workspace_root)
+
+        def worker() -> None:
+            try:
+                outcome = run_startup_recovery(
+                    root,
+                    recover_interrupted=recover_interrupted_workspace,
+                    recover_on_startup=recover_on_startup,
+                    cleanup=cleanup_staging_area,
+                    sweep=sweep,
+                )
+                self._recovery_ready.emit(key, outcome)
+            except Exception as exc:  # noqa: BLE001
+                self._recovery_ready.emit(key, exc)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_recovery_ready(self, key: str, outcome: object) -> None:
+        self._recovery_running = False
+        current = os.path.normcase((self.root_dir or "").strip())
+        if key != current:
+            if current:
+                self._maybe_start_recovery(self.root_dir)
+            else:
+                self._writes_held = False
+                self._hide_recovery_banner()
+            return
+        if isinstance(outcome, Exception):
+            self.apply_recovery_hold(f"启动恢复失败: {outcome}", None)
+            self._log(f"启动恢复失败: {outcome}")
+            return
+        self._recovered_for = key
+        self._writes_held = not bool(getattr(outcome, "writes_enabled", False))
+        banner = getattr(outcome, "banner", None)
+        if banner:
+            self.apply_recovery_hold(str(banner), getattr(outcome, "resume_name", None))
+        else:
+            self._resume_name = None
+            self._writes_held = False
+            self._hide_recovery_banner()
+        for path, text in getattr(outcome, "cleanup_errors", []):
+            self._log(f"清理暂存失败 {path}: {text}")
+
+    def _continue_recovery(self) -> None:
+        name = self._resume_name
+        if not name:
+            return
+        answer = QMessageBox.question(self, "继续恢复", "按上次中断的操作继续恢复？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        calls = {
+            "resume_normalize_module_leaf": resume_normalize_module_leaf,
+            "resume_update_asset": resume_update_asset,
+            "resume_change_asset_semantics": resume_change_asset_semantics,
+            "resume_restore_retired_version": resume_restore_retired_version,
+        }
+        fn = calls.get(name)
+        if fn is None:
+            return
+
+        def run(log):
+            return fn(self.root_dir, self.root_dir, log_fn=log)
+
+        def done(result: dict) -> None:
+            present_result(self, result, "resume")
+            self._recovered_for = ""
+            self._maybe_start_recovery(self.root_dir)
+
+        self.run_write("继续恢复", run, done)
 
 
 class QtWorkbenchWindow(FluentWindow):
@@ -1135,17 +1426,30 @@ class QtWorkbenchWindow(FluentWindow):
 
         self.workbench = WorkbenchInterface(self)
         self.settings_interface = SettingsInterface(self)
+        self.repair_interface = RepairInterface(self)
+        self.recycle_interface = RecycleInterface(self)
+        self.workbench.repair_interface = self.repair_interface
+        self.workbench.recycle_interface = self.recycle_interface
         self.workbench.settings_requested.connect(self._open_settings)
         self.settings_interface.configure_requested.connect(self._open_configuration)
 
         self.addSubInterface(self.workbench, FluentIcon.HOME, "程序资产工作台")
+        self.addSubInterface(self.recycle_interface, FluentIcon.DELETE, "回收站")
+        self.addSubInterface(self.repair_interface, FluentIcon.INFO, "软件修复")
         self.addSubInterface(self.settings_interface, FluentIcon.SETTING, "设置")
         self._refresh_settings_interface()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        super().showEvent(event)
+        self.workbench._hold_writes_until_recovery()
+        self.workbench._maybe_start_recovery(self.workbench.root_dir)
 
     def _refresh_settings_interface(self) -> None:
         import fwasset.core.settings as settings
 
         self.settings_interface.set_paths(settings.DEFAULT_ROOT, settings.TOOL_ROOT)
+        self.repair_interface.set_workspace(settings.DEFAULT_ROOT)
+        self.recycle_interface.bind(self.workbench, settings.DEFAULT_ROOT)
         self.workbench.set_configuration_required(
             not bool(settings.DEFAULT_ROOT.strip())
         )
@@ -1165,26 +1469,33 @@ class QtWorkbenchWindow(FluentWindow):
             tool_root=settings.TOOL_ROOT,
             allow_skip=False,
         )
-        if wizard.exec() != QDialog.DialogCode.Accepted:
-            return
 
-        # 留空表示保持原值（方案 A），故用 resolved_* 而非原始输入框内容。
-        next_root = wizard.resolved_root_dir()
-        if previous_root and os.path.normcase(previous_root) != os.path.normcase(
-            next_root
-        ):
+        def confirm_switch() -> bool:
+            next_root = wizard.resolved_root_dir()
+            if not previous_root or os.path.normcase(previous_root) == os.path.normcase(
+                next_root
+            ):
+                return True
             answer = QMessageBox.question(
-                self,
+                wizard,
                 "切换程序文件夹",
                 "将切换到新的程序文件夹并重新读取程序列表。"
                 "当前列表会更新为新位置的内容，是否继续？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
+            return answer == QMessageBox.StandardButton.Yes
 
-        wizard.write_config()
+        wizard.set_before_write(confirm_switch)
+        if wizard.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        written = getattr(wizard, "_config_written", None)
+        if not isinstance(written, dict):
+            written = wizard.write_config()
+        if isinstance(written, dict) and not written.get("ok"):
+            QMessageBox.warning(self, "无法保存配置", str(written.get("message") or ""))
+            return
         root_dir, _tool_root = _reload_runtime_settings()
         self._refresh_settings_interface()
         self.workbench.set_configured_root(root_dir)
@@ -1207,9 +1518,19 @@ def main() -> int:
 
         wizard = SetupWizard()
         if wizard.exec() == QDialog.DialogCode.Accepted:
-            wizard.write_config()
-            _reload_runtime_settings()
-            wizard_completed = True
+            written = getattr(wizard, "_config_written", None)
+            if not isinstance(written, dict):
+                written = wizard.write_config()
+            if isinstance(written, dict) and written.get("ok"):
+                _reload_runtime_settings()
+                wizard_completed = True
+            else:
+                detail = (
+                    str(written.get("message") or "")
+                    if isinstance(written, dict)
+                    else "配置保存失败"
+                )
+                QMessageBox.warning(None, "无法保存配置", detail)
 
     window = QtWorkbenchWindow()
     window.show()

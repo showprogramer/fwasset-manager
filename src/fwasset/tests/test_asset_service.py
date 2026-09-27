@@ -280,7 +280,8 @@ def test_create_asset_index_write_failure_is_ok_with_index_pending(
 # ---------------------------------------------------------------------------
 
 
-def test_create_asset_incomplete_handcontrol_goes_to_candidate(tmp_path: Path) -> None:
+def test_create_asset_stores_handcontrol_rom_without_pkg(tmp_path: Path) -> None:
+    """导入不做内容校验：缺 .pkg 的手控来源直接落在业务目录。"""
     model_root = _make_model(tmp_path)
     src_dir = _source_dir(tmp_path)
     rom_file = _write_rom_only(src_dir)
@@ -298,62 +299,39 @@ def test_create_asset_incomplete_handcontrol_goes_to_candidate(tmp_path: Path) -
     )
 
     assert result["ok"] is True
-    assert result["code"] == "created_incomplete"
+    assert result["code"] == "ok"
     business_path = model_root / "通用" / "手控" / "程序A"
-    assert not business_path.exists()
-
-    candidate_path = Path(result["payload"]["candidate_path"])
-    assert candidate_path.is_dir()
-    data, status, _err = load_asset_info_with_status(candidate_path)
+    assert (business_path / rom_file.name).is_file()
+    candidate_root = managed_root(tmp_path, "incomplete_candidate")
+    if candidate_root.exists():
+        assert [path for path in candidate_root.iterdir() if path.is_dir()] == []
+    data, status, _err = load_asset_info_with_status(business_path)
     assert status == "ok"
     assert data.get("vendor") == "摩众"
-    assert data.get("import_state") == "incomplete"
-    assert data.get("intended_firmware_type") == "handcontrol_ui"
+    assert "import_state" not in data
 
 
-def test_incomplete_candidate_double_blind_zone(tmp_path: Path) -> None:
-    """候选目录不被普通 scanner 发现，但能被 scan_incomplete_imports 发现。"""
-    model_root = _make_model(tmp_path)
-    src_dir = _source_dir(tmp_path)
-    rom_file = _write_rom_only(src_dir)
-
-    result = create_asset(
-        str(tmp_path),
-        str(tmp_path),
-        source=[str(rom_file)],
-        source_kind="files",
-        model_root=model_root,
-        scope="通用",
-        module_name="手控",
-        asset_name="程序A",
-    )
-    assert result["ok"] is True
+def test_legacy_incomplete_directory_warns_and_is_not_an_asset(tmp_path: Path) -> None:
+    """历史候选目录不进资产列表，扫描给出手动处理 warning。"""
+    _make_model(tmp_path)
+    candidate_id = _make_incomplete_candidate(tmp_path, tmp_path)
+    candidate_path = managed_root(tmp_path, "incomplete_candidate") / candidate_id
 
     assets, issues = scan_firmware_assets(str(tmp_path))
-    candidate_path = result["payload"]["candidate_path"]
-    assert not any(a["path"] == candidate_path for a in assets)
-
-    candidates, scan_issues = scan_incomplete_imports(tmp_path)
-    assert len(candidates) == 1
-    assert candidates[0].path == candidate_path
-    assert candidates[0].ready_to_promote is False
+    assert not any(Path(asset["path"]) == candidate_path for asset in assets)
+    warnings = [
+        issue
+        for issue in issues
+        if issue.get("severity") == "warning" and Path(str(issue.get("path"))) == candidate_path
+    ]
+    assert warnings
+    assert "手动" in str(warnings[0]["message"])
 
 
 def test_scan_incomplete_imports_ready_to_promote_after_manual_fix(tmp_path: Path) -> None:
     model_root = _make_model(tmp_path)
-    src_dir = _source_dir(tmp_path)
-    rom_file = _write_rom_only(src_dir)
-    result = create_asset(
-        str(tmp_path),
-        str(tmp_path),
-        source=[str(rom_file)],
-        source_kind="files",
-        model_root=model_root,
-        scope="通用",
-        module_name="手控",
-        asset_name="程序A",
-    )
-    candidate_path = Path(result["payload"]["candidate_path"])
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root)
+    candidate_path = managed_root(tmp_path, "incomplete_candidate") / candidate_id
     (candidate_path / "fw.pkg").write_bytes(b"pkg")
 
     candidates, issues = scan_incomplete_imports(tmp_path)
@@ -443,21 +421,28 @@ def test_incomplete_candidate_not_indexed(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_incomplete_candidate(tmp_path: Path, model_root: Path) -> str:
-    src_dir = _source_dir(tmp_path)
-    rom_file = _write_rom_only(src_dir, f"fw-{len(list(src_dir.iterdir()))}.rom")
-    result = create_asset(
-        str(tmp_path),
-        str(tmp_path),
-        source=[str(rom_file)],
-        source_kind="files",
-        model_root=model_root,
-        scope="通用",
-        module_name="手控",
-        asset_name="程序A",
+def _make_incomplete_candidate(
+    tmp_path: Path, model_root: Path, *, vendor: str = "摩众"
+) -> str:
+    """手工放一份历史候选。新建程序不再产生候选区。"""
+    del model_root
+    from fwasset.core.asset_info import save_candidate_metadata
+
+    root = managed_root(tmp_path, "incomplete_candidate")
+    candidate_id = "cand-rom"
+    candidate_dir = root / candidate_id
+    suffix = 2
+    while candidate_dir.exists():
+        candidate_id = f"cand-rom-{suffix}"
+        candidate_dir = root / candidate_id
+        suffix += 1
+    candidate_dir.mkdir(parents=True)
+    (candidate_dir / "fw.rom").write_bytes(b"rom")
+    status, error = save_candidate_metadata(
+        candidate_dir, vendor=vendor, intended_firmware_type="handcontrol_ui"
     )
-    assert result["ok"] is True
-    return result["payload"]["candidate_id"]
+    assert status == "ok", error
+    return candidate_id
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +481,7 @@ def test_promote_candidate_success_moves_to_business_path(tmp_path: Path) -> Non
     assert result["code"] == "ok"
     asset_path = Path(result["payload"]["asset_path"])
     assert asset_path == model_root / "通用" / "手控" / "手控程序A"
-    assert (asset_path / "fw-0.rom").is_file()
+    assert (asset_path / "fw.rom").is_file()
     assert (asset_path / "fw.pkg").is_file()
     # 候选目录已消失；正式元数据无 import_state（Q1）。
     assert not candidate_path.exists()
@@ -614,10 +599,10 @@ def test_promote_candidate_keyword_type_content_succeeds(tmp_path: Path) -> None
     """ACI-003a 回归：keyword 型内容（mainboard，dir_keywords 按 target 路径段
     匹配）在落点语境判定完整并可提升——候选区路径语境不含任何 keyword，
     会把同一份内容误判为「不完整」。"""
+    from fwasset.core.asset_info import save_candidate_metadata
     from fwasset.core.services.asset_service import promote_candidate
 
     model_root = _make_model(tmp_path)
-    # 主板 .bin（keyword 型）：create 时模块名不含 catalog 关键词 → 进候选区。
     src_dir = _source_dir(tmp_path)
     bin_file = src_dir / "board.bin"
     bin_file.write_bytes(b"bin")
@@ -632,11 +617,17 @@ def test_promote_candidate_keyword_type_content_succeeds(tmp_path: Path) -> None
         asset_name="程序A",
     )
     assert created["ok"] is True
-    assert created["code"] == "created_incomplete"
-    candidate_id = created["payload"]["candidate_id"]
-    candidate_path = Path(created["payload"]["candidate_path"])
+    stored = model_root / "通用" / "自定义模块" / "程序A" / "board.bin"
+    assert stored.is_file()
 
-    # 手工补齐场景（ACI-003b 同场）：元数据仍带 incomplete 键。
+    candidate_id = "board-hist"
+    candidate_path = managed_root(tmp_path, "incomplete_candidate") / candidate_id
+    candidate_path.mkdir(parents=True)
+    (candidate_path / "board.bin").write_bytes(b"bin")
+    status, error = save_candidate_metadata(
+        candidate_path, vendor="摩众", intended_firmware_type=""
+    )
+    assert status == "ok", error
     result = promote_candidate(
         str(tmp_path),
         str(tmp_path),
@@ -709,22 +700,7 @@ def test_promote_candidate_vendor_write_failure_recovery_required(
     from fwasset.core.services.asset_service import promote_candidate
 
     model_root = _make_model(tmp_path)
-    src_dir = _source_dir(tmp_path)
-    rom_file = _write_rom_only(src_dir)
-
-    # 创建 vendor 为空的候选（补齐 .pkg 变完整后提升时才会触发补写）。
-    created = create_asset(
-        str(tmp_path),
-        str(tmp_path),
-        source=[str(rom_file)],
-        source_kind="files",
-        model_root=model_root,
-        scope="通用",
-        module_name="手控",
-        asset_name="程序A",
-    )
-    assert created["ok"] is True
-    candidate_id = created["payload"]["candidate_id"]
+    candidate_id = _make_incomplete_candidate(tmp_path, model_root, vendor="")
 
     pkg_src = _source_dir(tmp_path, "_pkg")
     (pkg_src / "fw.pkg").write_bytes(b"pkg")
@@ -1780,42 +1756,24 @@ def test_create_asset_vendor_write_failure_not_reported_ok(
     assert load_workspace_status(tmp_path).state == "recovery_required"
 
 
-def test_create_candidate_metadata_write_failure_not_reported_ok(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ACI-008 回归：候选元数据写入失败 → 不得返回 created_incomplete。
-
-    元数据是候选 scanner 的识别真源；失败时若报成功，候选目录会成为
-    普通 scanner 不认、候选 scanner 也不认的双盲死角。
-    """
-    from fwasset.core.services import asset_service as svc
-
+def test_create_asset_stores_unknown_suffix(tmp_path: Path) -> None:
+    """未知后缀同样直接入库，不进入候选区。"""
     model_root = _make_model(tmp_path)
     src_dir = _source_dir(tmp_path)
-    rom_file = _write_rom_only(src_dir)
-
-    def _failing_meta(asset_dir, vendor, intended_firmware_type):
-        return ("write_error", "模拟候选元数据写入失败")
-
-    monkeypatch.setattr(svc, "save_candidate_metadata", _failing_meta)
+    odd = src_dir / "notes.zzz"
+    odd.write_bytes(b"x")
     result = create_asset(
         str(tmp_path),
         str(tmp_path),
-        source=[str(rom_file)],
+        source=[str(odd)],
         source_kind="files",
         model_root=model_root,
         scope="通用",
-        module_name="手控",
-        asset_name="程序A",
+        module_name="主板",
+        asset_name="程序B",
     )
-
-    assert result["ok"] is False
-    assert result["code"] == "promote_failed"
-    assert result["payload"]["recovery_required"] is True
-    # 候选目录已落盘（非零产物），工作区保持待恢复现场。
-    candidate_root = managed_root(tmp_path, "incomplete_candidate")
-    assert candidate_root.is_dir()
-    assert load_workspace_status(tmp_path).state == "recovery_required"
+    assert result["ok"] is True
+    assert (model_root / "通用" / "主板" / "程序B" / "notes.zzz").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -1926,13 +1884,7 @@ def test_delete_asset_interrupted_after_quarantine_before_rmdir(
 def test_candidate_promote_zero_product_failure_keeps_workspace_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: Exception
 ) -> None:
-    """候选区提升在 os.replace **之前**失败 → 真零产物，收敛为 clean 且可重试。
-
-    判据与 MSC-014 一致：看内容是否已离开 staging 会话，不是「有没有抛异常」。
-    这里 manifest 计算发生在移动之前，会话仍在原处，必须 commit() 为 clean；
-    同时异常须收束为 ServiceResult，不得裸抛穿透 service 边界
-    （AGENTS.md：不以裸异常代替服务错误码）。
-    """
+    """新建不再走候选区提升。候选区 manifest 钩子损坏也不影响直接入库。"""
     model_root = _make_model(tmp_path)
     src_dir = _source_dir(tmp_path)
     rom_file = _write_rom_only(src_dir)
@@ -1954,9 +1906,8 @@ def test_candidate_promote_zero_product_failure_keeps_workspace_clean(
         vendor="摩众",
     )
 
-    assert result["ok"] is False
-    assert result["code"] == "promote_failed"
-    assert not result.get("payload", {}).get("recovery_required")
+    assert result["ok"] is True, result
+    assert (model_root / "通用" / "手控" / "程序A" / rom_file.name).is_file()
     assert load_workspace_status(tmp_path).state == "clean"
 
     # 可重试：同一工作区随后仍能正常完成一次新增。

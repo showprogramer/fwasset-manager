@@ -68,13 +68,16 @@ class DataGrid(QWidget):
     @staticmethod
     def _variant_text(variant: ModuleVariant, label: str) -> str:
         # Issue 20-A：始终用变体目录名；空名才退回「默认」
-        text = variant.name or "默认"
+        text = variant.name or ("借用" if variant.borrowed_only else "默认")
         if variant.default_badge:
             text = f"{text}  {variant.default_badge}"
         if variant.shared_state == "shared_hit":
             text = f"{text}  {variant.shared_source_label}"
         elif variant.shared_state == "shared_missing":
-            text = f"{text}  共享来源缺失"
+            if variant.shared_reason == "no_source_default":
+                text = f"{text}  源型号未设默认"
+            else:
+                text = f"{text}  借用来源缺失"
         return text
 
     @staticmethod
@@ -165,6 +168,7 @@ class DataGrid(QWidget):
                 shared_source_label=data.shared_source_label,
                 shared_reason=data.shared_reason,
                 effective_asset=data.effective_asset,
+                borrowed_only=data.borrowed_only,
             )
             grouped.setdefault(label, []).append(variant)
 
@@ -218,7 +222,7 @@ class DataGrid(QWidget):
         if variant is None:
             return
         if variant.shared_state == "shared_missing":
-            self._on_log("共享来源缺失，无法打开")
+            self._on_log("借用来源缺失，无法打开")
             return
         asset = variant.effective_asset or variant.asset
         open_path_in_explorer(str(asset.get("path", "")), self._on_log)

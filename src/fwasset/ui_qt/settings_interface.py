@@ -2,15 +2,24 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QResizeEvent
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLineEdit,
+    QListWidget,
+    QMessageBox,
+    QVBoxLayout,
+    QWidget,
+)
 from qfluentwidgets import (
     CaptionLabel,
     FluentIcon,
+    PushButton,
     PushSettingCard,
     SettingCardGroup,
     SubtitleLabel,
 )
 
+from fwasset.core.settings import load_vendor_candidates, save_vendor_candidates
 from fwasset.ui_qt.design_tokens import SETTINGS_CARD_MAX_WIDTH, SPACE_LG, SPACE_MD
 
 _UNSET_TEXT = "未配置"
@@ -72,6 +81,29 @@ class SettingsInterface(QWidget):
             "配置完成后，软件会读取所选程序文件夹并更新程序列表。", self
         )
         layout.addWidget(hint, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        layout.addWidget(SubtitleLabel("厂商名单", self))
+        layout.addWidget(
+            CaptionLabel("删除只影响新建时的候选，不会改写已有程序。", self)
+        )
+        self.vendor_list = QListWidget(self)
+        self.vendor_list.setMaximumWidth(SETTINGS_CARD_MAX_WIDTH)
+        layout.addWidget(self.vendor_list, alignment=Qt.AlignmentFlag.AlignLeft)
+        editor = QHBoxLayout()
+        self.vendor_edit = QLineEdit(self)
+        self.vendor_edit.setPlaceholderText("厂商名称")
+        add_button = PushButton("添加", self)
+        remove_button = PushButton("删除", self)
+        save_button = PushButton("保存名单", self)
+        add_button.clicked.connect(self._add_vendor)
+        remove_button.clicked.connect(self._remove_vendor)
+        save_button.clicked.connect(self._save_vendors)
+        editor.addWidget(self.vendor_edit)
+        editor.addWidget(add_button)
+        editor.addWidget(remove_button)
+        editor.addWidget(save_button)
+        layout.addLayout(editor)
+        self.reload_vendors()
         layout.addStretch(1)
 
     def set_paths(self, root_dir: str, tool_root: str) -> None:
@@ -79,6 +111,7 @@ class SettingsInterface(QWidget):
         self._root_dir = root_dir.strip()
         self._tool_root = tool_root.strip()
         self._elide_paths()
+        self.reload_vendors()
 
     def resizeEvent(self, event: QResizeEvent) -> None:
         """窗口收窄时同步卡片宽度，并按新宽度重新省略路径。"""
@@ -121,3 +154,37 @@ class SettingsInterface(QWidget):
         card.setContent(shown)
         # tooltip 始终是完整路径，截断后仍可查看
         card.setToolTip(value)
+
+    def reload_vendors(self) -> None:
+        """重新读取进程内名单。已打开的新建对话框不会跟着变。"""
+        self.vendor_list.clear()
+        for name in load_vendor_candidates():
+            self.vendor_list.addItem(name)
+
+    def _draft_vendors(self) -> list[str]:
+        names: list[str] = []
+        for index in range(self.vendor_list.count()):
+            item = self.vendor_list.item(index)
+            if item is not None:
+                names.append(item.text())
+        return names
+
+    def _add_vendor(self) -> None:
+        text = self.vendor_edit.text().strip()
+        if not text:
+            return
+        self.vendor_list.addItem(text)
+        self.vendor_edit.clear()
+
+    def _remove_vendor(self) -> None:
+        row = self.vendor_list.currentRow()
+        if row >= 0:
+            self.vendor_list.takeItem(row)
+
+    def _save_vendors(self) -> None:
+        result = save_vendor_candidates(self._draft_vendors())
+        if result["code"] in {"ok", "unchanged"}:
+            QMessageBox.information(self, "厂商名单", result["message"])
+            self.reload_vendors()
+            return
+        QMessageBox.warning(self, "厂商名单", result["message"])

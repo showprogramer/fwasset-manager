@@ -40,6 +40,7 @@ from fwasset.core.import_io import (
     stage_import_directory,
 )
 from fwasset.core.managed_paths import (
+    ASSET_METADATA_FILENAME,
     RETIRED_METADATA_FILENAME,
     RETIRED_VERSIONS_DIRNAME,
     managed_root,
@@ -86,6 +87,7 @@ from fwasset.core.types import (
     ReferenceSemantics,
     RetiredBy,
     RetiredVersionMetadata,
+    RetiredVersionView,
     RetireMode,
     RewriteRequest,
     ServiceResult,
@@ -99,6 +101,7 @@ from fwasset.core.workspace_transaction import (
 __all__ = [
     "RetireBackupError",
     "change_asset_semantics",
+    "list_retired_versions",
     "normalize_module_leaf",
     "restore_retired_version",
     "resume_change_asset_semantics",
@@ -675,15 +678,6 @@ def _run_update(
         cleanup_staging_area(ws, session)
         transaction.commit()  # 产品区零改动
         return _error("incomplete_replacement", f"来源导入失败：{exc}")
-    if not _staging_is_complete_asset(ws, session, target):
-        cleanup_staging_area(ws, session)
-        transaction.commit()
-        return _error(
-            "incomplete_replacement",
-            "来源内容不是完整合法的程序，已取消更新",
-            {"source": str(src)},
-        )
-
     # 步骤 3：提升 replacement 到最终路径，record_product 记录提升时 manifest
     transaction.set_phase("promote_replacement", details={"target": str(target)})
     try:
@@ -703,7 +697,7 @@ def _run_update(
     # 步骤 4：此时 old 与 replacement 同为现存合法资产 → build
     transaction.set_phase("build_plan")
     new_scanned, reason = _scan_single_asset(ws, target)
-    if new_scanned is None:
+    if new_scanned is None and not _directory_has_file(target):
         return _cleanup_product(
             transaction, ws, target, "plan_build_failed", f"新程序校验失败：{reason}"
         )
@@ -729,6 +723,7 @@ def _run_update(
             new_semantics=new_semantics,
         ),
         log_fn,
+        allow_unrecognized_replacement=True,
     )
     if not plan_result["ok"]:
         return _cleanup_product(
@@ -782,6 +777,7 @@ def _run_update(
                         old,
                         target,
                         retired_by="update_asset",
+                        allow_unrecognized_current=True,
                     )
                 )
             }
@@ -820,6 +816,26 @@ def _run_update(
         f"已更新为「{target.name}」",
         {"old": str(old), "replacement": str(target), **retired},
     )
+
+
+def _directory_has_file(target: Path) -> bool:
+    try:
+        return any(path.is_file() for path in target.rglob("*"))
+    except OSError:
+        return False
+
+
+def _directory_has_active_file(target: Path) -> bool:
+    """恢复时排除备用副本，确认当前程序自身仍有文件。"""
+    try:
+        return any(
+            path.is_file()
+            and RETIRED_VERSIONS_DIRNAME not in path.relative_to(target).parts
+            and path.name not in {RETIRED_METADATA_FILENAME, ASSET_METADATA_FILENAME}
+            for path in target.rglob("*")
+        )
+    except OSError:
+        return False
 
 
 def _staging_is_complete_asset(ws: Path, session: Path, target: Path) -> bool:
@@ -1385,6 +1401,7 @@ def _resume_update(
                     old,
                     target,
                     retired_by="update_asset",
+                    allow_unrecognized_current=True,
                 )
             else:
                 register_retire(ws, old)
@@ -1556,6 +1573,7 @@ def retire_asset_to_backup(
     current_asset_path: str | Path,
     *,
     retired_by: RetiredBy,
+    allow_unrecognized_current: bool = False,
 ) -> Path:
     """D4.2 唯一 backup 写入口。返回正式副本目录。须已持写锁且已 begin_product_write。"""
     if not transaction.is_active:
@@ -1580,7 +1598,9 @@ def retire_asset_to_backup(
         raise RetireBackupError(f"旧程序目录不存在：{old}")
     if not current.is_dir():
         raise RetireBackupError(f"当前程序目录不存在：{current}")
-    kind_detail = _validate_target_kind(current, "asset")
+    kind_detail = _validate_target_kind(
+        current, "asset", allow_unrecognized_files=allow_unrecognized_current
+    )
     if kind_detail is not None:
         raise RetireBackupError(f"当前程序不是合法活动资产：{kind_detail}")
     if same_path_identity(old, current) or is_within_boundary(current, old):
@@ -1896,7 +1916,6 @@ def _run_change(
         details={"plan_files": frozen},
     )
 
-    resolved_vendor = _resolve_vendor(vendor, old)
     parent_existed = new_path.parent.is_dir()
     transaction.set_phase("stage_import", details={"source": str(src)})
     transaction.begin_product_write()
@@ -1907,18 +1926,6 @@ def _run_change(
         return _error("incomplete_replacement", f"来源导入失败：{exc}")
     session = Path(staged["session"])
     transaction.set_phase("stage_import", details={"session": str(session), "new_path": str(new_path)})
-
-    if not _staging_is_complete_asset(ws, session, new_path):
-        filenames = [f.name for f in session.iterdir() if f.is_file()]
-        intended = "handcontrol_ui" if _looks_like_handcontrol(filenames) else ""
-        return _promote_incomplete_candidate(
-            transaction,
-            ws,
-            session,
-            vendor=resolved_vendor,
-            intended_firmware_type=intended,
-        )
-
     transaction.set_phase("promote_replacement", details={"target": str(new_path)})
     try:
         promote_import(transaction, ws, str(configured_root or ""), session, new_path)
@@ -1999,6 +2006,7 @@ def _run_change(
                         old,
                         new_path,
                         retired_by="change_asset_semantics",
+                        allow_unrecognized_current=True,
                     )
                 )
             }
@@ -2055,6 +2063,89 @@ def _restore_admission(
             return None
         return _error(exc.code, exc.message, exc.payload)
     return None
+
+
+def list_retired_versions(
+    configured_root: str | Path | None,
+    workspace_root: str | Path,
+    current_path: str | Path,
+) -> ServiceResult:
+    """列出当前程序的备用副本树，标明哪些可由恢复服务直接交换。"""
+    ws = Path(workspace_root).resolve()
+    gate = check_reference_gate(configured_root, workspace_root)
+    if gate is not None:
+        return gate
+    try:
+        current = assert_within_workspace(Path(current_path), ws)
+    except PathGuardError as exc:
+        return _error("out_of_workspace", f"程序不在工作区内：{exc}")
+    if not current.is_dir():
+        return _error("invalid_target", "当前程序目录不存在")
+    if should_exclude_managed_path(current, is_dir=True, workspace_root=ws):
+        return _error("invalid_target", "请选择当前程序目录，而不是受管备用副本")
+    kind_detail = _validate_target_kind(
+        current, "asset", allow_unrecognized_files=True
+    )
+    if kind_detail is not None:
+        return _error("invalid_target", f"当前目录不是程序：{kind_detail}")
+    has_active_file = _directory_has_active_file(current)
+    backup_root = current / RETIRED_VERSIONS_DIRNAME
+    if not backup_root.exists():
+        return _ok("ok", "没有备用副本", {"versions": []})
+    if backup_root.is_symlink() or not backup_root.is_dir():
+        return _error("invalid_target", "旧版本目录不是普通目录")
+    versions: list[RetiredVersionView] = []
+    pending: list[tuple[Path, int]] = [(backup_root, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        try:
+            children = sorted(directory.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            return _error("backup_read_failed", f"读取备用副本失败：{exc}")
+        for backup in children:
+            if not backup.is_dir() or backup.is_symlink():
+                continue
+            nested_root = backup / RETIRED_VERSIONS_DIRNAME
+            if nested_root.is_dir() and not nested_root.is_symlink():
+                pending.append((nested_root, depth + 1))
+            data = _load_retired_toml(backup)
+            identity = _retired_from_identity(data) if data is not None else ""
+            retired_at = str(data.get("retired_at") or "") if data else ""
+            reason = ""
+            if not identity or not data or not str(data.get("content_hash") or ""):
+                reason = "退位信息无效"
+            else:
+                original = Path(identity)
+                if not original.is_absolute():
+                    reason = "原程序路径无效"
+                else:
+                    try:
+                        original = assert_within_workspace(original, ws)
+                    except PathGuardError:
+                        reason = "原程序不在工作区内"
+                    else:
+                        if not has_active_file:
+                            reason = "当前程序没有有效文件"
+                        elif depth:
+                            reason = "先恢复上一层版本"
+                        elif not same_path_identity(original.parent, current.parent):
+                            reason = "跨类型或方案的副本暂不支持直接恢复"
+                        elif same_path_identity(original, current):
+                            reason = "原程序与当前程序路径相同"
+                        elif original.exists() or original.is_symlink():
+                            reason = "原位置已有程序"
+            versions.append(
+                {
+                    "backup_path": str(backup),
+                    "name": backup.name,
+                    "retired_from": identity,
+                    "retired_at": retired_at,
+                    "can_restore": not reason,
+                    "reason": reason,
+                }
+            )
+    versions.sort(key=lambda item: (item["retired_at"], item["name"]), reverse=True)
+    return _ok("ok", f"找到 {len(versions)} 份备用副本", {"versions": versions})
 
 
 def restore_retired_version(
@@ -2151,8 +2242,13 @@ def _run_restore(
         return _error("invalid_target", "无法确定当前程序目录")
     current_asset, reason = _scan_single_asset(ws, current)
     if current_asset is None:
-        transaction.commit()
-        return _error("invalid_target", f"当前程序不是唯一完整资产：{reason}")
+        kind_detail = _validate_target_kind(
+            current, "asset", allow_unrecognized_files=True
+        )
+        if kind_detail is not None or not _directory_has_active_file(current):
+            transaction.commit()
+            detail = kind_detail or reason
+            return _error("invalid_target", f"当前程序不是完整资产：{detail}")
     old_sem = _derive_semantics(current, ws)
     new_sem = _derive_semantics(retired_from, ws)
     if (
@@ -2250,6 +2346,7 @@ def _run_restore(
             new_semantics=new_semantics,
         ),
         log_fn,
+        allow_unrecognized_target=True,
     )
     if not plan_result["ok"]:
         if not _move_back_to_backup(retired_from, backup):
@@ -2657,6 +2754,7 @@ def _resume_change(
                     old,
                     new_path,
                     retired_by="change_asset_semantics",
+                    allow_unrecognized_current=True,
                 )
             else:
                 register_retire(ws, old)

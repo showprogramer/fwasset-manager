@@ -3,9 +3,14 @@
 隔离根本身（``managed_paths.quarantine``、同卷兄弟目录、所有权标记、路径
 守卫）已由 TASK-20260905 / TASK-20260915 交付，本模块只负责**记录层**：
 
-- ``undoable_delete``——D10.1 各删除操作，保留 5 秒撤销窗口；
+- ``undoable_delete``——D10.1 各删除操作，进内置回收站保留
+  :data:`RETENTION_SECONDS`（TASK-20260923：1 小时）；
 - ``transactional_retire``——update / 改类型的旧程序退位，仅供失败补偿，
-  提交成功后立即异步送系统回收站，**不展示撤销**（D10.2）。
+  提交成功后立即清理，**不展示撤销**（D10.2）。
+
+**清理即永久删除（TASK-20260923）**：到期清理、「彻底删除」、「清空回收站」
+三条路径一律 :func:`_purge` 真删，**不送系统回收站**——内置回收站是唯一的
+后悔入口。:func:`_send_to_system_recycle_bin` 保留但删除链路不再调用。
 
 清单持久化在 ``workspace_state`` 受管根，读写沿用 ``workspace_transaction``
 的原子替换（临时文件 + fsync + ``os.replace``）与有界重试模式，不新造
@@ -33,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -62,8 +68,9 @@ from fwasset.core.workspace_transaction import (
 #: 隔离清单文件名（位于 ``workspace_state`` 受管根）。
 _MANIFEST_FILENAME = "quarantine-manifest.json"
 
-#: ``undoable_delete`` 的撤销窗口（父规格 D2.5：保留 5 秒撤销）。
-UNDO_WINDOW_SECONDS: float = 5.0
+#: 内置回收站的保留期（TASK-20260923）。``expires_at`` 由 :func:`time.time`
+#: 取绝对墙钟并落盘，所以软件关闭期间同样计时，不依赖进程存活。
+RETENTION_SECONDS: float = 3600.0
 
 _SHARING_RETRY_BUDGET_SECONDS: float = 2.0
 _SHARING_RETRY_DELAY_SECONDS: float = 0.01
@@ -385,7 +392,7 @@ def register_delete(
         workspace_root,
         source,
         kind="undoable_delete",
-        expires_at=UNDO_WINDOW_SECONDS,
+        expires_at=RETENTION_SECONDS,
         removed_containers=removed_containers,
     )
 
@@ -646,6 +653,65 @@ def _send_to_system_recycle_bin(path: Path) -> None:
         raise OSError(f"送出系统回收站失败（code={result}）：{path}")
 
 
+def _purge(path: Path) -> None:
+    """永久删除隔离内容（TASK-20260923）。
+
+    **不走系统回收站**：内置回收站是唯一的后悔入口，出了它就找不回来。
+    若还送进系统回收站，用户可以从那里还原出一个索引里没有、默认与借用
+    也不匹配的目录，正是本轮要杜绝的。
+    """
+    if not path.exists():
+        return
+    if path.is_dir() and not path_is_reparse_point(path):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def discard_now(
+    workspace_root: str | Path, record_ids: Sequence[str]
+) -> list[QuarantineRecord]:
+    """立即永久删除指定的回收站条目（「彻底删除」/「清空回收站」）。
+
+    与 :func:`sweep_expired` 的区别是不看 ``expires_at``——未到期也清。
+    安全检查完全一致：跨工作区混入或路径越出隔离根的记录一律跳过并原样
+    保留；只处理 ``undoable_delete`` 且 ``pending`` 的记录，其余 id 忽略。
+
+    调用方须已持有工作区写锁（未持锁调用直接拒绝，见模块 docstring）。
+    """
+    _assert_lock_held(workspace_root)
+    wanted = {str(item) for item in record_ids}
+    records = load_quarantine_manifest(workspace_root)
+    processed: list[QuarantineRecord] = []
+    remaining: list[QuarantineRecord] = []
+    for record in records:
+        if (
+            record["id"] not in wanted
+            or record["kind"] != "undoable_delete"
+            or record["status"] != "pending"
+        ):
+            remaining.append(record)
+            continue
+        try:
+            _assert_same_workspace(record, workspace_root)
+            _assert_quarantine_path_owned(
+                record, workspace_root, other_records=tuple(records)
+            )
+        except QuarantineError:
+            # 不属于本工作区或路径被篡改越界：原样保留，不清理。
+            remaining.append(record)
+            continue
+        try:
+            _purge(Path(record["quarantine_path"]))
+            processed.append({**record, "status": "sent"})
+        except OSError:
+            failed: QuarantineRecord = {**record, "status": "send_failed"}
+            processed.append(failed)
+            remaining.append(failed)
+    _save_quarantine_manifest(workspace_root, remaining)
+    return processed
+
+
 def _reconcile_moving_record(record: QuarantineRecord) -> QuarantineRecord | None:
     """收敛崩溃在两阶段登记之间遗留的 ``moving`` 记录。
 
@@ -708,8 +774,8 @@ def sweep_expired(workspace_root: str | Path) -> list[QuarantineRecord]:
             continue
         quarantine_path = Path(record["quarantine_path"])
         try:
-            if quarantine_path.exists():
-                _send_to_system_recycle_bin(quarantine_path)
+            # TASK-20260923：到期即永久删除，不再送系统回收站。
+            _purge(quarantine_path)
             sent: QuarantineRecord = {**record, "status": "sent"}
             processed.append(sent)
         except OSError:

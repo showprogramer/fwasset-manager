@@ -564,7 +564,7 @@ def test_undo_after_window_expired_returns_undo_failed_and_clean(
 ) -> None:
     import fwasset.core.quarantine as quarantine_module
 
-    monkeypatch.setattr(quarantine_module, "UNDO_WINDOW_SECONDS", 0.0)
+    monkeypatch.setattr(quarantine_module, "RETENTION_SECONDS", 0.0)
     _create_model(tmp_path)
     model_root = tmp_path / "L99程序"
     delete_result = delete_model(

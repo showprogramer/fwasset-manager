@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 import fwasset.core.services.layout_update_service as layout_update_service
-from fwasset.core.incomplete_scan import scan_incomplete_imports
 from fwasset.core.managed_paths import (
     ASSET_METADATA_FILENAME as META_NAME,
 )
@@ -292,10 +291,10 @@ def test_change_kind_mismatch_and_normalize_required_are_clean(
     _assert_converged_clean(tmp_path)
 
 
-def test_created_incomplete_keeps_old_and_writes_three_keys(tmp_path: Path) -> None:
+def test_incomplete_change_replaces_source_in_place(tmp_path: Path) -> None:
+    """缺文件的换类型来源直接落到新路径，不再进入候选区。"""
     model = _workspace(tmp_path)
     old = _variant(model)
-    save_platform_config(model, [PlatformDefaults("单3D", {"主板程序": "v1"})])
     source = tmp_path / "外部" / "残缺"
     source.mkdir(parents=True)
     (source / "only.rom").write_bytes(b"rom")
@@ -309,24 +308,18 @@ def test_created_incomplete_keeps_old_and_writes_three_keys(tmp_path: Path) -> N
         retire_mode="retire_to_backup",
         vendor="摩众",
     )
-    assert result["ok"] is True
-    assert result["code"] == "created_incomplete"
-    candidates, _issues = scan_incomplete_imports(tmp_path)
-    assert candidates
-    candidate = Path(result["payload"]["candidate"])
-    data = tomllib.loads((candidate / META_NAME).read_text(encoding="utf-8"))
-    assert data["import_state"] == "incomplete"
-    assert data["vendor"] == "摩众"
-    assert data["intended_firmware_type"] == "handcontrol_ui"
-    assert "change_kind" not in data
-    assert old.exists()
-    assert "主板程序" in load_platform_config(model)[0].defaults
-    assert list((model / "通用" / "主板程序").glob("**/旧版本")) == []
-    assert [r for r in list_records(tmp_path) if r["kind"] == "transactional_retire"] == []
+    assert result["ok"] is True, result
+    assert result["code"] != "created_incomplete"
+    landed = model / "通用" / "手控UI" / "残缺手控"
+    assert (landed / "only.rom").read_bytes() == b"rom"
+    assert not old.exists()
+    incomplete = tmp_path / ".fwasset" / "incomplete"
+    if incomplete.is_dir():
+        assert [path for path in incomplete.iterdir() if path.is_dir()] == []
     _assert_converged_clean(tmp_path)
 
 
-def test_created_incomplete_writes_empty_intended_type_key(tmp_path: Path) -> None:
+def test_unknown_file_change_replaces_source_in_place(tmp_path: Path) -> None:
     model = _workspace(tmp_path)
     old = _variant(model)
     source = tmp_path / "外部" / "未知"
@@ -341,14 +334,11 @@ def test_created_incomplete_writes_empty_intended_type_key(tmp_path: Path) -> No
         "change_type",
         retire_mode="retire_to_trash",
     )
-    assert result["ok"] is True
-    assert result["code"] == "created_incomplete"
-    data = tomllib.loads(
-        (Path(result["payload"]["candidate"]) / META_NAME).read_text(encoding="utf-8")
-    )
-    assert "intended_firmware_type" in data
-    assert data["intended_firmware_type"] == ""
-    assert old.exists()
+    assert result["ok"] is True, result
+    assert result["code"] != "created_incomplete"
+    landed = model / "通用" / "快捷键程序" / "残缺"
+    assert (landed / "notes.txt").read_text(encoding="utf-8") == "x"
+    assert not old.exists()
     _assert_converged_clean(tmp_path)
 
 
@@ -594,24 +584,11 @@ def test_change_resume_checks_defaults_rebuild_result(
 def test_change_resume_candidate_metadata_writes_missing_keys(
     tmp_path: Path,
 ) -> None:
-    """6B-IMP-004：候选已移动但元数据缺失时，续跑补写三键后 clean。"""
-    model = _workspace(tmp_path)
-    old = _variant(model)
-    source = tmp_path / "外部" / "残缺"
-    source.mkdir(parents=True)
-    (source / "only.rom").write_bytes(b"rom")
-    result = change_asset_semantics(
-        str(tmp_path),
-        tmp_path,
-        old,
-        source,
-        model / "通用" / "手控UI" / "残缺手控",
-        "change_type",
-        retire_mode="retire_to_backup",
-        vendor="摩众",
-    )
-    assert result["ok"] is True
-    candidate = Path(result["payload"]["candidate"])
+    """6B-IMP-004：历史中断停在候选元数据阶段时，续跑仍补写三键。"""
+    _workspace(tmp_path)
+    candidate = tmp_path / ".fwasset" / "incomplete" / "deadbeef-only"
+    candidate.mkdir(parents=True)
+    (candidate / "only.rom").write_bytes(b"rom")
 
     # 手工删除元数据文件，模拟「移动后、save 前」崩溃。
     meta = candidate / META_NAME
@@ -637,4 +614,27 @@ def test_change_resume_candidate_metadata_writes_missing_keys(
     assert data["import_state"] == "incomplete"
     assert data["vendor"] == "摩众"
     assert data["intended_firmware_type"] == "handcontrol_ui"
+    _assert_converged_clean(tmp_path)
+
+
+def test_change_type_and_scope_together_lands_in_target_scheme(tmp_path: Path) -> None:
+    """更新程序对话框可同时改类型与范围：服务按 change_type 处理并落到方案（TASK-20260924）。"""
+    model = _workspace(tmp_path)
+    assert create_scheme(str(tmp_path), str(tmp_path), model, "方案A")["ok"]
+    old = _variant(model)
+    save_platform_config(model, [PlatformDefaults("单3D", {"主板程序": "v1"})])
+    new_path = model / "定制" / "方案A" / "快捷键程序" / "新程序"
+    result = change_asset_semantics(
+        str(tmp_path),
+        tmp_path,
+        old,
+        _source(tmp_path, filename="key.hex", payload=b"keys"),
+        new_path,
+        "change_type",
+        retire_mode="retire_to_backup",
+    )
+    assert result["ok"] is True, result
+    assert (new_path / "key.hex").read_bytes() == b"keys"
+    assert not old.exists()
+    assert "主板程序" not in load_platform_config(model)[0].defaults
     _assert_converged_clean(tmp_path)
