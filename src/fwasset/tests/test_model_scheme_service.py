@@ -550,6 +550,7 @@ def test_delete_model_undo_within_window_restores_content(tmp_path: Path) -> Non
     delete_result = delete_model(
         str(tmp_path), str(tmp_path), model_root, confirm_shared=False
     )
+    assert "回收站" in delete_result["message"]
     record_id = delete_result["payload"]["quarantine_record_id"]
 
     undo_result = undo_model_scheme_delete(str(tmp_path), record_id)

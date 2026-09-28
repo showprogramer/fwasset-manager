@@ -28,7 +28,7 @@ def _make_host(widget_cls, root: Path):
         def _log(self, message: str) -> None:
             self.logs.append(message)
 
-        def _refresh_main_grid(self) -> None:
+        def _refresh_main_grid(self, *, reload_data: bool = False) -> None:
             return None
 
         def run_write(self, name: str, fn, on_done) -> None:

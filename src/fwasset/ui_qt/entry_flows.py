@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -34,7 +35,14 @@ from fwasset.core.services.layout_update_service import (
     restore_retired_version,
     update_asset,
 )
-from fwasset.core.services.model_scheme_service import create_model, create_scheme
+from fwasset.core.services.model_scheme_service import (
+    create_model,
+    create_scheme,
+    delete_model,
+    delete_scheme,
+    rename_model,
+    rename_scheme,
+)
 from fwasset.core.services.write_edit_service import (
     register_shared_module,
     update_asset_vendor,
@@ -56,6 +64,7 @@ from fwasset.ui_common.asset_name_prefill import (
 from fwasset.ui_common.workbench_helpers import module_label_from_asset
 from fwasset.ui_common.workspace_actions import (
     ProgramUpdatePlan,
+    direct_scheme_dir_names,
     effect_for_result,
     plan_program_update,
     stage_files_as_named_dir,
@@ -193,6 +202,140 @@ def open_create_model(host: Any) -> None:
 
     buttons[1].clicked.connect(submit)
     dialog.exec()
+
+
+def _selected_model_root(host: Any) -> Path | None:
+    model_name = host.current_selection.model_name
+    model_root = host.model_root_for(model_name) if model_name else None
+    if model_root is None:
+        QMessageBox.information(host, "型号管理", "请先选择型号。")
+    return model_root
+
+
+def _selected_scheme_root(host: Any) -> Path | None:
+    model_root = _selected_model_root(host)
+    if model_root is None:
+        return None
+    names = direct_scheme_dir_names(model_root)
+    if not names:
+        QMessageBox.information(host, "方案管理", "当前型号还没有定制方案。")
+        return None
+    current = host.current_selection.scheme_name
+    if host.current_selection.node_type == "custom_scheme" and current in names:
+        return model_root / "定制" / current
+    name, accepted = QInputDialog.getItem(host, "选择定制方案", "方案", names, 0, False)
+    return model_root / "定制" / name if accepted and name else None
+
+
+def open_rename_model(host: Any) -> None:
+    target = _selected_model_root(host)
+    if target is None or not host._write_gate(target):
+        return
+    name, accepted = QInputDialog.getText(host, "重命名型号", "新名称", text=target.name)
+    new_name = name.strip()
+    if not accepted or not new_name or new_name == target.name:
+        return
+
+    def done(result: dict[str, Any]) -> None:
+        if present_result(host, result, "rename_model") in {"toast", "rescan_hint"}:
+            host.refresh_model_chips(new_name)
+
+    host.run_write(
+        "重命名型号",
+        lambda log: rename_model(host.root_dir, host.root_dir, target, new_name, log_fn=log),
+        done,
+    )
+
+
+def open_create_scheme(host: Any) -> None:
+    model_root = _selected_model_root(host)
+    if model_root is None or not host._write_gate(model_root):
+        return
+    name, accepted = QInputDialog.getText(host, "新建定制方案", "方案名")
+    scheme_name = name.strip()
+    if not accepted or not scheme_name:
+        return
+
+    def done(result: dict[str, Any]) -> None:
+        if present_result(host, result, "create_scheme") in {"toast", "rescan_hint"}:
+            host._refresh_main_grid(reload_data=True)
+
+    host.run_write(
+        "新建方案",
+        lambda log: create_scheme(host.root_dir, host.root_dir, model_root, scheme_name, log_fn=log),
+        done,
+    )
+
+
+def open_rename_scheme(host: Any) -> None:
+    target = _selected_scheme_root(host)
+    if target is None or not host._write_gate(target):
+        return
+    name, accepted = QInputDialog.getText(host, "重命名定制方案", "新名称", text=target.name)
+    new_name = name.strip()
+    if not accepted or not new_name or new_name == target.name:
+        return
+
+    def done(result: dict[str, Any]) -> None:
+        if present_result(host, result, "rename_scheme") in {"toast", "rescan_hint"}:
+            host.current_selection.scheme_name = new_name
+            host._refresh_main_grid(reload_data=True)
+
+    host.run_write(
+        "重命名方案",
+        lambda log: rename_scheme(host.root_dir, host.root_dir, target, new_name, log_fn=log),
+        done,
+    )
+
+
+def _open_delete_container(host: Any, kind: str) -> None:
+    target = _selected_model_root(host) if kind == "model" else _selected_scheme_root(host)
+    if target is None or not host._write_gate(target):
+        return
+    label = "型号" if kind == "model" else "定制方案"
+    answer = QMessageBox.question(
+        host, f"删除{label}",
+        f"确认删除{label}「{target.name}」及其全部内容？\n删除后可在回收站还原。",
+    )
+    if answer != QMessageBox.StandardButton.Yes:
+        return
+    service = delete_model if kind == "model" else delete_scheme
+
+    def run(confirm_shared: bool, log: Any) -> dict[str, Any]:
+        return service(
+            host.root_dir, host.root_dir, target,
+            confirm_shared=confirm_shared, log_fn=log,
+        )
+
+    def done(result: dict[str, Any]) -> None:
+        action = present_result(host, result, f"delete_{kind}")
+        if action == "delete_confirm":
+            hits = list((result.get("payload") or {}).get("hits") or [])
+            owners = "\n".join(f" · {hit.get('owner_root', '未知位置')}" for hit in hits)
+            answer = QMessageBox.question(
+                host, "确认跨型号影响",
+                f"{result.get('message', '')}\n{owners}\n\n继续删除？",
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                host.run_write(f"删除{label}", lambda log: run(True, log), done)
+            return
+        if action in {"toast", "rescan_hint"}:
+            if kind == "model":
+                host.refresh_model_chips()
+            else:
+                host.current_selection.node_type = "all"
+                host.current_selection.scheme_name = ""
+                host._refresh_main_grid(reload_data=True)
+
+    host.run_write(f"删除{label}", lambda log: run(False, log), done)
+
+
+def open_delete_model(host: Any) -> None:
+    _open_delete_container(host, "model")
+
+
+def open_delete_scheme(host: Any) -> None:
+    _open_delete_container(host, "scheme")
 
 
 def open_create_asset(host: Any) -> None:
@@ -535,6 +678,8 @@ def _scheme_creator(host: Any, model_root: Path) -> Any:
 
         def done(result: dict[str, Any]) -> None:
             action = present_result(host, result, "create_scheme")
+            if action in {"toast", "rescan_hint"}:
+                host._refresh_main_grid(reload_data=True)
             finish(action in {"toast", "rescan_hint"})
 
         host.run_write("新建方案", run, done)

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QVBoxLayout,
     QWidget,
@@ -110,7 +111,12 @@ from fwasset.ui_qt.entry_flows import (
     open_change_vendor,
     open_create_asset,
     open_create_model,
+    open_create_scheme,
     open_delete_asset,
+    open_delete_model,
+    open_delete_scheme,
+    open_rename_model,
+    open_rename_scheme,
     open_retired_versions,
     open_update_program,
     present_result,
@@ -303,6 +309,21 @@ class WorkbenchInterface(QWidget):
             entry_row.addWidget(button)
         entry_row.addStretch(1)
         main.addLayout(entry_row)
+
+        manage_row = QHBoxLayout()
+        for label, actions in (
+            ("型号管理", (("重命名当前型号", open_rename_model), ("删除当前型号", open_delete_model))),
+            ("方案管理", (("新建定制方案", open_create_scheme), ("重命名定制方案", open_rename_scheme), ("删除定制方案", open_delete_scheme))),
+        ):
+            button = PushButton(label, self)
+            menu = QMenu(button)
+            for action_label, flow in actions:
+                action = menu.addAction(action_label)
+                action.triggered.connect(lambda _checked=False, fn=flow: fn(self))
+            button.setMenu(menu)
+            manage_row.addWidget(button)
+        manage_row.addStretch(1)
+        main.addLayout(manage_row)
 
         # 头部：过滤行（型号 chips + 搜索 + U盘）
         filter_row = QHBoxLayout()
@@ -1252,13 +1273,23 @@ class WorkbenchInterface(QWidget):
         return None
 
     def refresh_model_chips(self, select: str | None = None) -> None:
+        self.workbench_model.reload()
         names = self._directory_chip_names()
         if select and select not in names:
             self.workbench_model.ensure_model_directory(select)
             names = [*names, select]
         self._refresh_model_selector(names)
-        if select:
-            self._on_model_changed(select)
+        chosen = select if select in names else self.current_selection.model_name
+        if chosen not in names:
+            chosen = names[0] if names else ""
+        if chosen:
+            self._on_model_changed(chosen)
+        else:
+            self.current_selection.model_name = ""
+            self.current_selection.node_type = ""
+            self.grid_panel.populate([])
+            self._refresh_sidebar_tree()
+            self._refresh_main_grid()
 
     def _directory_chip_names(self) -> list[str]:
         root = Path(self.root_dir) if self.root_dir else None

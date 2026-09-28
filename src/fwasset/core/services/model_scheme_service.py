@@ -529,7 +529,7 @@ def _delete_target(
             transaction.commit()
             return _ok(
                 "ok",
-                f"「{target_path.name}」已删除，可在 5 秒内撤销",
+                f"「{target_path.name}」已删除，可在回收站还原",
                 {"quarantine_record_id": record["id"], "original_path": str(target_path)},
             )
     except QuarantineError as exc:

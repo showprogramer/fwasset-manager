@@ -186,7 +186,7 @@ def effect_for_result(result: dict[str, Any], *, entry: str) -> WriteEffect:
     if code == "confirmation_required":
         # 删除的确认是「影响对话框」（跨型号命中 + 备用副本份数），
         # 与借用的覆盖确认不是同一件事，动作名不能共用。
-        if entry == "delete_asset":
+        if entry in {"delete_asset", "delete_model", "delete_scheme"}:
             return WriteEffect("delete_confirm")
         return WriteEffect("overwrite_confirm")
     if code in {"recovery_required"} or (

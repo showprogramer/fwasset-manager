@@ -1,4 +1,4 @@
-"""回收站页。删除的程序在这里保留 1 小时，可还原或永久删除。
+"""回收站页。删除的程序、型号和方案在这里保留 1 小时，可还原或永久删除。
 
 出了这个回收站就找不回来——清理一律真删，不进电脑回收站。
 """
@@ -22,12 +22,13 @@ from qfluentwidgets import CaptionLabel, PushButton, SubtitleLabel
 
 from fwasset.core.quarantine import discard_now, list_records
 from fwasset.core.services.asset_service import undo_asset_delete
+from fwasset.core.services.model_scheme_service import undo_model_scheme_delete
 from fwasset.core.workspace_transaction import WorkspaceLock
 from fwasset.ui_common.workspace_actions import recycle_rows
 from fwasset.ui_qt.design_tokens import SPACE_LG, SPACE_MD
 
 _EMPTY = "回收站是空的"
-_NOTICE = "删除的程序在这里保留 1 小时。出了回收站就永久删除，电脑回收站里也没有。"
+_NOTICE = "删除的程序、型号和方案在这里保留 1 小时。出了回收站就永久删除，电脑回收站里也没有。"
 
 
 class RecycleInterface(QWidget):
@@ -122,14 +123,27 @@ class RecycleInterface(QWidget):
         if row is None or self._host is None:
             return
         root = self._root
+        try:
+            parts = Path(row["original_path"]).relative_to(root).parts
+        except ValueError:
+            parts = ()
+        container = (
+            len(parts) == 1
+            or (len(parts) == 3 and parts[1] == "定制")
+            or (len(parts) == 2 and parts[0] == "定制")
+        )
 
         def run(log: Any) -> dict[str, Any]:
+            if container:
+                return undo_model_scheme_delete(root, row["record_id"], log)
             return undo_asset_delete(root, row["record_id"], log)
 
         def done(result: dict[str, Any]) -> None:
             message = str(result.get("message") or "")
             if result.get("ok"):
                 self._finish(message or f"已还原「{row['name']}」")
+                if len(parts) == 1:
+                    self._host.refresh_model_chips()
                 return
             QMessageBox.warning(self, "无法还原", message)
             self.reload()

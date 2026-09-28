@@ -961,6 +961,13 @@ class SchemeWorkbenchModel:
 
         common_counts: dict[str, int] = {}
         custom_schemes: set[str] = set()
+        model_root = self._model_root_path_for_name(model_name)
+        if model_root is not None:
+            custom_schemes.update(
+                scheme.path.name
+                for scheme in discover_schemes(model_root)
+                if scheme.path.parent == model_root / "定制"
+            )
 
         for a in model_assets:
             cat = str(a.get("category", ""))
