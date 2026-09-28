@@ -1,6 +1,6 @@
 # .codexignore — OpenAI Codex CLI 项目级文件排除清单
 # 语法同 .gitignore；命中后 Codex CLI 不会自动读入上下文。
-# 本文件由 AGENTS.md 「上下文加载纪律」段落背书，请保持与 .claudeignore / .cursorignore 同步。
+# 与 .cursorignore 保持同步（见 docs/agent-workflow.md#本地环境）。
 # ---------- 敏感配置与本地机密 ----------
 config.toml
 .env

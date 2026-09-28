@@ -39,7 +39,12 @@ build/
 !fwasset.spec
 
 # Agent tooling (user-local)
-.claude/
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/codex-review/
 .opencode/
 .codex/
 .qoder/

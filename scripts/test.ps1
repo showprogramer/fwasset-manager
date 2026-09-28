@@ -1,10 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-uv sync --extra dev
+uv run ruff check src scripts
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-.\\.venv\\Scripts\\python.exe -m pytest -q
+uv run mypy
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-.\\.venv\\Scripts\\python.exe scripts\\check_task_sync.py --pre-commit --strict
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& .\\scripts\\quality.ps1
+uv run python -m pytest -q
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
