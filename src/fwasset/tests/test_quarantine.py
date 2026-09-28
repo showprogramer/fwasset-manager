@@ -1313,6 +1313,52 @@ def test_discard_now_purges_before_expiry(tmp_path, monkeypatch) -> None:
     assert Path(keep_record["quarantine_path"]).exists()
 
 
+def test_discard_now_purges_read_only_files(tmp_path) -> None:
+    """厂商固件常带只读属性：彻底删除不能因此失败并留在回收站里。"""
+    import os
+    import stat
+
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    _init_workspace(workspace_root)
+    asset = _make_asset(workspace_root)
+    nested = asset / "旧版本" / "v1"
+    nested.mkdir(parents=True)
+    (nested / "old.bin").write_bytes(b"old")
+    os.chmod(asset / "file.bin", stat.S_IREAD)
+    os.chmod(nested / "old.bin", stat.S_IREAD)
+    record = _locked_register_delete(workspace_root, asset)
+
+    processed = _locked_discard_now(workspace_root, [record["id"]])
+
+    assert [r["status"] for r in processed] == ["sent"]
+    assert not Path(record["quarantine_path"]).exists()
+    assert load_quarantine_manifest(workspace_root) == []
+
+
+def test_sweep_retries_failed_discard(tmp_path, monkeypatch) -> None:
+    """彻底删除失败留下的 send_failed 记录，下次清理必须真的重试。"""
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    _init_workspace(workspace_root)
+    asset = _make_asset(workspace_root)
+    record = _locked_register_delete(workspace_root, asset)
+
+    def _fail(_path: Path) -> None:
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(quarantine_module, "_purge", _fail)
+    processed = _locked_discard_now(workspace_root, [record["id"]])
+    assert [r["status"] for r in processed] == ["send_failed"]
+    monkeypatch.undo()
+
+    retried = _locked_sweep_expired(workspace_root)
+
+    assert [r["status"] for r in retried] == ["sent"]
+    assert not Path(record["quarantine_path"]).exists()
+    assert load_quarantine_manifest(workspace_root) == []
+
+
 def test_discard_now_requires_lock(tmp_path) -> None:
     from fwasset.core.quarantine import discard_now
 

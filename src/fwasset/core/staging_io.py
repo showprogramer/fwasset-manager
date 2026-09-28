@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Literal
 
+from fwasset.core.fs_remove import unlink_force
 from fwasset.core.managed_paths import (
     MANAGED_ROOT_DIRNAME,
     assert_managed_write,
@@ -286,7 +287,7 @@ def _delete_recorded_files(
     for entry in entries:
         file_path = _resolve_plain_path(destination, entry.relpath)
         try:
-            file_path.unlink()
+            unlink_force(file_path)
         except OSError as exc:
             raise ProductCleanupConflict(
                 f"产物文件删除受阻（内容可能已被外部改动），已保留剩余现场："
@@ -376,7 +377,7 @@ def _unlink_staging_files(root: Path) -> None:
             if child.is_dir():
                 stack.append(child)
             else:
-                child.unlink()
+                unlink_force(child)
 
 
 def _rmdir_staging_bottom_up(root: Path) -> None:

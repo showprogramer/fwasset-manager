@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import threading
 import time
 import uuid
@@ -46,6 +45,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from fwasset.core.fs_remove import rmtree_force, unlink_force
 from fwasset.core.managed_paths import assert_managed_write, managed_root
 from fwasset.core.manifest import (
     ManifestError,
@@ -663,9 +663,9 @@ def _purge(path: Path) -> None:
     if not path.exists():
         return
     if path.is_dir() and not path_is_reparse_point(path):
-        shutil.rmtree(path)
+        rmtree_force(path)
     else:
-        path.unlink()
+        unlink_force(path)
 
 
 def discard_now(
@@ -761,13 +761,13 @@ def sweep_expired(workspace_root: str | Path) -> list[QuarantineRecord]:
             # 不属于本工作区或路径被篡改越界：原样保留，不回收、不报告。
             remaining.append(record)
             continue
-        due = (
+        # send_failed 是上次删除失败的残留（已不可还原），每次都重试。
+        due = record["status"] == "send_failed" or (
             record["kind"] == "undoable_delete"
             and record["status"] == "pending"
             and now >= record["expires_at"]
         ) or (
-            record["kind"] == "transactional_retire"
-            and record["status"] in ("committed", "send_failed")
+            record["kind"] == "transactional_retire" and record["status"] == "committed"
         )
         if not due:
             remaining.append(record)

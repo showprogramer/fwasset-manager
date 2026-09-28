@@ -62,6 +62,34 @@ def test_copy_to_usb_replaces_old_rom_pkg(tmp_path: Path):
     assert any("已复制" in msg for msg in logs)
 
 
+def test_usb_copies_replace_read_only_leftovers(tmp_path: Path):
+    """U 盘上上次复制留下的只读固件（copy2 保留属性）也要能替换。"""
+    import os
+    import stat
+
+    drive = tmp_path / "usb"
+    old_dir = drive / "music_A"
+    old_dir.mkdir(parents=True)
+    old_rom = drive / "OLD.ROM"
+    old_rom.write_text("old", encoding="utf-8")
+    (old_dir / "old.mp3").write_text("old", encoding="utf-8")
+    os.chmod(old_rom, stat.S_IREAD)
+    os.chmod(old_dir / "old.mp3", stat.S_IREAD)
+    src = tmp_path / "src"
+    (src / "music_A").mkdir(parents=True)
+    (src / "music_A" / "a.mp3").write_text("new", encoding="utf-8")
+    (src / "NEW.ROM").write_text("rom", encoding="utf-8")
+    (src / "NEW.PKG").write_text("pkg", encoding="utf-8")
+
+    _, log_fn = _logs()
+    assert copy_to_usb(str(src / "NEW.ROM"), str(src / "NEW.PKG"), str(drive), log_fn=log_fn)
+    assert copy_directory_to_usb(str(src / "music_A"), str(drive), log_fn=log_fn)
+
+    assert not old_rom.exists()
+    assert not (old_dir / "old.mp3").exists()
+    assert (old_dir / "a.mp3").exists()
+
+
 def test_copy_to_usb_returns_false_on_error(tmp_path: Path):
     drive = tmp_path / "usb"
     drive.mkdir()

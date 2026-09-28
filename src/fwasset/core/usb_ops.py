@@ -6,6 +6,7 @@ from pathlib import Path
 
 import psutil
 
+from fwasset.core.fs_remove import rmtree_force, unlink_force
 from fwasset.core.managed_paths import should_exclude_managed_path
 
 _PERMISSION_HINTS = [
@@ -56,7 +57,7 @@ def copy_to_usb(
     try:
         for old in drive_root.iterdir():
             if old.suffix.lower() in (".rom", ".pkg"):
-                old.unlink()
+                unlink_force(old)
                 log_fn(f"  移除旧文件: {old.name}")
 
         shutil.copy2(rom_path, drive_root / Path(rom_path).name)
@@ -143,7 +144,7 @@ def copy_directory_to_usb(
     target = root / src.name
     try:
         if target.exists():
-            shutil.rmtree(target)
+            rmtree_force(target)
             log_fn(f"  已移除旧目录: {target.name}")
         shutil.copytree(src, target, ignore=_ignore_managed_entries)
         log_fn(f"  已复制目录: {src.name}")

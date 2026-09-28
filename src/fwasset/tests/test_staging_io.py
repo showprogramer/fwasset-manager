@@ -248,6 +248,21 @@ def test_cleanup_staging_area_removes_tree_and_rejects_outside(tmp_path) -> None
         cleanup_staging_area(tmp_path, tmp_path / "not-staging")
 
 
+def test_cleanup_staging_area_removes_read_only_files(tmp_path) -> None:
+    """copy2 进 staging 的厂商固件保留只读属性，清理不能因此中止。"""
+    import stat
+
+    with WorkspaceTransaction(tmp_path, operation="import_asset") as transaction:
+        area = allocate_staging_area(tmp_path, transaction)
+        _staged_content(area)
+        os.chmod(area / "main.rom", stat.S_IREAD)
+        os.chmod(area / "子" / "extra.pkg", stat.S_IREAD)
+
+        cleanup_staging_area(tmp_path, area)
+
+        assert not area.exists()
+
+
 def test_staging_root_itself_is_rejected_as_session(tmp_path) -> None:
     """staging 根（含所有权标记与其他会话）不得被当作会话目录操作。"""
     with WorkspaceTransaction(tmp_path, operation="import_asset") as transaction:
