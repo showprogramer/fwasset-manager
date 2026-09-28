@@ -154,6 +154,25 @@ def copy_directory_to_usb(
         return False
 
 
+_PS_UTF8_PREFIX = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+
+
+def _run_powershell(script: str, timeout: float) -> subprocess.CompletedProcess[str]:
+    """运行 PowerShell 并按 UTF-8 读回输出。
+
+    默认按系统代码页（GBK）解码时，PowerShell 输出里的字节可能解不开，
+    读取线程会抛 UnicodeDecodeError，stdout/stderr 变成 None、错误原因丢失。
+    """
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-Command", _PS_UTF8_PREFIX + script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+
+
 def eject_usb(drive: str, log_fn: Callable[..., None] = print) -> bool:
     """Safely eject USB using PowerShell."""
     letter = drive.rstrip("\\").rstrip("/")
@@ -164,16 +183,11 @@ $vol.Put()
 (New-Object -ComObject Shell.Application).Namespace(17).ParseName('{letter}').InvokeVerb('Eject')
 """
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        result = _run_powershell(script, timeout=15)
         if result.returncode == 0:
             log_fn(f"  U盘已安全弹出: {drive}")
             return True
-        log_fn(f"  弹出失败（可忽略，手动拔出即可）: {result.stderr.strip()}")
+        log_fn(f"  弹出失败（可忽略，手动拔出即可）: {(result.stderr or '').strip()}")
         return False
     except Exception as e:
         log_fn(f"  弹出异常: {e}")
@@ -199,12 +213,7 @@ def format_usb(drive: str, log_fn: Callable[..., None] = print) -> bool:
     )
     try:
         log_fn(f"  正在格式化 {drive} (FAT32) ...")
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", script],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        result = _run_powershell(script, timeout=120)
         if result.returncode != 0:
             msg = (result.stderr or result.stdout or "Format-Volume 失败").strip()
             log_fn(f"  格式化失败: {msg}")

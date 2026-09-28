@@ -1504,3 +1504,57 @@ def test_recycle_page_lists_pending_deletes_and_empty_state(qapp, tmp_path) -> N
     assert page.empty_button.isEnabled()
     # 未选中行时逐项操作不可用
     assert not page.restore_button.isEnabled()
+
+
+def _bare_workbench():
+    from fwasset.ui_qt.workbench_window import WorkbenchInterface
+
+    w = WorkbenchInterface()
+    for timer in (w._search_timer, w._model_switch_timer, w._cached_load_timer, w._usb_timer):
+        timer.stop()
+    return w
+
+
+def test_usb_combo_shows_selected_drive_not_placeholder(qapp, monkeypatch) -> None:
+    """有 U 盘时显示并能选盘符；拔掉后显示占位文字且取不到盘符。"""
+    import fwasset.ui_qt.workbench_window as module
+    from fwasset.ui_qt.detail_pane import USB_PLACEHOLDER
+
+    w = _bare_workbench()
+    drives = ["E:\\", "F:\\"]
+    monkeypatch.setattr(module, "get_usb_drives", lambda: list(drives))
+
+    w._refresh_usb()
+    assert w.usb_combo.text() == "E:\\"
+    assert w.get_global_usb_drive() == "E:\\"
+    w.usb_combo.setCurrentIndex(1)
+    w._refresh_usb()
+    assert w.usb_combo.text() == "F:\\", "刷新后保留用户选择"
+
+    drives.clear()
+    w._refresh_usb()
+    assert w.usb_combo.text() == USB_PLACEHOLDER
+    assert w.get_global_usb_drive() == ""
+
+    drives.append("G:\\")
+    w._refresh_usb()
+    assert w.usb_combo.text() == "G:\\"
+
+
+def test_usb_task_done_shows_eject_notice(qapp) -> None:
+    w = _bare_workbench()
+    toasts: list[tuple[str, str, str]] = []
+    w._toast = lambda title, content="", *, error=False, level="": toasts.append(  # type: ignore[method-assign]
+        (title, content, level)
+    )
+
+    ok = {"ok": True, "code": "ok", "message": "", "payload": {"ejected": True}}
+    w._on_task_done(1, "复制到 U 盘", ok)
+    failed_eject = {**ok, "payload": {"ejected": False}}
+    w._on_task_done(2, "复制到 U 盘", failed_eject)
+    w._on_task_done(3, "其他任务", {"ok": True, "payload": {}})
+
+    assert toasts[0] == ("已复制到 U 盘", "U 盘已安全弹出，可以拔出", "success")
+    assert toasts[1][2] == "warning"
+    assert toasts[2] == ("其他任务完成", "", "")
+    assert w._usb_timer.isActive(), "弹出后要刷新 U 盘列表"

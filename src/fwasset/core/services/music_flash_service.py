@@ -42,7 +42,12 @@ def run_music_flash(
             "ok": True,
             "code": "ok",
             "message": "音乐版 U 盘准备完成",
-            "payload": {"formatted": formatted, "copied": True, "ejected": ejected},
+            "payload": {
+                "formatted": formatted,
+                "copied": True,
+                "ejected": ejected,
+                "eject_requested": eject_after,
+            },
         }
     except Exception as exc:
         return {

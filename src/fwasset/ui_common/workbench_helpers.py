@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from fwasset.core.path_guard import (
     PathGuardError,
@@ -43,6 +45,20 @@ def relative_time_text(seconds_ago: float) -> str:
     if seconds < 86400:
         return f"{seconds // 3600} 小时前"
     return f"{seconds // 86400} 天前"
+
+
+def usb_copy_notice(payload: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    """U 盘复制成功后的提示：(标题, 内容, 级别 success / warning / info)。
+
+    payload 不含 ``ejected`` 时不是 U 盘任务，返回 ``None``。
+    """
+    if "ejected" not in payload:
+        return None
+    if payload.get("ejected"):
+        return ("已复制到 U 盘", "U 盘已安全弹出，可以拔出", "success")
+    if payload.get("eject_requested", True):
+        return ("文件已复制到 U 盘", "自动弹出失败，请先在任务栏安全弹出再拔出", "warning")
+    return ("已复制到 U 盘", "未自动弹出，拔出前请先安全弹出", "info")
 
 
 def breadcrumb_text(node_type: str, common_type: str = "", scheme_name: str = "") -> str:

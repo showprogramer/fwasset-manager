@@ -24,6 +24,7 @@ def test_run_music_flash_ok(monkeypatch: pytest.MonkeyPatch):
     assert result["payload"]["formatted"] is True
     assert result["payload"]["copied"] is True
     assert result["payload"]["ejected"] is True
+    assert result["payload"]["eject_requested"] is True
 
 
 def test_run_music_flash_format_failed(monkeypatch: pytest.MonkeyPatch):

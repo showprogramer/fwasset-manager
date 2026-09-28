@@ -11,6 +11,7 @@ from fwasset.ui_common.workbench_helpers import (
     shared_source_picker_caption,
     shared_unregister_action_label,
     source_tag,
+    usb_copy_notice,
 )
 
 
@@ -48,3 +49,19 @@ def test_relative_time_and_breadcrumb_texts() -> None:
     assert breadcrumb_text("common_type", common_type="手控UI") == "通用模块 › 手控UI"
     assert breadcrumb_text("custom_scheme", scheme_name="客户A") == "定制方案 › 客户A"
     assert breadcrumb_text("") == ""
+
+
+def test_usb_copy_notice_reports_eject_outcome() -> None:
+    assert usb_copy_notice({"format_ok": True}) is None
+    assert usb_copy_notice({}) is None
+    assert usb_copy_notice({"ejected": True}) == (
+        "已复制到 U 盘",
+        "U 盘已安全弹出，可以拔出",
+        "success",
+    )
+    title, content, level = usb_copy_notice({"ejected": False})  # type: ignore[misc]
+    assert level == "warning" and "手动" not in title and "安全弹出" in content
+    _, content, level = usb_copy_notice(  # type: ignore[misc]
+        {"ejected": False, "eject_requested": False}
+    )
+    assert level == "info" and "未自动弹出" in content

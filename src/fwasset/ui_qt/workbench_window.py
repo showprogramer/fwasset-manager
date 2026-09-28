@@ -88,6 +88,7 @@ from fwasset.ui_common.workbench_helpers import (
     shared_source_picker_caption,
     shared_unregister_action_label,
     shared_unregister_confirm_message,
+    usb_copy_notice,
     write_gate_check,
 )
 from fwasset.ui_common.workspace_actions import (
@@ -143,6 +144,8 @@ from fwasset.ui_qt.theming import bind_qss, pick
 
 SEARCH_REFRESH_DEBOUNCE_MS = 180
 STATUS_REFRESH_MS = 60_000
+#: 弹出后等系统卸载盘符再刷新 U 盘列表。
+USB_REFRESH_AFTER_EJECT_MS = 1500
 CONFIGURATION_NOTICE = "尚未配置程序文件夹，请前往左侧「设置」完成配置。"
 
 
@@ -430,13 +433,21 @@ class WorkbenchInterface(QWidget):
             aniType=FlyoutAnimationType.PULL_UP,
         )
 
-    def _toast(self, title: str, content: str = "", *, error: bool = False) -> None:
+    def _toast(
+        self, title: str, content: str = "", *, error: bool = False, level: str = ""
+    ) -> None:
         """右下角短暂提示；日志常驻位置已移除，操作结果靠它反馈。"""
-        make = InfoBar.error if error else InfoBar.success
+        level = level or ("error" if error else "success")
+        make = {
+            "success": InfoBar.success,
+            "info": InfoBar.info,
+            "warning": InfoBar.warning,
+            "error": InfoBar.error,
+        }[level]
         make(
             title,
             content,
-            duration=4000 if error else 2000,
+            duration=2000 if level == "success" and not content else 6000,
             position=InfoBarPosition.BOTTOM_RIGHT,
             parent=self.window(),
         )
@@ -505,7 +516,13 @@ class WorkbenchInterface(QWidget):
         if isinstance(reported, dict) and "ok" in reported:
             if reported.get("ok"):
                 self._log(f"{name}完成")
-                if not silent:
+                notice = usb_copy_notice(reported.get("payload") or {})
+                if notice is not None:
+                    self._usb_timer.start(USB_REFRESH_AFTER_EJECT_MS)
+                if not silent and notice is not None:
+                    title, content, level = notice
+                    self._toast(title, content, level=level)
+                elif not silent:
                     self._toast(f"{name}完成")
             else:
                 msg = str(reported.get("message") or "未知错误")
@@ -558,14 +575,17 @@ class WorkbenchInterface(QWidget):
 
     # ------------------------------------------------------------------ USB
     def _refresh_usb(self) -> None:
-        drives = get_usb_drives() or [""]
+        # 占位文字只在 DetailPane 里设一次：QFluentWidgets 的 setPlaceholderText
+        # 在选中第 0 项时也会盖掉显示文字，导致有盘也显示「未发现 U 盘」。
+        drives = get_usb_drives()
         current = self.usb_combo.currentText()
         self.usb_combo.clear()
         self.usb_combo.addItems(drives)
         if current in drives:
             self.usb_combo.setCurrentText(current)
-        self.usb_combo.setPlaceholderText("未发现 U 盘")
-        self._log(f"U盘刷新: {', '.join([d for d in drives if d]) or '未发现'}")
+        elif not drives:
+            self.usb_combo.setCurrentIndex(-1)
+        self._log(f"U盘刷新: {', '.join(drives) or '未发现'}")
 
     def get_global_usb_drive(self) -> str:
         return self.usb_combo.currentText()

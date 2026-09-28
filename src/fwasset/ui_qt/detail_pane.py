@@ -49,6 +49,7 @@ from fwasset.ui_qt.design_tokens import (
 from fwasset.ui_qt.theming import bind_qss, pick
 
 _BREAK_AFTER = "_-.·"
+USB_PLACEHOLDER = "未发现 U 盘"
 _ZERO_WIDTH_SPACE = "\u200b"
 
 
@@ -160,6 +161,7 @@ class DetailPane(QFrame):
         usb.setSpacing(SPACE_XS)
         usb.addWidget(CaptionLabel("U 盘", self.usb_row))
         self.usb_combo = ComboBox(self.usb_row)
+        self.usb_combo.setPlaceholderText(USB_PLACEHOLDER)
         usb.addWidget(self.usb_combo, stretch=1)
         self.usb_refresh = TransparentToolButton(FluentIcon.SYNC, self.usb_row)
         self.usb_refresh.setToolTip("刷新 U 盘列表")

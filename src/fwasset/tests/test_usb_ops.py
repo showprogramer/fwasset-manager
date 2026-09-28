@@ -339,3 +339,24 @@ def test_copy_directory_to_usb_keeps_lookalike_names(tmp_path: Path):
     target = drive / src.name
     assert (target / "旧版本说明" / "readme.txt").exists()
     assert (target / "旧版本").is_file()
+
+
+def test_powershell_output_is_read_as_utf8(monkeypatch: pytest.MonkeyPatch):
+    """PowerShell 输出不按 GBK 解码；stderr 为 None 时弹出也不再二次异常。"""
+    calls: list[dict] = []
+
+    def fake_run(args, **kwargs):
+        calls.append({"args": args, **kwargs})
+        return SimpleNamespace(returncode=1, stdout=None, stderr=None)
+
+    monkeypatch.setattr("fwasset.core.usb_ops.subprocess.run", fake_run)
+    logs, log_fn = _logs()
+
+    assert eject_usb("E:\\", log_fn=log_fn) is False
+    assert format_usb("E:\\", log_fn=log_fn) is False
+
+    for call in calls:
+        assert call["encoding"] == "utf-8" and call["errors"] == "replace"
+        assert "OutputEncoding" in call["args"][-1]
+    assert any("弹出失败" in msg for msg in logs)
+    assert not any("弹出异常" in msg for msg in logs)
