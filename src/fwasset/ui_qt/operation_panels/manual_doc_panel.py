@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from PySide6.QtWidgets import QHBoxLayout, QMessageBox
-from qfluentwidgets import BodyLabel, PushButton
+from PySide6.QtWidgets import QMessageBox
+from qfluentwidgets import BodyLabel, FluentIcon, PushButton
 
 from fwasset.ui_qt.operation_panels.base import BaseOperationPanel
 from fwasset.ui_qt.operation_panels.registry import register
-from fwasset.ui_qt.operation_panels.shared_actions import build_handoff_actions
 
 
 @register("manual_doc")
@@ -13,14 +12,12 @@ class ManualDocPanel(BaseOperationPanel):
     """manual_doc 类型操作面板：显示说明提示。"""
 
     def build(self):
-        row = QHBoxLayout()
-        row.addWidget(BodyLabel("该类型需要按说明人工处理。", self))
-        doc_btn = PushButton("查看说明", self)
+        label = BodyLabel("该类型需要按说明人工处理。", self)
+        label.setWordWrap(True)
+        self.body.addWidget(label)
+        doc_btn = PushButton(FluentIcon.DOCUMENT, "查看说明", self)
         doc_btn.clicked.connect(lambda: self._show_manual_doc(self.asset))
-        row.addWidget(doc_btn)
-        row.addStretch(1)
-        self.body.addLayout(row)
-        build_handoff_actions(self, self._panel_host)
+        self.body.addWidget(doc_btn)
 
     def _show_manual_doc(self, asset):
         message = (

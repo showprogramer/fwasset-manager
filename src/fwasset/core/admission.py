@@ -229,7 +229,7 @@ def _assert_no_anchor_conflict(
         return
     raise AdmissionError(
         "path_identity_conflict",
-        "目标路径命中现存借用或默认值锚点"
+        "目标路径命中现存关联或默认值锚点"
         f"（命中 {len(lookup.hits)} 项，阻断级问题 {len(blocking)} 项）",
         {
             "hits": [

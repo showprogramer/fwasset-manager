@@ -889,7 +889,7 @@ def delete_asset(
     if cross_owner_hits and not confirm_shared:
         return _error(
             "confirmation_required",
-            f"存在 {len(cross_owner_hits)} 条跨型号借用命中，需确认后再删除",
+            f"存在 {len(cross_owner_hits)} 条跨型号关联命中，需确认后再删除",
             {
                 "hits": [h.__dict__ for h in cross_owner_hits],
                 "retired_copies": retired_copies,

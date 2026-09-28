@@ -11,26 +11,49 @@ from fwasset.core.path_guard import (
 )
 from fwasset.core.types import FirmwareAsset, ServiceResult
 
-MODEL_CHIP_LIMIT = 4
+
+def source_tag(
+    source_label: str,
+    source_kind: str,
+    shared_state: str = "local",
+    shared_source_label: str = "",
+) -> tuple[str, str]:
+    """表格「归属」列标签：(文案, 语义)。语义为 accent / warning / error。
+
+    关联命中只显示来源型号（「自动更新·L50S」→「来自 L50S」），完整文案作提示。
+    """
+    if shared_state == "shared_hit":
+        source = shared_source_label.rsplit("·", 1)[-1].removeprefix("来自").strip()
+        return (f"来自 {source}" if source else "来自其他型号", "warning")
+    if shared_state == "shared_missing":
+        return ("关联缺失", "error")
+    label = source_label.strip()
+    if label == "通用默认" or (not label and source_kind == "common"):
+        label = "通用"
+    return (label or ("通用" if source_kind == "common" else "定制专属"), "accent")
 
 
-def model_chip_values(
-    models: list[str], selected: str = "", limit: int = MODEL_CHIP_LIMIT
-) -> tuple[list[str], list[str]]:
-    """Split models into visible chips and overflow while keeping selected visible."""
-    clean_models = [model for model in models if model]
-    if len(clean_models) <= limit:
-        return clean_models, []
+def relative_time_text(seconds_ago: float) -> str:
+    """状态栏索引时间：刚刚 / N 分钟前 / N 小时前 / N 天前。"""
+    seconds = max(0, int(seconds_ago))
+    if seconds < 60:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{seconds // 60} 分钟前"
+    if seconds < 86400:
+        return f"{seconds // 3600} 小时前"
+    return f"{seconds // 86400} 天前"
 
-    chips = clean_models[:limit]
-    overflow = clean_models[limit:]
-    if selected and selected in clean_models and selected not in chips:
-        displaced = chips[-1]
-        chips[-1] = selected
-        overflow = [item for item in clean_models if item not in chips]
-        if displaced not in overflow:
-            overflow.insert(0, displaced)
-    return chips, overflow
+
+def breadcrumb_text(node_type: str, common_type: str = "", scheme_name: str = "") -> str:
+    """主区标题的分类部分（型号名另行显示）。"""
+    if node_type == "common_type":
+        return f"通用模块 › {common_type}"
+    if node_type == "custom_scheme":
+        return f"定制方案 › {scheme_name}"
+    if node_type == "all":
+        return "全部程序"
+    return ""
 
 
 def flash_mode_label(mode: str) -> str:
@@ -90,43 +113,43 @@ def set_default_confirm_message(
 def shared_register_action_label(module: str) -> str:
     """右键项：为目标模块登记借用。"""
     mod = (module or "").strip() or "该模块"
-    return f"为「{mod}」登记借用…"
+    return f"为「{mod}」关联其他型号的程序…"
 
 
 def shared_replace_action_label(module: str) -> str:
     """右键项：替换目标模块已经登记的借用。"""
     mod = (module or "").strip() or "该模块"
-    return f"更换「{mod}」的借用…"
+    return f"更换「{mod}」的关联…"
 
 
 def shared_unregister_action_label(module: str) -> str:
     """右键项：解除目标模块的借用。"""
     mod = (module or "").strip() or "该模块"
-    return f"解除「{mod}」的借用"
+    return f"解除「{mod}」的关联"
 
 
 def shared_register_dialog_title(module: str) -> str:
     mod = (module or "").strip() or "该模块"
-    return f"为「{mod}」登记借用"
+    return f"为「{mod}」关联其他型号的程序"
 
 
 def shared_unregister_confirm_message(module: str) -> str:
     mod = (module or "").strip() or "该模块"
     return (
-        f"确认解除「{mod}」的借用？\n\n"
-        "只删除借用记录，不会删除固件文件。"
+        f"确认解除「{mod}」的关联？\n\n"
+        "只删除关联记录，不会删除固件文件。"
     )
 
 
 def shared_conflict_prompt_message(module: str) -> str:
     mod = (module or "").strip() or "该模块"
-    return f"「{mod}」已有借用登记，是否覆盖为新的来源？"
+    return f"「{mod}」已有关联，是否换成新的来源程序？"
 
 
 def shared_source_picker_caption(module: str) -> str:
     """来源选择对话框顶部说明。"""
     mod = (module or "").strip() or "该模块"
-    return f"从其它型号选择一个「{mod}」程序作为借用"
+    return f"从其他型号选择一个「{mod}」程序进行关联"
 
 
 def write_gate_check(

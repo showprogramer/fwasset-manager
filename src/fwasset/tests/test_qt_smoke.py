@@ -1,7 +1,7 @@
 """Qt 工作台 smoke 测试（REVIEW-20260708-pyside6-p1-p2 阻断项 3.2）。
 
 契约级兜底：导入可用、DataGrid 渲染语义（单变体折叠 / 多变体归组 /
-★默认徽章 / 归属文案）、LogPanel 折叠行为。用 offscreen 平台跑，
+★默认徽章 / 归属文案）、运行日志缓冲。用 offscreen 平台跑，
 无显示器也能执行，但仍标 ui（依赖 PySide6，qt extra 未装时自动跳过）。
 """
 
@@ -24,7 +24,7 @@ from fwasset.ui_common.view_models.scheme_workbench_model import (  # noqa: E402
     ModuleVariant,
 )
 from fwasset.ui_qt.data_grid import DataGrid  # noqa: E402
-from fwasset.ui_qt.log_panel import LogPanel  # noqa: E402
+from fwasset.ui_qt.log_panel import ActivityLog, LogView  # noqa: E402
 
 pytestmark = pytest.mark.ui
 
@@ -153,8 +153,8 @@ def test_context_menu_hides_default_status_and_uses_replace_actions(
     visible = [action for action in actions if not action.isSeparator()]
 
     assert [action.text() for action in visible] == [
-        "更换「快捷键程序」的借用…",
-        "解除「快捷键程序」的借用",
+        "更换「快捷键程序」的关联…",
+        "解除「快捷键程序」的关联",
         "打开所在目录",
         "复制目录路径",
         "删除",
@@ -193,8 +193,8 @@ def test_context_menu_borrow_only_row_has_no_default_or_delete(
         )
         texts = [a.text() for a in actions if not a.isSeparator()]
         assert texts == [
-            "更换「快捷键程序」的借用…",
-            "解除「快捷键程序」的借用",
+            "更换「快捷键程序」的关联…",
+            "解除「快捷键程序」的关联",
             "打开所在目录",
             "复制目录路径",
         ]
@@ -215,7 +215,7 @@ def test_context_menu_groups_register_and_directory_actions(
     visible = [action for action in actions if not action.isSeparator()]
 
     assert [action.text() for action in visible] == [
-        "为「快捷键程序」登记借用…",
+        "为「快捷键程序」关联其他型号的程序…",
         "打开所在目录",
         "复制目录路径",
         "删除",
@@ -454,16 +454,18 @@ def test_settings_interface_shows_paths_and_emits_configure_request(qapp) -> Non
 
 def test_workbench_configuration_notice_visibility(qapp) -> None:
     """未配置时指示可见、配置后隐藏；不再有「前往设置」按钮（入口统一由导航承担）。"""
-    from fwasset.ui_qt.workbench_window import WorkbenchInterface
+    from fwasset.ui_qt.workbench_window import CONFIGURATION_NOTICE, WorkbenchInterface
 
     workbench = WorkbenchInterface()
     workbench._search_timer.stop()
     workbench._model_switch_timer.stop()
 
     workbench.set_configuration_required(True)
-    assert workbench.scan_btn.text() == "重新读取程序文件夹"
     assert not workbench.configuration_notice.isHidden()
+    assert workbench.configuration_notice.text() == CONFIGURATION_NOTICE
+    assert workbench.configuration_notice.action.isHidden()
     assert not hasattr(workbench, "open_settings_button")
+    assert not hasattr(workbench, "scan_btn"), "重新读取已迁到软件修复页"
 
     workbench.set_configuration_required(False)
     assert workbench.configuration_notice.isHidden()
@@ -579,16 +581,16 @@ def test_single_variant_collapses_with_directory_name_and_badge(qapp) -> None:
     assert item.childCount() == 0
     assert item.text(0) == "主板程序"
     assert item.text(1) == "主板程序  ★默认"
-    assert item.text(2) == "通用"
-    assert item.text(3) == "V40"
-    assert "回源" not in item.text(2)
-    assert [grid.tree.headerItem().text(i) for i in range(5)] == [
-        "程序类型",
+    assert item.text(2) == "V40"
+    assert item.text(3) == "通用"
+    assert "回源" not in item.text(3)
+    assert [grid.tree.headerItem().text(i) for i in range(4)] == [
+        "类型",
         "程序名称",
-        "程序归属",
         "版本",
-        "程序文件",
+        "归属",
     ]
+    assert grid.variant_count() == 1
 
 
 def test_img_handcontrol_is_rendered_in_common_qt_grid(qapp, tmp_path) -> None:
@@ -623,9 +625,8 @@ def test_img_handcontrol_is_rendered_in_common_qt_grid(qapp, tmp_path) -> None:
     item = grid.tree.topLevelItem(0)
     assert item.text(0) == "手控UI"
     assert item.text(1) == program.name
-    assert item.text(2) == "通用"
-    assert item.text(3) == "V21.07"
-    assert item.text(4) == "d12x_mzkj_v1.0.0.img"
+    assert item.text(2) == "V21.07"
+    assert item.text(3) == "通用"
 
 
 def test_multi_variant_grouped_under_parent_row(qapp) -> None:
@@ -648,6 +649,8 @@ def test_multi_variant_grouped_under_parent_row(qapp) -> None:
     assert parent.isExpanded()
     assert parent.child(0).text(1) == "以色列"
     assert parent.child(1).text(1) == "以色列-塞尔维亚"
+    assert parent.text(1) == "2 个变体"
+    assert grid.variant_count() == 2
 
 
 def test_populate_cards_groups_by_label(qapp) -> None:
@@ -690,52 +693,51 @@ def test_populate_cards_groups_by_label(qapp) -> None:
     assert "★默认" not in parent.child(1).text(1)
 
 
-def test_log_panel_write_and_toggle(qapp) -> None:
-    panel = LogPanel()
-    assert (
-        not panel.log_text.isVisible() or panel.log_text.isHidden() or True
-    )  # offscreen 下可见性弱断言
-    panel.write("第一条日志")
-    panel.write("第二条日志\n")
-    text = panel.log_text.toPlainText()
-    assert "第一条日志" in text and "第二条日志" in text
-    panel.toggle()
-    assert panel.toggle_btn.text() == "折叠日志"
-    panel.toggle()
-    assert panel.toggle_btn.text() == "展开日志"
+def test_activity_log_counts_unread_errors_and_view_marks_read(qapp) -> None:
+    log = ActivityLog()
+    changes: list[bool] = []
+    log.changed.connect(lambda: changes.append(True))
+    log.write("第一条日志")
+    log.write("复制到 U 盘失败: 盘符不存在\n")
+    log.write("")
+    assert log.lines() == ["第一条日志", "复制到 U 盘失败: 盘符不存在"]
+    assert log.unread_errors == 1
+    assert len(changes) == 2
+
+    view = LogView(log)
+    assert "第一条日志" in view.log_text.toPlainText()
+    assert log.unread_errors == 0, "打开日志即视为已读"
+    view.clear_btn.click()
+    assert log.lines() == []
+    assert view.log_text.toPlainText() == ""
 
 
-def _chip_bar_widgets(w):
-    return [
-        w.chip_bar.itemAt(i).widget()
-        for i in range(w.chip_bar.count())
-        if w.chip_bar.itemAt(i).widget() is not None
-    ]
-
-
-def test_model_dropdown_always_present_with_all_models(qapp) -> None:
-    """可搜索型号下拉常驻（型号少时也在），且包含全部型号。"""
-    from qfluentwidgets import EditableComboBox, TogglePushButton
-
+def test_model_dropdown_lists_all_models_and_shows_current(qapp) -> None:
+    """左栏型号下拉常驻，含全部型号并显示当前型号；无型号时给出提示。"""
     from fwasset.ui_qt.workbench_window import WorkbenchInterface
 
     w = WorkbenchInterface()
-
-    # 少量型号：2 chips + 常驻下拉（含全部 2 项）
     w.current_selection.model_name = "L36"
-    w._refresh_model_selector(["L36", "L36双机芯-上3D-下2D"])
-    widgets = _chip_bar_widgets(w)
-    assert len([x for x in widgets if isinstance(x, TogglePushButton)]) == 2
-    combos = [x for x in widgets if isinstance(x, EditableComboBox)]
-    assert len(combos) == 1, "型号下拉应常驻"
-    assert combos[0].count() == 2
-
-    # 多型号：4 chips + 下拉仍含全部 6 项
     w._refresh_model_selector(["L36", "L36双机芯-上3D-下2D", "L50S", "M3", "M5", "M8"])
-    widgets = _chip_bar_widgets(w)
-    assert len([x for x in widgets if isinstance(x, TogglePushButton)]) == 4
-    combos = [x for x in widgets if isinstance(x, EditableComboBox)]
-    assert combos[0].count() == 6
+    assert w.model_combo.count() == 6
+    assert w.model_combo.text() == "L36"
+    assert w.model_hint.isHidden()
+
+    w.current_selection.model_name = ""
+    w._refresh_model_selector([])
+    assert w.model_combo.count() == 0
+    assert not w.model_hint.isHidden()
+
+
+def test_model_combo_restores_current_after_abandoned_typing(qapp) -> None:
+    from fwasset.ui_qt.workbench_window import WorkbenchInterface
+
+    w = WorkbenchInterface()
+    w.current_selection.model_name = "L36"
+    w._refresh_model_selector(["L36", "M8"])
+    w.model_combo.setText("L5")
+    w._sync_model_combo_text()
+    assert w.model_combo.text() == "L36"
 
 
 def test_model_switch_is_debounced_and_prefix_safe(
@@ -860,7 +862,7 @@ def test_click_filtered_scheme_reselects_its_new_row_after_sidebar_rebuild(
     assert w.nav.currentRow() == target_row
     assert selected_rows == {target_row}
     assert w.nav.delegate.selectedRows == {target_row}
-    assert w.nav.currentItem().text() == "◆ 马来西亚"
+    assert w.nav.currentItem().text() == "马来西亚"
 
 
 # ---------------------------------------------------------------------------
@@ -889,9 +891,6 @@ class _FakeHost:
 
     def _copy_primary_file_path(self):
         self.calls.append(("copy_file",))
-
-    def _launch_tool_and_open_asset_dir(self):
-        self.calls.append(("tool_combo",))
 
     def get_global_usb_drive(self) -> str:
         return self.drive
@@ -933,7 +932,7 @@ def test_auto_usb_panel_paired_files_shows_copy_button(qapp) -> None:
     panel.build()
     buttons = panel.findChildren(PrimaryPushButton)
     texts = {b.text() for b in buttons}
-    assert "复制到 U 盘" in texts
+    assert "格式化并复制到 U 盘" in texts
     assert "一键烧录" not in texts
 
 
@@ -949,7 +948,7 @@ def test_auto_usb_panel_img_txt_uses_same_copy_button(qapp) -> None:
     )
     panel.build()
     buttons = panel.findChildren(PrimaryPushButton)
-    assert {b.text() for b in buttons} == {"复制到 U 盘"}
+    assert {b.text() for b in buttons} == {"格式化并复制到 U 盘"}
 
 
 def test_auto_usb_panel_missing_pkg_shows_warning(qapp) -> None:
@@ -981,8 +980,9 @@ def test_auto_usb_panel_directory_copy_has_options(qapp) -> None:
     assert checks == {"格式化": True, "完成后弹出": True}
 
 
-def test_tool_launch_panel_without_tool_disables_button(qapp) -> None:
-    from qfluentwidgets import PrimaryPushButton
+def test_tool_launch_panel_without_tool_shows_nothing(qapp) -> None:
+    """找不到工具时不给按钮、不给路径提示（是否保留打开工具待定）。"""
+    from PySide6.QtWidgets import QWidget
 
     from fwasset.ui_qt.operation_panels import get_panel
 
@@ -992,27 +992,119 @@ def test_tool_launch_panel_without_tool_disables_button(qapp) -> None:
         panel_host=_FakeHost(),
     )
     panel.build()
-    launch = [
-        b for b in panel.findChildren(PrimaryPushButton) if b.text() == "打开烧录工具"
-    ]
-    assert launch and not launch[0].isEnabled()
+    assert panel.findChildren(QWidget) == []
 
 
-def test_disabled_and_manual_panels_have_handoff_actions(qapp) -> None:
-    from qfluentwidgets import PushButton
+def test_tool_launch_panel_with_tool_offers_launch(qapp, monkeypatch) -> None:
+    from qfluentwidgets import PrimaryPushButton
 
-    from fwasset.ui_qt.operation_panels import get_panel
+    from fwasset.ui_qt.operation_panels import get_panel, tool_launch_panel
 
-    host = _FakeHost()
-    for mode in ("disabled", "manual_doc"):
-        panel = get_panel(mode)(
-            asset=_op_asset(flash_mode=mode), log_fn=lambda _m: None, panel_host=host
-        )
-        panel.build()
-        texts = {b.text() for b in panel.findChildren(PushButton)}
-        assert {"打开程序目录", "复制目录路径", "复制主文件路径"} <= texts, (
-            f"{mode} 缺交接按钮"
-        )
+    monkeypatch.setattr(
+        tool_launch_panel, "discover_tool_path", lambda *_a, **_k: "D:/tools/a.exe"
+    )
+    panel = get_panel("tool_launch")(
+        asset=_op_asset(firmware_type="不存在的类型", flash_mode="tool_launch"),
+        log_fn=lambda _m: None,
+        panel_host=_FakeHost(),
+    )
+    panel.build()
+    texts = [b.text() for b in panel.findChildren(PrimaryPushButton)]
+    assert texts == ["打开烧录工具"]
+
+
+def test_detail_pane_shows_properties_and_hides_write_actions(qapp) -> None:
+    """详情：属性、U 盘行只在 auto_usb；借用行不能删、不能改厂商。"""
+    from fwasset.ui_qt.detail_pane import DetailPane
+
+    pane = DetailPane()
+    assert pane.content.isHidden() and not pane.empty.isHidden()
+
+    local = ModuleVariant(
+        asset={**_op_asset(), "vendor": "YJ"},
+        name="YJ_d12x",
+        version="V21.07",
+        source_kind="common",
+        source_label="通用",
+    )
+    mode = pane.show_variant(local, can_write=True, can_delete=True)
+    assert mode == "auto_usb"
+    assert pane.name_label.text().replace("\u200b", "") == "YJ_d12x"
+    assert pane.vendor_value.text() == "YJ"
+    assert pane.files_value.text().replace("\u200b", "") == "a.rom\na.pkg"
+    assert pane.files_value.toolTip() == "a.rom\na.pkg"
+    assert pane.source_tag.text() == "通用"
+    assert not pane.usb_row.isHidden()
+    assert not pane.delete_btn.isHidden() and not pane.vendor_edit.isHidden()
+
+    borrowed = ModuleVariant(
+        asset=_op_asset(flash_mode="tool_launch"),
+        name="源程序",
+        version="V1",
+        source_kind="common",
+        source_label="通用",
+        shared_state="shared_hit",
+        shared_source_label="自动更新·L50S",
+        borrowed_only=True,
+    )
+    mode = pane.show_variant(borrowed, can_write=True, can_delete=False)
+    assert mode == "tool_launch"
+    assert pane.source_tag.text() == "来自 L50S"
+    assert pane.usb_row.isHidden()
+    assert pane.delete_btn.isHidden() and pane.vendor_edit.isHidden()
+
+    missing = ModuleVariant(
+        asset=_op_asset(),
+        name="",
+        version="",
+        source_kind="common",
+        source_label="通用",
+        shared_state="shared_missing",
+    )
+    assert pane.show_variant(missing, can_write=True, can_delete=False) == ""
+    assert not pane.notice.isHidden()
+    assert not pane.open_dir_btn.isEnabled()
+
+    pane.show_empty()
+    assert pane.content.isHidden() and pane.footer.isHidden()
+
+
+def test_selection_drives_commands_and_detail(qapp, monkeypatch) -> None:
+    from fwasset.ui_qt import workbench_window as window_module
+
+    monkeypatch.setattr(
+        window_module, "write_gate_check", lambda *_a, **_k: _fake_gate(True)
+    )
+    w = window_module.WorkbenchInterface()
+    w.current_selection.model_name = "L36"
+    assert not w.update_btn.isEnabled() and not w.retired_btn.isEnabled()
+    assert not hasattr(w, "more_btn"), "选中项操作只在详情底部与右键菜单"
+
+    variant = ModuleVariant(
+        asset=_op_asset(),
+        name="A",
+        version="V1.0",
+        source_kind="common",
+        source_label="通用",
+    )
+    w._on_grid_selection_changed(variant)
+    assert w.update_btn.isEnabled() and w.retired_btn.isEnabled()
+    assert w.active_operation_panel is not None
+    assert w.detail.name_label.text() == "A"
+    w._on_grid_selection_changed(None)
+    assert not w.update_btn.isEnabled()
+    assert w.active_operation_panel is None
+    assert not w.detail.empty.isHidden()
+
+
+def test_break_long_name_allows_wrapping_at_separators() -> None:
+    from fwasset.ui_qt.detail_pane import break_long_name
+
+    name = "YJ_3DMain_Foot_16_MA82G5C64_V40-221223-32023.0710.bin"
+    broken = break_long_name(name)
+    assert broken.replace("\u200b", "") == name
+    assert broken.count("\u200b") == name.count("_") + name.count("-") + name.count(".")
+    assert break_long_name("手控UI") == "手控UI"
 
 
 def test_run_task_busy_guard_and_completion(qapp) -> None:
@@ -1055,7 +1147,7 @@ def test_wrapped_write_failure_is_not_logged_as_complete(qapp) -> None:
     w._silent_tasks.add(7)
     w._on_task_done(
         7,
-        "登记借用",
+        "关联程序",
         {
             "epoch": 1,
             "result": {
@@ -1068,9 +1160,9 @@ def test_wrapped_write_failure_is_not_logged_as_complete(qapp) -> None:
         },
     )
 
-    assert any("登记借用失败" in message for message in logs)
+    assert any("关联程序失败" in message for message in logs)
     assert any("来源型号必须已配置 id" in message for message in logs)
-    assert not any(message == "登记借用完成" for message in logs)
+    assert not any(message == "关联程序完成" for message in logs)
 
 
 def test_shared_badges_render_on_existing_variant_row() -> None:
@@ -1080,9 +1172,14 @@ def test_shared_badges_render_on_existing_variant_row() -> None:
     missing = _variant("快捷键", kind="common")
     missing.shared_state = "shared_missing"
 
-    assert DataGrid._variant_text(hit, "快捷键程序").endswith("L36")
-    assert "共享自" not in DataGrid._variant_text(hit, "快捷键程序")
-    assert "借用来源缺失" in DataGrid._variant_text(missing, "快捷键程序")
+    # 借用来源画在归属标签，不再拼进名称列
+    assert DataGrid._variant_text(hit, "快捷键程序") == "快捷键"
+    grid = DataGrid(lambda _m: None)
+    grid.populate_tree(
+        [ModuleRow(label="快捷键程序", source_kind="common", source_label="通用", variants=[hit])]
+    )
+    assert grid.tree.topLevelItem(0).text(3) == "来自 L36"
+    assert "关联来源缺失" in DataGrid._variant_text(missing, "快捷键程序")
 
 
 def test_present_result_keeps_resume_for_recovery_required(qapp) -> None:
@@ -1107,7 +1204,8 @@ def test_present_result_keeps_resume_for_recovery_required(qapp) -> None:
         "update_asset",
     )
     assert workbench._resume_name == "resume_update_asset"
-    assert workbench.resume_button.isHidden() is False
+    assert workbench.recovery_banner.action.isHidden() is False
+    assert workbench.recovery_banner.action.text() == "继续恢复"
 
 
 def test_failed_cache_scan_holds_writes_and_starts_recovery(

@@ -491,7 +491,7 @@ def build_rewrite_plan(
             ):
                 return _error_result(
                     "invalid_operation",
-                    "replacement 与固定借用锚点重叠，会造成固定借用静默指向新程序",
+                    "replacement 与固定关联锚点重叠，会造成固定关联静默指向新程序",
                     payload={"anchor": hit.current_target},
                 )
 
@@ -517,7 +517,7 @@ def build_rewrite_plan(
             ):
                 return _error_result(
                     "invalid_request",
-                    "存在无法归位到新路径的借用引用，已阻止改写",
+                    "存在无法归位到新路径的关联记录，已阻止改写",
                     payload={
                         "raw_key": hit.raw_key,
                         "source_relative_path": hit.source_relative_path,
@@ -1274,7 +1274,7 @@ def migrate_follow_default_refs(
             _merge_write_model_config(entry.root, _mut)
             changed.append(root_str)
             converted += len(migrations)
-            log_fn(f"已迁移 {len(migrations)} 条借用（{root_str}）")
+            log_fn(f"已迁移 {len(migrations)} 条关联（{root_str}）")
         except Exception as exc:  # noqa: BLE001
             failed.append(
                 {"path": str(entry.root / MODEL_CONFIG_FILENAME), "reason": str(exc)}

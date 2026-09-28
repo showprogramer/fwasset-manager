@@ -1,19 +1,94 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QMenu, QTreeWidgetItem, QVBoxLayout, QWidget
-from qfluentwidgets import TreeWidget
+from PySide6.QtCore import QModelIndex, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QFontMetrics, QPainter
+from PySide6.QtWidgets import (
+    QMenu,
+    QStyleOptionViewItem,
+    QTreeWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+from qfluentwidgets import (
+    TreeItemDelegate,
+    TreeWidget,
+    getFont,
+    isDarkTheme,
+    themeColor,
+)
 
-from fwasset.core.asset_helpers import asset_primary_file_name, open_path_in_explorer
+from fwasset.core.asset_helpers import open_path_in_explorer
 from fwasset.ui_common.view_models.scheme_workbench_model import (
     ModuleCardData,
     ModuleRow,
     ModuleVariant,
 )
-from fwasset.ui_qt.design_tokens import GRID_BORDER_RADIUS, GRID_COL_WIDTHS
+from fwasset.ui_common.workbench_helpers import source_tag
+from fwasset.ui_qt.design_tokens import (
+    GRID_BORDER_RADIUS,
+    GRID_COL_WIDTHS,
+    GRID_ROW_HEIGHT,
+    STATUS_COLORS,
+    TAG_RADIUS,
+)
 
 _VARIANT_ROLE = Qt.ItemDataRole.UserRole
+_TAG_KIND_ROLE = Qt.ItemDataRole.UserRole + 1
+TAG_COLUMN = 3
+COLUMNS = ["类型", "程序名称", "版本", "归属"]
+
+
+def tag_colors(kind: str) -> tuple[QColor, QColor]:
+    """标签 (底色, 文字色)：accent 跟随主题色，其余取状态色。"""
+    if kind == "accent":
+        fg = QColor(themeColor())
+        bg = QColor(fg)
+        bg.setAlpha(46 if isDarkTheme() else 30)
+        return bg, fg
+    light, dark = STATUS_COLORS.get(kind, STATUS_COLORS["info"])
+    bg_hex, fg_hex = dark if isDarkTheme() else light
+    return QColor(bg_hex), QColor(fg_hex)
+
+
+class _TagDelegate(TreeItemDelegate):
+    """「归属」列把文字画成圆角标签；其余列沿用 Fluent 树的绘制。"""
+
+    def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+        size = super().sizeHint(option, index)
+        return QSize(size.width(), GRID_ROW_HEIGHT)
+
+    def initStyleOption(self, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        super().initStyleOption(option, index)
+        if index.column() == TAG_COLUMN and index.data(_TAG_KIND_ROLE):
+            option.text = ""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        super().paint(painter, option, index)
+        kind = index.data(_TAG_KIND_ROLE)
+        text = str(index.data() or "")
+        if index.column() != TAG_COLUMN or not kind or not text:
+            return
+        font = getFont(12)
+        metrics = QFontMetrics(font)
+        width = min(metrics.horizontalAdvance(text) + 14, option.rect.width() - 8)
+        height = metrics.height() + 4
+        rect = QRectF(
+            option.rect.x() + 4,
+            option.rect.y() + (option.rect.height() - height) / 2,
+            width,
+            height,
+        )
+        bg, fg = tag_colors(str(kind))
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(rect, TAG_RADIUS, TAG_RADIUS)
+        painter.setFont(font)
+        painter.setPen(fg)
+        elided = metrics.elidedText(text, Qt.TextElideMode.ElideRight, int(width) - 14)
+        painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), elided)
+        painter.restore()
 
 
 class DataGrid(QWidget):
@@ -35,28 +110,20 @@ class DataGrid(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.tree = TreeWidget(self)
-        self.tree.setColumnCount(5)
-        self.tree.setHeaderLabels(
-            ["程序类型", "程序名称", "程序归属", "版本", "程序文件"]
-        )
+        self.tree.setColumnCount(len(COLUMNS))
+        self.tree.setHeaderLabels(COLUMNS)
+        self.tree.setItemDelegate(_TagDelegate(self.tree))
         header = self.tree.header()
         for col, width in enumerate(GRID_COL_WIDTHS):
             self.tree.setColumnWidth(col, width)
-            # 归属列（index 2）最小宽度，避免「定制专属 · 方案」被裁成空白
-            if col == 2:
-                header.setMinimumSectionSize(160)
         header.setStretchLastSection(True)
         header.setDefaultAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
-        self.tree.setAlternatingRowColors(True)
-        self.tree.setBorderVisible(True)
+        # 行高由委托给出；不覆盖 Fluent 样式表，否则选中行退回系统默认外观。
+        self.tree.setBorderVisible(False)
         self.tree.setBorderRadius(GRID_BORDER_RADIUS)
-        # 略增行高，中文归属文案更易读
-        self.tree.setStyleSheet(
-            "TreeWidget { font-size: 13px; }"
-            "TreeWidget::item { min-height: 28px; padding: 2px 4px; }"
-        )
+        self.tree.setUniformRowHeights(True)
         layout.addWidget(self.tree)
 
         self.tree.itemSelectionChanged.connect(self._on_selection)
@@ -68,23 +135,36 @@ class DataGrid(QWidget):
     @staticmethod
     def _variant_text(variant: ModuleVariant, label: str) -> str:
         # Issue 20-A：始终用变体目录名；空名才退回「默认」
-        text = variant.name or ("借用" if variant.borrowed_only else "默认")
+        text = variant.name or ("关联" if variant.borrowed_only else "默认")
         if variant.default_badge:
             text = f"{text}  {variant.default_badge}"
-        if variant.shared_state == "shared_hit":
-            text = f"{text}  {variant.shared_source_label}"
-        elif variant.shared_state == "shared_missing":
+        # 借用命中的来源画在归属标签里，名称列只标缺失。
+        if variant.shared_state == "shared_missing":
             if variant.shared_reason == "no_source_default":
                 text = f"{text}  源型号未设默认"
             else:
-                text = f"{text}  借用来源缺失"
+                text = f"{text}  关联来源缺失"
         return text
 
     @staticmethod
     def _source_text(label: str, source_kind: str) -> str:
-        if label == "通用默认" or (not label and source_kind == "common"):
-            return "通用"
-        return label
+        return source_tag(label, source_kind)[0]
+
+    @staticmethod
+    def _variant_item(first: str, name: str, variant: ModuleVariant) -> QTreeWidgetItem:
+        text, kind = source_tag(
+            variant.source_label,
+            variant.source_kind,
+            variant.shared_state,
+            variant.shared_source_label,
+        )
+        item = QTreeWidgetItem([first, name, variant.version or "-", text])
+        item.setData(TAG_COLUMN, _TAG_KIND_ROLE, kind)
+        item.setData(0, _VARIANT_ROLE, variant)
+        if variant.shared_source_label:
+            item.setToolTip(TAG_COLUMN, variant.shared_source_label)
+        item.setToolTip(1, str((variant.effective_asset or variant.asset).get("path", "")))
+        return item
 
     def populate_tree(self, rows: list[ModuleRow]) -> None:
         self.tree.blockSignals(True)
@@ -93,48 +173,27 @@ class DataGrid(QWidget):
             for row in rows:
                 if len(row.variants) == 1:
                     variant = row.variants[0]
-                    item = QTreeWidgetItem(
-                        [
-                            row.label,
-                            self._variant_text(variant, row.label),
-                            self._source_text(
-                                variant.source_label, variant.source_kind
-                            ),
-                            variant.version or "-",
-                            asset_primary_file_name(variant.asset),
-                        ]
+                    item = self._variant_item(
+                        row.label, self._variant_text(variant, row.label), variant
                     )
-                    item.setData(0, _VARIANT_ROLE, variant)
                     self.tree.addTopLevelItem(item)
                     continue
 
                 parent = QTreeWidgetItem(
                     [
                         row.label,
+                        f"{len(row.variants)} 个变体",
                         "",
                         self._source_text(row.source_label, row.source_kind),
-                        "",
-                        "",
                     ]
                 )
+                parent.setData(TAG_COLUMN, _TAG_KIND_ROLE, "accent")
                 self.tree.addTopLevelItem(parent)
                 for variant in row.variants:
                     name = (variant.name or "默认") + (
                         f"  {variant.default_badge}" if variant.default_badge else ""
                     )
-                    child = QTreeWidgetItem(
-                        [
-                            "",
-                            name,
-                            self._source_text(
-                                variant.source_label, variant.source_kind
-                            ),
-                            variant.version or "-",
-                            asset_primary_file_name(variant.asset),
-                        ]
-                    )
-                    child.setData(0, _VARIANT_ROLE, variant)
-                    parent.addChild(child)
+                    parent.addChild(self._variant_item("", name, variant))
                 parent.setExpanded(True)
         finally:
             self.tree.blockSignals(False)
@@ -189,6 +248,14 @@ class DataGrid(QWidget):
             )
         self.populate_tree(rows)
 
+    def variant_count(self) -> int:
+        """表格中可选变体行数（状态栏「N 个程序」）。"""
+        count = 0
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            count += top.childCount() or (1 if top.data(0, _VARIANT_ROLE) else 0)
+        return count
+
     # --- 选择 ---
     def select_first_variant(self) -> bool:
         """选中第一个变体行（自动化验证/回归钩子用），无变体返回 False。"""
@@ -222,7 +289,7 @@ class DataGrid(QWidget):
         if variant is None:
             return
         if variant.shared_state == "shared_missing":
-            self._on_log("借用来源缺失，无法打开")
+            self._on_log("关联来源缺失，无法打开")
             return
         asset = variant.effective_asset or variant.asset
         open_path_in_explorer(str(asset.get("path", "")), self._on_log)

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
 from fwasset.core.types import FirmwareAsset
-from fwasset.ui_qt.design_tokens import SPACE_XS
+from fwasset.ui_qt.design_tokens import SPACE_SM
 
 if TYPE_CHECKING:
     from fwasset.ui_qt.operation_panels.host_types import PanelHost
@@ -23,7 +23,7 @@ class BaseOperationPanel(QWidget):
         self._panel_host: PanelHost = panel_host
         self.body = QVBoxLayout(self)
         self.body.setContentsMargins(0, 0, 0, 0)
-        self.body.setSpacing(SPACE_XS)
+        self.body.setSpacing(SPACE_SM)
 
     def build(self):
         """子类重写此方法构建 UI。"""

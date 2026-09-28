@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import QHBoxLayout, QMessageBox
-from qfluentwidgets import BodyLabel, CheckBox, PrimaryPushButton
+from qfluentwidgets import (
+    BodyLabel,
+    CaptionLabel,
+    CheckBox,
+    FluentIcon,
+    PrimaryPushButton,
+)
 
 from fwasset.core.asset_helpers import (
     asset_rom_pkg_files,
@@ -12,6 +18,8 @@ from fwasset.core.services.flash_service import run_handcontrol_copy
 from fwasset.core.services.music_flash_service import run_music_flash
 from fwasset.ui_qt.operation_panels.base import BaseOperationPanel
 from fwasset.ui_qt.operation_panels.registry import register
+
+COPY_TO_USB_TEXT = "格式化并复制到 U 盘"
 
 
 @register("auto_usb")
@@ -26,9 +34,10 @@ class AutoUsbPanel(BaseOperationPanel):
 
         names = handcontrol_copy_filenames(list(self.asset.get("files", [])))
         if usb_flow == "paired_files" and names:
-            btn = PrimaryPushButton("复制到 U 盘", self)
+            btn = PrimaryPushButton(FluentIcon.SAVE, COPY_TO_USB_TEXT, self)
             btn.clicked.connect(self._copy_handcontrol_to_usb)
             self.body.addWidget(btn)
+            self.body.addWidget(CaptionLabel("会清空 U 盘，完成后自动弹出", self))
             return
 
         if usb_flow == "paired_files":
@@ -39,17 +48,19 @@ class AutoUsbPanel(BaseOperationPanel):
             elif pkg_file and not rom_file:
                 missing.append("ROM")
             if missing:
-                self.body.addWidget(
-                    BodyLabel(
-                        f"当前手控资源缺少 {' / '.join(missing)} 文件，无法复制到 U 盘。",
-                        self,
-                    )
+                self._add_text(
+                    f"当前手控资源缺少 {' / '.join(missing)} 文件，无法复制到 U 盘。"
                 )
                 return
-            self.body.addWidget(BodyLabel("当前手控资源没有可复制的固件文件。", self))
+            self._add_text("当前手控资源没有可复制的固件文件。")
             return
 
-        self.body.addWidget(BodyLabel("当前 USB 流程未配置，无法确定刷写方式。", self))
+        self._add_text("当前 USB 流程未配置，无法确定刷写方式。")
+
+    def _add_text(self, text: str) -> None:
+        label = BodyLabel(text, self)
+        label.setWordWrap(True)
+        self.body.addWidget(label)
 
     def _build_directory_copy_usb_ops(self):
         row = QHBoxLayout()
@@ -59,15 +70,15 @@ class AutoUsbPanel(BaseOperationPanel):
         self.eject_after = CheckBox("完成后弹出", self)
         self.eject_after.setChecked(True)
         row.addWidget(self.eject_after)
-
-        run_btn = PrimaryPushButton("执行目录刷机流程", self)
-        run_btn.clicked.connect(self._run_directory_flash)
-        row.addWidget(run_btn)
-        row.addWidget(
-            BodyLabel("该资源按目录复制到 U 盘，仅适用于音乐文件资源。", self)
-        )
         row.addStretch(1)
         self.body.addLayout(row)
+
+        run_btn = PrimaryPushButton(FluentIcon.SAVE, "执行目录刷机流程", self)
+        run_btn.clicked.connect(self._run_directory_flash)
+        self.body.addWidget(run_btn)
+        hint = CaptionLabel("按目录复制到 U 盘，仅适用于音乐文件资源。", self)
+        hint.setWordWrap(True)
+        self.body.addWidget(hint)
 
     # -- USB 操作方法 --
     def _resolve_drive(self) -> str:

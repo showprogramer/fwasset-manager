@@ -404,7 +404,7 @@ def _follow_default_state(
     if any(is_blocking_issue(issue) for issue in result.issues):
         return [], _error(
             "reference_incomplete",
-            "借用引用无法完整读取，已停止归一",
+            "关联记录无法完整读取，已停止归一",
             {"issues": result.issues},
         )
     hits = [
@@ -612,7 +612,7 @@ def normalize_platform_config(
                 transaction.commit()
                 return _error(
                     "follow_default_migration_required",
-                    "仍有旧版跟随默认借用指向本型号，请先完成迁移再归一",
+                    "仍有旧版跟随默认关联指向本型号，请先完成迁移再归一",
                     {"hits": hits},
                 )
 

@@ -7,8 +7,8 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QItemSelectionModel, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QShowEvent
+from PySide6.QtCore import QItemSelectionModel, QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QShowEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCompleter,
@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QListWidget,
     QListWidgetItem,
-    QMenu,
     QMessageBox,
     QVBoxLayout,
     QWidget,
@@ -26,19 +25,24 @@ from qfluentwidgets import (
     Action,
     BodyLabel,
     CaptionLabel,
-    ComboBox,
     EditableComboBox,
     FluentIcon,
     FluentWindow,
+    Flyout,
+    FlyoutAnimationType,
+    InfoBar,
+    InfoBarPosition,
     ListWidget,
+    NavigationItemPosition,
     PrimaryPushButton,
     PushButton,
     RoundMenu,
     SearchLineEdit,
-    StrongBodyLabel,
     SubtitleLabel,
     Theme,
-    TogglePushButton,
+    TransparentPushButton,
+    TransparentToolButton,
+    VerticalSeparator,
     setTheme,
 )
 
@@ -74,9 +78,9 @@ from fwasset.ui_common.view_models.scheme_workbench_model import (
     WorkbenchSelection,
 )
 from fwasset.ui_common.workbench_helpers import (
-    flash_mode_label,
-    model_chip_values,
+    breadcrumb_text,
     module_label_from_asset,
+    relative_time_text,
     shared_conflict_prompt_message,
     shared_register_action_label,
     shared_register_dialog_title,
@@ -95,6 +99,9 @@ from fwasset.ui_common.workspace_actions import (
 )
 from fwasset.ui_qt.data_grid import DataGrid
 from fwasset.ui_qt.design_tokens import (
+    MUTED_TEXT,
+    PANE_BACKGROUND,
+    PANE_BORDER,
     SEARCH_MIN_WIDTH,
     SHARED_SOURCE_PICKER_DEFAULT_SIZE,
     SHARED_SOURCE_PICKER_ITEM_HEIGHT,
@@ -104,9 +111,9 @@ from fwasset.ui_qt.design_tokens import (
     SPACE_MD,
     SPACE_SM,
     SPACE_XS,
-    SPACE_XXS,
-    USB_COMBO_MIN_WIDTH,
+    STATUS_COLORS,
 )
+from fwasset.ui_qt.detail_pane import DetailPane
 from fwasset.ui_qt.entry_flows import (
     open_change_vendor,
     open_create_asset,
@@ -121,13 +128,22 @@ from fwasset.ui_qt.entry_flows import (
     open_update_program,
     present_result,
 )
-from fwasset.ui_qt.log_panel import LogPanel
+from fwasset.ui_qt.inline_banner import InlineBanner
+from fwasset.ui_qt.log_panel import ActivityLog, LogView
 from fwasset.ui_qt.operation_panels import get_panel
 from fwasset.ui_qt.recycle_interface import RecycleInterface
 from fwasset.ui_qt.repair_interface import RepairInterface
 from fwasset.ui_qt.settings_interface import SettingsInterface
+from fwasset.ui_qt.sidebar_nav import (
+    SidebarNavDelegate,
+    add_nav_entry,
+    add_nav_section,
+)
+from fwasset.ui_qt.theming import bind_qss, pick
 
 SEARCH_REFRESH_DEBOUNCE_MS = 180
+STATUS_REFRESH_MS = 60_000
+CONFIGURATION_NOTICE = "尚未配置程序文件夹，请前往左侧「设置」完成配置。"
 
 
 def _reload_runtime_settings() -> tuple[str, str]:
@@ -193,8 +209,12 @@ class WorkbenchInterface(QWidget):
         self._undo_token = ""
         self._undo_started = 0.0
         self._undo_caller = None
-        self.repair_interface = None
+        self.repair_interface: RepairInterface | None = None
         self.recycle_interface = None
+        self.activity = ActivityLog(self)
+        self._indexed_at: float | None = None
+        self._scan_ui_state = "idle"
+        self._current_variant: ModuleVariant | None = None
 
         self._build_layout()
 
@@ -230,146 +250,203 @@ class WorkbenchInterface(QWidget):
         self._cached_load_timer.setSingleShot(True)
         self._cached_load_timer.timeout.connect(self._load_cached_assets)
         self._cached_load_timer.start(100)
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(STATUS_REFRESH_MS)
+        self._status_timer.timeout.connect(self._refresh_status_bar)
+        self._status_timer.start()
+        self.activity.changed.connect(self._refresh_activity_button)
 
     # ------------------------------------------------------------------ 布局
     def _build_layout(self) -> None:
+        """左栏（型号 + 分类）| 主区（标题、命令、提示、表格、状态栏）| 详情。"""
         root_layout = QHBoxLayout(self)
-        root_layout.setContentsMargins(0, 0, SPACE_SM, SPACE_SM)
-        root_layout.setSpacing(SPACE_MD)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self._build_sidebar())
 
-        # --- 左侧边栏 ---
-        sidebar = QFrame(self)
-        sidebar.setFixedWidth(SIDEBAR_WIDTH)
-        side_layout = QVBoxLayout(sidebar)
-        side_layout.setContentsMargins(SPACE_MD, SPACE_MD, SPACE_XS, 0)
-        side_layout.addWidget(SubtitleLabel("程序资产", sidebar))
-        side_layout.addWidget(CaptionLabel("通用模块与定制方案", sidebar))
-
-        self.nav = ListWidget(sidebar)
-        side_layout.addWidget(self.nav, stretch=1)
-        self.nav.currentRowChanged.connect(self._on_nav_changed)
-
-        self.scan_btn = PrimaryPushButton("重新读取程序文件夹", sidebar)
-        self.scan_btn.clicked.connect(self._on_scan_button_click)
-        side_layout.addWidget(self.scan_btn)
-        side_layout.addSpacing(SPACE_SM)
-        root_layout.addWidget(sidebar)
-
-        # --- 右侧主区 ---
-        main = QVBoxLayout()
+        main_widget = QWidget(self)
+        main = QVBoxLayout(main_widget)
+        main.setContentsMargins(SPACE_LG, SPACE_MD, SPACE_LG, SPACE_XS)
         main.setSpacing(SPACE_SM)
 
-        # 头部：标题行
+        # 标题行：型号 › 分类 + 搜索
         title_row = QHBoxLayout()
-        self.header_title = SubtitleLabel("请选择左侧分类进行过滤", self)
+        title_row.setSpacing(SPACE_SM)
+        self.header_model = SubtitleLabel("", main_widget)
+        title_row.addWidget(self.header_model)
+        self.header_title = BodyLabel("请选择型号", main_widget)
+        self.header_title.setTextColor(QColor(MUTED_TEXT[0]), QColor(MUTED_TEXT[1]))
         title_row.addWidget(self.header_title)
         title_row.addStretch(1)
-        self.header_badge = StrongBodyLabel("", self)
-        title_row.addWidget(self.header_badge)
-        main.addLayout(title_row)
-
-        # 配置提示（无按钮）：入口统一由左侧导航「设置」承担。
-        self.configuration_notice = CaptionLabel(
-            "尚未配置程序文件夹，请前往左侧「设置」完成配置。", self
-        )
-        self.configuration_notice.setVisible(not bool(self.root_dir.strip()))
-        main.addWidget(self.configuration_notice)
-
-        banner_row = QHBoxLayout()
-        self.recovery_banner = CaptionLabel("", self)
-        self.recovery_banner.setWordWrap(True)
-        self.recovery_banner.hide()
-        self.resume_button = PushButton("继续恢复", self)
-        self.resume_button.hide()
-        self.resume_button.clicked.connect(self._continue_recovery)
-        banner_row.addWidget(self.recovery_banner, stretch=1)
-        banner_row.addWidget(self.resume_button)
-        main.addLayout(banner_row)
-
-        self.undo_frame = QFrame(self)
-        undo_row = QHBoxLayout(self.undo_frame)
-        self.undo_label = CaptionLabel("", self.undo_frame)
-        self.undo_button = PushButton("撤销", self.undo_frame)
-        self.undo_button.clicked.connect(self._click_undo)
-        undo_row.addWidget(self.undo_label, stretch=1)
-        undo_row.addWidget(self.undo_button)
-        self.undo_frame.hide()
-        main.addWidget(self.undo_frame)
-
-        entry_row = QHBoxLayout()
-        for label, slot in (
-            ("新增型号", lambda: open_create_model(self)),
-            ("新建程序", lambda: open_create_asset(self)),
-            ("更新程序", lambda: open_update_program(self)),
-            ("备用版本", lambda: open_retired_versions(self)),
-            ("改厂商", lambda: open_change_vendor(self)),
-        ):
-            button = PushButton(label, self)
-            button.clicked.connect(slot)
-            entry_row.addWidget(button)
-        entry_row.addStretch(1)
-        main.addLayout(entry_row)
-
-        manage_row = QHBoxLayout()
-        for label, actions in (
-            ("型号管理", (("重命名当前型号", open_rename_model), ("删除当前型号", open_delete_model))),
-            ("方案管理", (("新建定制方案", open_create_scheme), ("重命名定制方案", open_rename_scheme), ("删除定制方案", open_delete_scheme))),
-        ):
-            button = PushButton(label, self)
-            menu = QMenu(button)
-            for action_label, flow in actions:
-                action = menu.addAction(action_label)
-                action.triggered.connect(lambda _checked=False, fn=flow: fn(self))
-            button.setMenu(menu)
-            manage_row.addWidget(button)
-        manage_row.addStretch(1)
-        main.addLayout(manage_row)
-
-        # 头部：过滤行（型号 chips + 搜索 + U盘）
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(BodyLabel("型号", self))
-        self.chip_bar = QHBoxLayout()
-        self.chip_bar.setSpacing(SPACE_XS)
-        filter_row.addLayout(self.chip_bar)
-        self.model_hint = CaptionLabel("读取后显示可选型号", self)
-        filter_row.addWidget(self.model_hint)
-        filter_row.addStretch(1)
-
-        self.search_edit = SearchLineEdit(self)
+        self.search_edit = SearchLineEdit(main_widget)
         self.search_edit.setPlaceholderText("搜索模块 / 版本 / 方案 / 平台")
         self.search_edit.setMinimumWidth(SEARCH_MIN_WIDTH)
-        filter_row.addWidget(self.search_edit, stretch=2)
+        title_row.addWidget(self.search_edit)
+        main.addLayout(title_row)
 
-        filter_row.addWidget(BodyLabel("U 盘", self))
-        self.usb_combo = ComboBox(self)
-        self.usb_combo.setMinimumWidth(USB_COMBO_MIN_WIDTH)
-        filter_row.addWidget(self.usb_combo)
-        usb_refresh = PushButton("刷新", self)
-        usb_refresh.clicked.connect(self._refresh_usb)
-        filter_row.addWidget(usb_refresh)
-        main.addLayout(filter_row)
+        # 命令行：唯一主按钮「新建程序」，其余依赖选中项
+        command_row = QHBoxLayout()
+        command_row.setSpacing(SPACE_XS)
+        self.new_program_btn = PrimaryPushButton(FluentIcon.ADD, "新建程序", main_widget)
+        self.new_program_btn.clicked.connect(lambda: open_create_asset(self))
+        command_row.addWidget(self.new_program_btn)
+        command_row.addSpacing(SPACE_XS)
+        command_row.addWidget(VerticalSeparator(main_widget))
+        command_row.addSpacing(SPACE_XS)
+        self.update_btn = TransparentPushButton(FluentIcon.UPDATE, "更新", main_widget)
+        self.update_btn.setToolTip("用新文件更新选中程序")
+        self.update_btn.clicked.connect(lambda: open_update_program(self))
+        command_row.addWidget(self.update_btn)
+        self.retired_btn = TransparentPushButton(FluentIcon.HISTORY, "备用版本", main_widget)
+        self.retired_btn.setToolTip("查看并恢复选中程序的备用版本")
+        self.retired_btn.clicked.connect(lambda: open_retired_versions(self))
+        command_row.addWidget(self.retired_btn)
+        command_row.addStretch(1)
+        main.addLayout(command_row)
 
-        # 数据表格
-        self.grid_panel = DataGrid(self._log, self)
+        # 内联提示：未配置 / 恢复 / 撤销
+        self.configuration_notice = InlineBanner("info", main_widget)
+        self.configuration_notice.show_message(CONFIGURATION_NOTICE)
+        self.configuration_notice.setVisible(not bool(self.root_dir.strip()))
+        main.addWidget(self.configuration_notice)
+        self.recovery_banner = InlineBanner("warning", main_widget)
+        main.addWidget(self.recovery_banner)
+        self.undo_banner = InlineBanner("success", main_widget)
+        main.addWidget(self.undo_banner)
+
+        self.grid_panel = DataGrid(self._log, main_widget)
         self.grid_panel.selection_changed.connect(self._on_grid_selection_changed)
         self.grid_panel.variant_right_clicked.connect(self._on_grid_right_click)
         main.addWidget(self.grid_panel, stretch=1)
 
-        # 操作区：选择摘要 + 按 flash_mode 挂载的操作面板
-        ops = QFrame(self)
-        self.ops_layout = QVBoxLayout(ops)
-        self.ops_layout.setContentsMargins(SPACE_XS, SPACE_XXS, SPACE_XS, SPACE_XXS)
-        self.selection_summary = CaptionLabel("未选择变体", ops)
-        self.ops_layout.addWidget(self.selection_summary)
-        self.ops_placeholder = BodyLabel("展开模块并选择具体变体以查看操作", ops)
-        self.ops_layout.addWidget(self.ops_placeholder)
-        main.addWidget(ops)
+        main.addWidget(self._build_status_bar(main_widget))
+        root_layout.addWidget(main_widget, stretch=1)
 
-        # 日志
-        self.log_panel = LogPanel(self)
-        main.addWidget(self.log_panel)
+        self.detail = DetailPane(self)
+        self.detail.vendor_edit_requested.connect(lambda: open_change_vendor(self))
+        self.detail.open_dir_requested.connect(self._open_current_asset_dir)
+        self.detail.copy_dir_requested.connect(self._copy_asset_dir_path)
+        self.detail.copy_file_requested.connect(self._copy_primary_file_path)
+        self.detail.borrow_requested.connect(self._show_borrow_menu)
+        self.detail.delete_requested.connect(self._delete_current_variant)
+        self.detail.usb_refresh_requested.connect(self._refresh_usb)
+        self.usb_combo = self.detail.usb_combo
+        self.ops_layout = self.detail.ops_layout
+        root_layout.addWidget(self.detail)
+        self._update_command_state()
 
-        root_layout.addLayout(main, stretch=1)
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QFrame(self)
+        sidebar.setObjectName("workbenchSidebar")
+        sidebar.setFixedWidth(SIDEBAR_WIDTH)
+        bind_qss(
+            sidebar,
+            lambda: (
+                f"#workbenchSidebar {{ background: {pick(PANE_BACKGROUND)};"
+                f" border-right: 1px solid {pick(PANE_BORDER)}; }}"
+            ),
+        )
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(SPACE_MD, SPACE_LG, SPACE_MD, SPACE_MD)
+        layout.setSpacing(SPACE_SM)
+
+        layout.addWidget(CaptionLabel("当前型号", sidebar))
+        model_row = QHBoxLayout()
+        model_row.setSpacing(SPACE_XS)
+        # 可搜索型号下拉：型号是作用域选择器，不走搜索框。
+        self.model_combo = EditableComboBox(sidebar)
+        self.model_combo.setPlaceholderText("搜索型号…")
+        # 不接 currentTextChanged（每键都发）；currentIndexChanged 只在文本精确命中
+        # 某项/从补全菜单选中时发，再经防抖确认，见 _schedule_model_switch。
+        self.model_combo.currentIndexChanged.connect(
+            lambda i: self._schedule_model_switch(self.model_combo.itemText(i))
+        )
+        self.model_combo.editingFinished.connect(
+            lambda: QTimer.singleShot(
+                self._model_switch_timer.interval() + 50, self._sync_model_combo_text
+            )
+        )
+        model_row.addWidget(self.model_combo, stretch=1)
+        self.model_more_btn = TransparentToolButton(FluentIcon.MORE, sidebar)
+        self.model_more_btn.setToolTip("型号管理")
+        self.model_more_btn.clicked.connect(self._show_model_menu)
+        model_row.addWidget(self.model_more_btn)
+        layout.addLayout(model_row)
+        self.model_hint = CaptionLabel("读取后显示可选型号", sidebar)
+        layout.addWidget(self.model_hint)
+        layout.addSpacing(SPACE_XS)
+
+        self.nav = ListWidget(sidebar)
+        self.nav.delegate = SidebarNavDelegate(self.nav)
+        self.nav.setItemDelegate(self.nav.delegate)
+        self.nav.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.nav.customContextMenuRequested.connect(self._on_nav_context_menu)
+        self.nav.currentRowChanged.connect(self._on_nav_changed)
+        self.nav.setStyleSheet("ListWidget { background: transparent; border: none; }")
+        layout.addWidget(self.nav, stretch=1)
+        return sidebar
+
+    def _build_status_bar(self, parent: QWidget) -> QWidget:
+        bar = QWidget(parent)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.status_label = CaptionLabel("", bar)
+        row.addWidget(self.status_label)
+        row.addStretch(1)
+        self.activity_btn = TransparentPushButton(FluentIcon.HISTORY, "活动 · 无错误", bar)
+        self.activity_btn.setToolTip("查看运行日志")
+        self.activity_btn.clicked.connect(self._show_activity_log)
+        row.addWidget(self.activity_btn)
+        return bar
+
+    # ------------------------------------------------------------------ 状态栏与活动日志
+    def _refresh_status_bar(self) -> None:
+        if self._scan_ui_state != "idle":
+            self.status_label.setText("正在读取程序文件夹…")
+            return
+        parts: list[str] = []
+        if self.current_selection.model_name:
+            parts.append(f"{self.grid_panel.variant_count()} 个程序")
+        if self._indexed_at is not None:
+            parts.append(f"索引 {relative_time_text(time.time() - self._indexed_at)}")
+        self.status_label.setText(" · ".join(parts))
+
+    def _refresh_activity_button(self) -> None:
+        errors = self.activity.unread_errors
+        self.activity_btn.setText(f"活动 · {errors} 个错误" if errors else "活动 · 无错误")
+        # 只换图标颜色：setStyleSheet 会冲掉 Fluent 按钮样式。
+        danger = STATUS_COLORS["error"]
+        self.activity_btn.setIcon(
+            FluentIcon.INFO.colored(QColor(danger[0][1]), QColor(danger[1][1]))
+            if errors
+            else FluentIcon.HISTORY
+        )
+
+    def _show_activity_log(self) -> None:
+        Flyout.make(
+            LogView(self.activity),
+            self.activity_btn,
+            self.window(),
+            aniType=FlyoutAnimationType.PULL_UP,
+        )
+
+    def _toast(self, title: str, content: str = "", *, error: bool = False) -> None:
+        """右下角短暂提示；日志常驻位置已移除，操作结果靠它反馈。"""
+        make = InfoBar.error if error else InfoBar.success
+        make(
+            title,
+            content,
+            duration=4000 if error else 2000,
+            position=InfoBarPosition.BOTTOM_RIGHT,
+            parent=self.window(),
+        )
+
+    def _set_scan_state(self, state: str) -> None:
+        """idle / scanning / cancelling：同步软件修复页按钮与状态栏。"""
+        self._scan_ui_state = state
+        if self.repair_interface is not None:
+            self.repair_interface.set_scan_state(state)
+        self._refresh_status_bar()
 
     # ------------------------------------------------------------------ 日志
     def _log(self, message: str) -> None:
@@ -377,7 +454,7 @@ class WorkbenchInterface(QWidget):
         self.log_message.emit(message or "")
 
     def _append_log(self, message: str) -> None:
-        self.log_panel.write(message)
+        self.activity.write(message)
         self._file_logger.log(message)
 
     # ------------------------------------------------------------------ 后台任务（PanelHost）
@@ -428,6 +505,8 @@ class WorkbenchInterface(QWidget):
         if isinstance(reported, dict) and "ok" in reported:
             if reported.get("ok"):
                 self._log(f"{name}完成")
+                if not silent:
+                    self._toast(f"{name}完成")
             else:
                 msg = str(reported.get("message") or "未知错误")
                 self._log(f"{name}失败: {msg}")
@@ -435,6 +514,8 @@ class WorkbenchInterface(QWidget):
                     QMessageBox.warning(self, f"{name}失败", msg)
         else:
             self._log(f"{name}完成")
+            if not silent:
+                self._toast(f"{name}完成")
 
     def _on_task_failed(self, task_id: int, name: str, error: str) -> None:
         self._busy = False
@@ -475,12 +556,6 @@ class WorkbenchInterface(QWidget):
         else:
             self._copy_to_clipboard(path)
 
-    def _launch_tool_and_open_asset_dir(self) -> None:
-        panel = self.active_operation_panel
-        if panel is not None and hasattr(panel, "_launch_current_tool"):
-            panel._launch_current_tool()
-        self._open_current_asset_dir()
-
     # ------------------------------------------------------------------ USB
     def _refresh_usb(self) -> None:
         drives = get_usb_drives() or [""]
@@ -489,6 +564,7 @@ class WorkbenchInterface(QWidget):
         self.usb_combo.addItems(drives)
         if current in drives:
             self.usb_combo.setCurrentText(current)
+        self.usb_combo.setPlaceholderText("未发现 U 盘")
         self._log(f"U盘刷新: {', '.join([d for d in drives if d]) or '未发现'}")
 
     def get_global_usb_drive(self) -> str:
@@ -522,8 +598,7 @@ class WorkbenchInterface(QWidget):
         if self._scan_cancel_event is not None:
             self._scan_cancel_event.set()
             self._log("正在取消读取，请稍候...")
-            self.scan_btn.setText("取消中...")
-            self.scan_btn.setEnabled(False)
+            self._set_scan_state("cancelling")
             return
         self._start_scan()
 
@@ -552,7 +627,7 @@ class WorkbenchInterface(QWidget):
 
         cancel_event = threading.Event()
         self.scan_state_model.replace(cancel_event)
-        self.scan_btn.setText("取消读取")
+        self._set_scan_state("scanning")
         self._log(f"开始读取程序文件夹: {directory}")
 
         def run_scan():
@@ -570,8 +645,8 @@ class WorkbenchInterface(QWidget):
 
     def _handle_scan_result(self, result: ServiceResult) -> None:
         self.scan_state_model.replace(None)
-        self.scan_btn.setText("重新读取程序文件夹")
-        self.scan_btn.setEnabled(True)
+        was_scanning = self._scan_ui_state != "idle"
+        self._set_scan_state("idle")
 
         if not result["ok"]:
             self._log(f"加载失败: {result['message']}")
@@ -583,14 +658,23 @@ class WorkbenchInterface(QWidget):
             return
 
         payload = result["payload"]
+        meta = payload.get("scan_meta") or []
         if "asset_count" in payload:
             self._log(f"已加载上次读取的程序列表，共有 {payload['asset_count']} 个项目")
+            if meta:
+                self._indexed_at = float(meta[0].get("last_scan_at") or 0) or None
         else:
             assets = payload.get("assets", [])
             errors = payload.get("errors", [])
+            self._indexed_at = time.time()
             self._log(f"程序列表读取完成，共找到 {len(assets)} 个项目")
             if errors:
                 self._log(f"读取过程中有 {len(errors)} 个错误")
+            if was_scanning:
+                detail = f"共 {len(assets)} 个程序" + (
+                    f"，{len(errors)} 个错误" if errors else ""
+                )
+                self._toast("程序列表已重新读取", detail)
 
         root = (self.root_dir or "").strip()
         configured_root: str | None = None
@@ -602,7 +686,6 @@ class WorkbenchInterface(QWidget):
             # 避免绑定到 "." 后型号列表退化成文件名解析的噪声假型号。
             # 注意：恢复出的根不得当作配置根——此时 configured_root 保持 None，
             # 型号 id 只读、不自动创建。
-            meta = payload.get("scan_meta") or []
             if meta:
                 root = str(meta[0].get("root_dir", "")).strip()
                 if root:
@@ -624,8 +707,9 @@ class WorkbenchInterface(QWidget):
                 self._refresh_model_selector()
                 self._refresh_sidebar_tree()
                 self._refresh_main_grid()
+        self._refresh_status_bar()
 
-    # ------------------------------------------------------------------ 型号 chips
+    # ------------------------------------------------------------------ 型号选择
     def _on_model_changed(self, choice: str) -> None:
         # 只接受真实型号：可搜索下拉的中间输入态（如敲了一半的 "L5"）不得
         # 污染 model_name，否则视图会静默变空。
@@ -640,46 +724,52 @@ class WorkbenchInterface(QWidget):
     def _refresh_model_selector(self, models: list[str] | None = None) -> None:
         if models is not None:
             self._available_models = models
-        while self.chip_bar.count():
-            item = self.chip_bar.takeAt(0)
-            if item is None:
-                break
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-
-        chips, _overflow = model_chip_values(
-            self._available_models, self.current_selection.model_name
-        )
-        self.model_hint.setText("还没有型号" if not self._available_models else "")
-        self.model_hint.setVisible(not chips)
-        for model in chips:
-            btn = TogglePushButton(model, self)
-            btn.setChecked(model == self.current_selection.model_name)
-            btn.clicked.connect(
-                lambda _c=False, value=model: self._on_model_changed(value)
-            )
-            self.chip_bar.addWidget(btn)
-
-        # 常驻可搜索型号下拉（含全部型号）：型号是作用域选择器，不走搜索框；
-        # 型号少时也保留（用户要求，便于验证与键盘定位），多时是唯一入口。
-        if self._available_models:
-            combo = EditableComboBox(self)
+        combo = self.model_combo
+        combo.blockSignals(True)
+        try:
+            combo.clear()
             combo.addItems(self._available_models)
-            combo.setPlaceholderText("搜索型号…")
-            combo.setCurrentIndex(-1)
-            combo.setMinimumWidth(150)
             completer = QCompleter(self._available_models, combo)
             completer.setFilterMode(Qt.MatchFlag.MatchContains)
             completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
             combo.setCompleter(completer)
-            # 不接 currentTextChanged（每键都发）；currentIndexChanged 只在文本
-            # 精确命中某项/从补全菜单选中时发，再经防抖确认，见 _schedule_model_switch。
-            combo.currentIndexChanged.connect(
-                lambda i, c=combo: self._schedule_model_switch(c.itemText(i))
-            )
-            self.chip_bar.addWidget(combo)
-            self.model_combo = combo
+            current = self.current_selection.model_name
+            if current in self._available_models:
+                combo.setCurrentIndex(self._available_models.index(current))
+            else:
+                combo.setCurrentIndex(-1)
+        finally:
+            combo.blockSignals(False)
+        self.model_hint.setText("还没有型号" if self._root_known() else "读取后显示可选型号")
+        self.model_hint.setVisible(not self._available_models)
+
+    def _root_known(self) -> bool:
+        return bool((self.root_dir or "").strip())
+
+    def _sync_model_combo_text(self) -> None:
+        """输入中途离开下拉：没有切成功就把文字还原为当前型号。"""
+        if self._pending_model:
+            return
+        current = self.current_selection.model_name
+        if self.model_combo.text() != current:
+            self.model_combo.blockSignals(True)
+            self.model_combo.setText(current)
+            self.model_combo.blockSignals(False)
+
+    def _show_model_menu(self) -> None:
+        menu = RoundMenu(parent=self)
+        has_model = bool(self.current_selection.model_name)
+        for icon, text, flow, enabled in (
+            (FluentIcon.ADD, "新增型号", open_create_model, True),
+            (FluentIcon.EDIT, "重命名当前型号", open_rename_model, has_model),
+            (FluentIcon.DELETE, "删除当前型号", open_delete_model, has_model),
+        ):
+            action = Action(icon, text, menu)
+            action.setEnabled(enabled)
+            action.triggered.connect(lambda _c=False, fn=flow: fn(self))
+            menu.addAction(action)
+        button = self.model_more_btn
+        menu.exec(button.mapToGlobal(QPoint(0, button.height())))
 
     def _schedule_model_switch(self, model_name: str) -> None:
         if not model_name or model_name not in self._available_models:
@@ -777,36 +867,74 @@ class WorkbenchInterface(QWidget):
         tree_data = self.workbench_model.build_sidebar_tree(model_name)
         search_kw = self.search_edit.text().lower().strip()
 
-        def _add_entry(text: str, kind: str, key: str) -> None:
-            item = QListWidgetItem(text)
-            self.nav.addItem(item)
-            self._nav_entries.append((kind, key))
-
-        def _add_section(text: str) -> None:
-            item = QListWidgetItem(text)
-            item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.nav.addItem(item)
-            self._nav_entries.append(("section", ""))
-
-        _add_entry("全部程序与模块", "all", "")
+        add_nav_entry(self.nav, "全部程序", tree_data.get("total"))
+        self._nav_entries.append(("all", ""))
 
         if tree_data["common"]:
-            _add_section("── 通用模块 ──")
+            add_nav_section(self.nav, "通用模块")
+            self._nav_entries.append(("section", ""))
             for fw_label, count in tree_data["common"].items():
                 if search_kw and search_kw not in fw_label.lower():
                     continue
-                _add_entry(f"{fw_label} ({count})", "common_type", fw_label)
+                add_nav_entry(self.nav, fw_label, count)
+                self._nav_entries.append(("common_type", fw_label))
 
-        if tree_data["custom"]:
-            _add_section("── 定制方案 ──")
-            for scheme in tree_data["custom"]:
-                if search_kw and search_kw not in scheme.lower():
-                    continue
-                _add_entry(f"◆ {scheme}", "custom_scheme", scheme)
+        section = add_nav_section(self.nav, "定制方案")
+        self._nav_entries.append(("section", ""))
+        self.nav.setItemWidget(section, self._scheme_section_widget())
+        custom_counts = tree_data.get("custom_counts") or {}
+        schemes = [
+            scheme
+            for scheme in tree_data["custom"]
+            if not search_kw or search_kw in scheme.lower()
+        ]
+        for scheme in schemes:
+            add_nav_entry(self.nav, scheme, custom_counts.get(scheme, 0))
+            self._nav_entries.append(("custom_scheme", scheme))
+        if not tree_data["custom"]:
+            empty = add_nav_entry(self.nav, "还没有定制方案")
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            empty.setForeground(QColor(MUTED_TEXT[0]))
+            self._nav_entries.append(("section", ""))
 
         self.nav.blockSignals(False)
         # 重建后按逻辑选中项高亮（勿保留点击时的旧行号）
         self._apply_nav_selection_highlight()
+
+    def _scheme_section_widget(self) -> QWidget:
+        """「定制方案」节标题右侧的新建按钮（标题文字由委托绘制）。"""
+        box = QWidget(self.nav)
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, SPACE_XS, 0)
+        row.addStretch(1)
+        add = TransparentToolButton(FluentIcon.ADD, box)
+        add.setFixedSize(24, 24)
+        add.setIconSize(QSize(12, 12))
+        add.setToolTip("新建定制方案")
+        add.clicked.connect(lambda: open_create_scheme(self))
+        row.addWidget(add, alignment=Qt.AlignmentFlag.AlignBottom)
+        return box
+
+    def _on_nav_context_menu(self, pos: QPoint) -> None:
+        item = self.nav.itemAt(pos)
+        if item is None:
+            return
+        row = self.nav.row(item)
+        if not (0 <= row < len(self._nav_entries)):
+            return
+        kind, key = self._nav_entries[row]
+        if kind != "custom_scheme":
+            return
+        if not self._nav_entry_matches_selection(kind, key):
+            self.nav.setCurrentRow(row)
+        menu = RoundMenu(parent=self)
+        rename = Action(FluentIcon.EDIT, "重命名方案", menu)
+        rename.triggered.connect(lambda _c=False: open_rename_scheme(self))
+        menu.addAction(rename)
+        delete = Action(FluentIcon.DELETE, "删除方案", menu)
+        delete.triggered.connect(lambda _c=False: open_delete_scheme(self))
+        menu.addAction(delete)
+        menu.exec(self.nav.viewport().mapToGlobal(pos))
 
     def _on_nav_changed(self, row: int) -> None:
         if not (0 <= row < len(self._nav_entries)):
@@ -852,37 +980,44 @@ class WorkbenchInterface(QWidget):
         search_kw = self.search_edit.text().lower().strip()
 
         if not model_name or not node_type:
-            self.header_title.setText("请选择左侧分类进行过滤")
-            self.header_badge.setText("")
+            self.header_model.setText("")
+            self.header_title.setText("请选择型号")
+            self._update_command_state()
+            self._refresh_status_bar()
             return
 
+        self.header_model.setText(model_name)
+        self.header_title.setText(
+            "› "
+            + breadcrumb_text(
+                node_type,
+                self.current_selection.common_type,
+                self.current_selection.scheme_name,
+            )
+        )
         cards_data: list[ModuleCardData] = []
         if node_type == "all":
-            self.header_title.setText(f"全部模块 ({model_name})")
-            self.header_badge.setText("全部")
             cards_data = self.workbench_model.get_all_modules(model_name, search_kw)
         elif node_type == "common_type":
             fw_label = self.current_selection.common_type
-            self.header_title.setText(f"通用模块: {fw_label}")
-            self.header_badge.setText("通用模块")
             cards_data = self.workbench_model.get_common_modules(
                 model_name, fw_label, search_kw
             )
         elif node_type == "custom_scheme":
             scheme_name = self.current_selection.scheme_name
-            self.header_title.setText(f"定制方案: {scheme_name}")
-            self.header_badge.setText("整机模块")
             rows = self.workbench_model.get_scheme_module_tree(
                 model_name, scheme_name, search_kw
             )
             self.grid_panel.populate_tree(rows)
             self._on_grid_selection_changed(None)
+            self._refresh_status_bar()
             return
 
         self.grid_panel.populate(cards_data)
         self._on_grid_selection_changed(None)
+        self._refresh_status_bar()
 
-    # ------------------------------------------------------------------ 选择与操作区
+    # ------------------------------------------------------------------ 选择与详情
     def _on_grid_selection_changed(self, variant: ModuleVariant | None) -> None:
         # 先拆掉上一个操作面板，避免选行叠加旧面板
         if self.active_operation_panel is not None:
@@ -890,83 +1025,107 @@ class WorkbenchInterface(QWidget):
             self.active_operation_panel.deleteLater()
             self.active_operation_panel = None
 
+        self._current_variant = variant
+        self._update_command_state()
         if not variant:
-            self.selection_summary.setText("未选择变体")
-            self.ops_placeholder.setText("展开模块并选择具体变体以查看操作")
-            self.ops_placeholder.show()
+            self.detail.show_empty()
             return
 
-        if variant.shared_state == "shared_missing":
-            self.selection_summary.setText("借用来源缺失 · 不可烧录")
-            self.ops_placeholder.setText("借用来源缺失，未回落本地副本")
-            self.ops_placeholder.show()
+        write_ok = bool(
+            write_gate_check(
+                DEFAULT_ROOT, self.root_dir, self._shared_write_target(variant)
+            )["ok"]
+        )
+        mode = self.detail.show_variant(
+            variant,
+            can_write=write_ok,
+            can_delete=self._can_delete(variant, write_ok),
+        )
+        if not mode:
             return
 
         asset = variant.effective_asset or variant.asset
-        mode = str(asset.get("flash_mode", "disabled")) or "disabled"
-        module = str(asset.get("firmware_label", "")) or str(
-            asset.get("firmware_type", "")
-        )
-        version = variant.version or str(asset.get("version", "")) or "-"
-        self.selection_summary.setText(
-            f"已选：{module} / {variant.name or str(asset.get('directory_name', ''))}"
-            f" · {version} · {variant.source_label} · {flash_mode_label(mode)}"
-        )
-
         PanelClass = get_panel(mode)
         if PanelClass is None:
-            self.ops_placeholder.setText(f"暂不支持的操作模式: {mode}")
-            self.ops_placeholder.show()
+            self.detail.show_notice(f"暂不支持的操作模式: {mode}")
             return
 
-        self.ops_placeholder.hide()
         panel = PanelClass(asset=asset, log_fn=self._log, panel_host=self)
         panel.build()
         self.ops_layout.addWidget(panel)
         self.active_operation_panel = panel
 
+    def _update_command_state(self) -> None:
+        variant = self._current_variant
+        self.new_program_btn.setEnabled(bool(self.current_selection.model_name))
+        for button in (self.update_btn, self.retired_btn):
+            button.setEnabled(variant is not None)
+
+    @staticmethod
+    def _can_delete(variant: ModuleVariant, write_ok: bool) -> bool:
+        # 借用来源行不给删除——那份程序不属于本型号，要删得去源型号。
+        return (
+            write_ok
+            and variant.shared_state != "shared_hit"
+            and not variant.borrowed_only
+        )
+
+    def _delete_current_variant(self) -> None:
+        variant = self._current_variant
+        if variant is not None:
+            open_delete_asset(self, variant.asset)
+
+    def _show_borrow_menu(self, global_pos: QPoint) -> None:
+        variant = self._current_variant
+        if variant is None:
+            return
+        menu = RoundMenu(parent=self)
+        if self._add_borrow_actions(menu, variant, write_ok=True):
+            menu.exec(global_pos)
+
     # ------------------------------------------------------------------ 右键菜单（共享登记与目录操作）
     def _on_grid_right_click(self, variant: ModuleVariant, global_pos) -> None:
-        menu = RoundMenu(parent=self)
+        self._build_variant_menu(variant).exec(global_pos)
 
-        asset = variant.asset
-        model_name = self.current_selection.model_name
-        module = module_label_from_asset(asset)
+    def _add_borrow_actions(
+        self, menu: RoundMenu, variant: ModuleVariant, *, write_ok: bool
+    ) -> bool:
+        """登记 / 更换 / 解除借用。没有可加的动作时返回 False。"""
+        module = module_label_from_asset(variant.asset)
         module_key = canonical_module_dir(module)
+        if not module_key or not write_ok:
+            return False
+        shared_res = self.workbench_model.resolve_shared_module(
+            self.current_selection.model_name, module_key
+        )
+        if shared_res is not None:
+            reg_action = Action(FluentIcon.SYNC, shared_replace_action_label(module), menu)
+            reg_action.triggered.connect(
+                lambda _c=False: self._register_shared_source(variant)
+            )
+            menu.addAction(reg_action)
+            unreg_action = Action(
+                FluentIcon.CANCEL, shared_unregister_action_label(module), menu
+            )
+            unreg_action.triggered.connect(lambda _c=False: self._unregister_shared(variant))
+            menu.addAction(unreg_action)
+        else:
+            reg_action = Action(FluentIcon.LINK, shared_register_action_label(module), menu)
+            reg_action.triggered.connect(
+                lambda _c=False: self._register_shared_source(variant)
+            )
+            menu.addAction(reg_action)
+        return True
+
+    def _build_variant_menu(self, variant: ModuleVariant) -> RoundMenu:
+        """表格右键菜单：借用、目录、删除（与详情底部操作一致）。"""
+        menu = RoundMenu(parent=self)
         gate = write_gate_check(
             DEFAULT_ROOT, self.root_dir, self._shared_write_target(variant)
         )
-        write_ok = gate["ok"]
+        write_ok = bool(gate["ok"])
 
-        # --- 共享登记（B2）：右键目标型号的模块行 → 登记/取消共享来源 ---
-        if module_key:
-            shared_res = self.workbench_model.resolve_shared_module(
-                model_name, module_key
-            )
-
-            if shared_res is not None and write_ok:
-                reg_action = Action(
-                    FluentIcon.SYNC, shared_replace_action_label(module), menu
-                )
-                reg_action.triggered.connect(
-                    lambda _c=False: self._register_shared_source(variant)
-                )
-                menu.addAction(reg_action)
-                unreg_action = Action(
-                    FluentIcon.CANCEL, shared_unregister_action_label(module), menu
-                )
-                unreg_action.triggered.connect(
-                    lambda _c=False: self._unregister_shared(variant)
-                )
-                menu.addAction(unreg_action)
-            elif write_ok:
-                reg_action = Action(
-                    FluentIcon.LINK, shared_register_action_label(module), menu
-                )
-                reg_action.triggered.connect(
-                    lambda _c=False: self._register_shared_source(variant)
-                )
-                menu.addAction(reg_action)
+        if self._add_borrow_actions(menu, variant, write_ok=write_ok):
             menu.addSeparator()
 
         open_action = Action(FluentIcon.FOLDER, "打开所在目录", menu)
@@ -978,20 +1137,14 @@ class WorkbenchInterface(QWidget):
         )
         menu.addAction(copy_action)
 
-        # 删除：借用来源行不给——那份程序不属于本型号，要删得去源型号。
-        if (
-            write_ok
-            and variant.shared_state != "shared_hit"
-            and not variant.borrowed_only
-        ):
+        if self._can_delete(variant, write_ok):
             menu.addSeparator()
             delete_action = Action(FluentIcon.DELETE, "删除", menu)
             delete_action.triggered.connect(
                 lambda _c=False: open_delete_asset(self, variant.asset)
             )
             menu.addAction(delete_action)
-
-        menu.exec(global_pos)
+        return menu
 
     def _write_gate(self, target_path: str | Path) -> bool:
         """统一写入门闩（TASK-20260806 R1/R10）。
@@ -1084,7 +1237,7 @@ class WorkbenchInterface(QWidget):
         layout.setContentsMargins(SPACE_LG, SPACE_LG, SPACE_LG, SPACE_LG)
         layout.setSpacing(SPACE_MD)
 
-        layout.addWidget(SubtitleLabel("选择借用", dlg))
+        layout.addWidget(SubtitleLabel("选择关联程序", dlg))
 
         caption = CaptionLabel(shared_source_picker_caption(module_label), dlg)
         caption.setWordWrap(True)
@@ -1167,7 +1320,7 @@ class WorkbenchInterface(QWidget):
             if result.get("code") == "confirmation_required":
                 answer = QMessageBox.question(
                     self,
-                    "覆盖借用",
+                    "覆盖关联",
                     str(result.get("message") or shared_conflict_prompt_message(module_label)),
                 )
                 if answer != QMessageBox.StandardButton.Yes:
@@ -1189,7 +1342,7 @@ class WorkbenchInterface(QWidget):
             if result.get("ok"):
                 self._refresh_main_grid(reload_data=True)
 
-        self.run_write("登记借用", run, done)
+        self.run_write("关联程序", run, done)
 
     def _unregister_shared(self, variant: ModuleVariant) -> None:
         if not self._write_gate(self._shared_write_target(variant)):
@@ -1199,7 +1352,7 @@ class WorkbenchInterface(QWidget):
         module_key = canonical_module_dir(module)
         answer = QMessageBox.question(
             self,
-            "解除借用",
+            "解除关联",
             shared_unregister_confirm_message(module),
         )
         if answer != QMessageBox.StandardButton.Yes:
@@ -1213,7 +1366,7 @@ class WorkbenchInterface(QWidget):
             token = str((result.get("payload") or {}).get("undo_token") or "")
             if result.get("code") == "ok" and token:
                 self.show_undo_bar(
-                    "已解除借用",
+                    "已解除关联",
                     token,
                     lambda undo_token, log: self.workbench_model.undo_clear_borrow(
                         undo_token, log
@@ -1222,7 +1375,7 @@ class WorkbenchInterface(QWidget):
             if result.get("ok"):
                 self._refresh_main_grid(reload_data=True)
 
-        self.run_write("解除借用", run, done)
+        self.run_write("解除关联", run, done)
 
     # ------------------------------------------------------------------ 工具
     def _open_asset_dir(self, variant: ModuleVariant) -> None:
@@ -1233,6 +1386,7 @@ class WorkbenchInterface(QWidget):
             return
         QApplication.clipboard().setText(text)
         self._log(f"已复制: {text}")
+        self._toast("已复制", text)
 
     def run_write(self, name: str, fn, on_done) -> None:
         """后台执行一次写入。晚到的结果若对话框代次已变，则丢弃。"""
@@ -1306,14 +1460,13 @@ class WorkbenchInterface(QWidget):
         self._undo_token = token
         self._undo_caller = caller
         self._undo_started = time.monotonic()
-        self.undo_label.setText(text)
-        self.undo_frame.show()
+        self.undo_banner.show_message(text, "撤销", self._click_undo)
         self._undo_timer.start(5000)
 
     def _expire_undo(self) -> None:
         self._undo_token = ""
         self._undo_caller = None
-        self.undo_frame.hide()
+        self.undo_banner.hide()
 
     def _click_undo(self) -> None:
         token = self._undo_token
@@ -1340,13 +1493,14 @@ class WorkbenchInterface(QWidget):
         self._writes_held = True
         self._recovery_message = message
         self._resume_name = resume_name
-        self.recovery_banner.setText(message)
-        self.recovery_banner.show()
-        self.resume_button.setVisible(bool(resume_name))
+        self.recovery_banner.show_message(
+            message,
+            "继续恢复" if resume_name else "",
+            self._continue_recovery,
+        )
 
     def _hide_recovery_banner(self) -> None:
         self.recovery_banner.hide()
-        self.resume_button.hide()
         self._recovery_message = ""
 
     def _hold_writes_until_recovery(self) -> None:
@@ -1459,11 +1613,24 @@ class QtWorkbenchWindow(FluentWindow):
         self.workbench.recycle_interface = self.recycle_interface
         self.workbench.settings_requested.connect(self._open_settings)
         self.settings_interface.configure_requested.connect(self._open_configuration)
+        self.repair_interface.rescan_requested.connect(
+            self.workbench._on_scan_button_click
+        )
 
         self.addSubInterface(self.workbench, FluentIcon.HOME, "程序资产工作台")
         self.addSubInterface(self.recycle_interface, FluentIcon.DELETE, "回收站")
-        self.addSubInterface(self.repair_interface, FluentIcon.INFO, "软件修复")
-        self.addSubInterface(self.settings_interface, FluentIcon.SETTING, "设置")
+        self.addSubInterface(
+            self.repair_interface,
+            FluentIcon.DEVELOPER_TOOLS,
+            "软件修复",
+            position=NavigationItemPosition.BOTTOM,
+        )
+        self.addSubInterface(
+            self.settings_interface,
+            FluentIcon.SETTING,
+            "设置",
+            position=NavigationItemPosition.BOTTOM,
+        )
         self._refresh_settings_interface()
 
     def showEvent(self, event: QShowEvent) -> None:

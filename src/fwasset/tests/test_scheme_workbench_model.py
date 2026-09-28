@@ -592,6 +592,8 @@ def test_multi_model_sidebar_and_fallback_work_per_model(
     tree = model.build_sidebar_tree("L36")
     assert tree["common"].get("主板程序") == 2
     assert tree["custom"] == ["西班牙"]
+    assert tree["custom_counts"] == {"西班牙": 1}
+    assert tree["total"] == sum(tree["common"].values()) + 1
 
     # 西班牙缺主板，方案页只保留自己的腿部程序。
     cards = model.get_scheme_modules("L36", "西班牙")
@@ -599,7 +601,7 @@ def test_multi_model_sidebar_and_fallback_work_per_model(
 
     # 未整理的双机芯型号没有 通用/定制 → 侧边树为空，但「全部」视图能看到资产
     dual_tree = model.build_sidebar_tree("L36双机芯-上3D-下2D")
-    assert dual_tree == {"common": {}, "custom": []}
+    assert dual_tree == {"common": {}, "custom": [], "custom_counts": {}, "total": 1}
 
 
 def test_multi_model_set_default_writes_into_model_dir(

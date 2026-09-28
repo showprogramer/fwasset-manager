@@ -804,7 +804,7 @@ def _retired_anchor_issue_for(
         category="retired_anchor",
         config_path=config_path,
         owner_root=owner_root,
-        detail=f"借用锚点落在旧版本：{anchor}",
+        detail=f"关联锚点落在旧版本：{anchor}",
         anchor_path=str(anchor),
         source_root=str(copy_root) if copy_root is not None else str(anchor),
         raw_key=raw_key,
@@ -906,7 +906,7 @@ def find_references_to(
     if related is not None:
         return _error_result(
             "retired_anchor",
-            "目标与旧版本中的借用锚点存在路径关系，已阻止",
+            "目标与旧版本中的关联锚点存在路径关系，已阻止",
             {"result": result},
         )
     return {

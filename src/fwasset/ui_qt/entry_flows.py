@@ -541,17 +541,17 @@ def open_create_asset(host: Any) -> None:
                 token = dict(result.get("payload", {})).get("overwrite_token")
                 answer = QMessageBox.question(
                     host,
-                    "覆盖借用",
-                    str(result.get("message") or "该模块已有借用，确认覆盖？"),
+                    "覆盖关联",
+                    str(result.get("message") or "该模块已有关联，确认覆盖？"),
                 )
                 if answer == QMessageBox.StandardButton.Yes and token is not None:
                     host.run_write(
-                        "登记借用", lambda log: run(log, token), done
+                        "关联程序", lambda log: run(log, token), done
                     )
                     return
             buttons[1].setEnabled(True)
 
-        host.run_write("登记借用", run, done)
+        host.run_write("关联程序", run, done)
 
     def submit_create() -> None:
         mode = str(chosen["kind"])
@@ -704,7 +704,7 @@ def open_update_program(host: Any) -> None:
         return
     if getattr(variant, "borrowed_only", False):
         QMessageBox.information(
-            host, "更新程序", "这是借用其他型号的程序，请到源型号里更新。"
+            host, "更新程序", "这是关联的其他型号程序，请到源型号里更新。"
         )
         return
     asset: FirmwareAsset = variant.asset
@@ -924,7 +924,7 @@ def open_update_program(host: Any) -> None:
                 answer = QMessageBox.question(
                     host,
                     "更新程序",
-                    "以下借用或默认指向这个程序：\n"
+                    "以下关联或默认指向这个程序：\n"
                     f"{_format_hits(result)}\n\n确认更新？",
                 )
                 if answer != QMessageBox.StandardButton.Yes:
@@ -943,7 +943,7 @@ def open_retired_versions(host: Any) -> None:
     variant = host.grid_panel.get_selected_variant()
     if variant is not None and getattr(variant, "borrowed_only", False):
         QMessageBox.information(
-            host, "备用版本", "这是借用其他型号的程序，请到源型号查看备用版本。"
+            host, "备用版本", "这是关联的其他型号程序，请到源型号查看备用版本。"
         )
         return
     selected_path = str(variant.asset.get("path") or "") if variant else ""
@@ -1061,7 +1061,7 @@ def _format_hits(result: dict[str, Any]) -> str:
     lookup = result.get("payload", {}).get("result")
     hits = list(getattr(lookup, "hits", []) or [])
     if not hits:
-        return "没有借用或默认指向这个程序"
+        return "没有关联或默认指向这个程序"
     lines = [f"共 {len(hits)} 条"]
     for hit in hits:
         lines.append(f"{hit.kind} · {hit.module_key} · {hit.owner_root}")

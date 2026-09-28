@@ -326,10 +326,10 @@ def set_asset_default(
     if lookup_result is not None:
         issues = lookup_result.issues
         if any(is_blocking_issue(issue) for issue in issues):
-            return _error("reference_incomplete", "借用引用无法完整读取，已停止设默认", {"issues": issues})
+            return _error("reference_incomplete", "关联记录无法完整读取，已停止设默认", {"issues": issues})
         residual = [hit for hit in lookup_result.hits if hit.kind == "shared_follow_default"]
         if residual:
-            return _error("follow_default_migration_required", "仍有旧版跟随默认借用，请先完成迁移", {"hits": residual})
+            return _error("follow_default_migration_required", "仍有旧版跟随默认关联，请先完成迁移", {"hits": residual})
 
     try:
         with WorkspaceTransaction(ws, operation="set_asset_default") as transaction:
@@ -358,14 +358,14 @@ def set_asset_default(
                     transaction.commit()
                     return _error(
                         "reference_incomplete",
-                        "借用引用无法完整读取，已停止设默认",
+                        "关联记录无法完整读取，已停止设默认",
                         {"issues": locked_result.issues},
                     )
                 if any(hit.kind == "shared_follow_default" for hit in locked_result.hits):
                     transaction.commit()
                     return _error(
                         "follow_default_migration_required",
-                        "仍有旧版跟随默认借用，请先完成迁移",
+                        "仍有旧版跟随默认关联，请先完成迁移",
                     )
             config_path = fresh_model / "平台配置.toml"
             preimage = _bytes(config_path)
@@ -418,7 +418,7 @@ def _confirmation_required(
 ) -> ServiceResult:
     return _error(
         "confirmation_required",
-        f"模块「{module_key}」已有借用登记，请确认覆盖",
+        f"模块「{module_key}」已有关联，请确认覆盖",
         {"existing": existing, "overwrite_token": _overwrite_token(generation, existing)},
     )
 
@@ -442,12 +442,12 @@ def register_shared_module(
     overwrite_token: dict[str, Any] | None = None,
     log_fn: Callable[[str], None] = print,
 ) -> ServiceResult:
-    """D1.8：登记或以确认 token 覆盖一条 static/follow_asset 借用。"""
+    """D1.8：登记或以确认 token 覆盖一条 static/follow_asset 关联。"""
     gate = check_reference_gate(configured_root, workspace_root)
     if gate is not None:
         return gate
     if mode not in ("static", "follow_asset"):
-        return _error("invalid_args", "新借用只支持固定版本或自动更新")
+        return _error("invalid_args", "新关联只支持固定版本或自动更新")
     ws = Path(workspace_root).resolve()
     try:
         target = assert_within_workspace(target_model_root, ws)
@@ -463,7 +463,7 @@ def register_shared_module(
     assert source is not None
     source_path = Path(str(source["path"]))
     if managed_path_reason(source_path, is_dir=True, workspace_root=ws) is not None:
-        return _error("retired_anchor", "不能借用受管排除目录中的程序")
+        return _error("retired_anchor", "不能关联受管排除目录中的程序")
     source_root = _model_root_for_asset(source, ws)
     source_id, source_status, _detail = load_model_config(source_root) if source_root else ("", "missing", "")
     target_id, target_status, _detail = load_model_config(target)
@@ -472,10 +472,10 @@ def register_shared_module(
     if target_status != "ok":
         return _error("invalid_target_model", "目标型号必须已配置 id")
     if same_path_identity(source_root, target) or source_id == target_id:
-        return _error("self_reference", "不能借用本型号自己的程序")
+        return _error("self_reference", "不能关联本型号自己的程序")
     other_roots = [root for root in enumerate_model_roots(ws) if not same_path_identity(root, target)]
     if not other_roots:
-        return _error("no_other_model", "当前没有其他可借用的型号")
+        return _error("no_other_model", "当前没有其他可关联的型号")
     module_key = canonical_module_dir(str(source.get("firmware_label", "") or ""))
     if not module_key:
         return _error("invalid_asset", "来源程序缺少可识别模块")
@@ -497,7 +497,7 @@ def register_shared_module(
             source_path = Path(str(source["path"]))
             if managed_path_reason(source_path, is_dir=True, workspace_root=ws) is not None:
                 transaction.commit()
-                return _error("retired_anchor", "不能借用受管排除目录中的程序")
+                return _error("retired_anchor", "不能关联受管排除目录中的程序")
             source_root = _model_root_for_asset(source, ws)
             source_id, source_status, _detail = (
                 load_model_config(source_root) if source_root else ("", "missing", "")
@@ -511,13 +511,13 @@ def register_shared_module(
                 return _error("invalid_target_model", "目标型号必须已配置 id")
             if same_path_identity(source_root, target) or source_id == target_id:
                 transaction.commit()
-                return _error("self_reference", "不能借用本型号自己的程序")
+                return _error("self_reference", "不能关联本型号自己的程序")
             other_roots = [
                 root for root in enumerate_model_roots(ws) if not same_path_identity(root, target)
             ]
             if not other_roots:
                 transaction.commit()
-                return _error("no_other_model", "当前没有其他可借用的型号")
+                return _error("no_other_model", "当前没有其他可关联的型号")
             module_key = canonical_module_dir(str(source.get("firmware_label", "") or ""))
             if not module_key:
                 transaction.commit()
@@ -532,11 +532,11 @@ def register_shared_module(
             pairs, invalid_keys, pair_status = _shared_pairs_from_data(data)
             if pair_status != "ok":
                 transaction.commit()
-                return _error("canonical_conflict", "型号配置中的借用条目结构无效")
+                return _error("canonical_conflict", "型号配置中的关联条目结构无效")
             matches = [ref for _raw_key, ref in pairs if ref.module_key == module_key]
             if invalid_keys or len(matches) > 1:
                 transaction.commit()
-                return _error("canonical_conflict", "型号配置中的借用条目存在 canonical 冲突")
+                return _error("canonical_conflict", "型号配置中的关联条目存在 canonical 冲突")
             existing = matches[0] if matches else None
             if preview_existing is not None:
                 if (
@@ -553,7 +553,7 @@ def register_shared_module(
             shared = data.setdefault("shared_modules", {})
             if not isinstance(shared, dict):
                 transaction.commit()
-                return _error("canonical_conflict", "型号配置中的借用条目结构无效")
+                return _error("canonical_conflict", "型号配置中的关联条目结构无效")
             rel = "/".join(source_path.relative_to(ws).parts)
             entry: dict[str, str] = {
                 "source_model_id": source_id,
@@ -571,7 +571,7 @@ def register_shared_module(
             transaction.commit()
     except Exception as exc:  # noqa: BLE001
         return _transaction_error(exc)
-    message = f"已登记「{module_key}」借用来源"
+    message = f"已关联「{module_key}」的来源程序"
     log_fn(message)
     return _ok("ok", message, {"module_key": module_key, "source_model_id": source_id})
 
@@ -584,7 +584,7 @@ def clear_shared_module(
     *,
     log_fn: Callable[[str], None] = print,
 ) -> ServiceResult:
-    """D10.1a：删除一条借用，并签发短时 CAS 撤销令牌。"""
+    """D10.1a：删除一条关联，并签发短时 CAS 撤销令牌。"""
     gate = check_reference_gate(configured_root, workspace_root)
     if gate is not None:
         return gate
@@ -605,18 +605,18 @@ def clear_shared_module(
             data, status, detail = _parse_model_toml(preimage)
             if status != "ok":
                 transaction.commit()
-                return _error("config_parse_error", "型号配置读取失败，已停止解除借用", {"detail": detail})
+                return _error("config_parse_error", "型号配置读取失败，已停止解除关联", {"detail": detail})
             shared = data.get("shared_modules")
             if not isinstance(shared, dict):
                 transaction.commit()
-                return _ok("unchanged", "未登记该模块借用，无需解除")
+                return _ok("unchanged", "该模块没有关联，无需解除")
             raw_keys = [key for key in shared if canonical_module_dir(str(key)) == canonical_key]
             if not raw_keys:
                 transaction.commit()
-                return _ok("unchanged", "未登记该模块借用，无需解除")
+                return _ok("unchanged", "该模块没有关联，无需解除")
             if len(raw_keys) != 1:
                 transaction.commit()
-                return _error("canonical_conflict", "型号配置中的借用条目存在 canonical 冲突")
+                return _error("canonical_conflict", "型号配置中的关联条目存在 canonical 冲突")
             shared.pop(raw_keys[0])
             if not shared:
                 data.pop("shared_modules", None)
@@ -638,7 +638,7 @@ def clear_shared_module(
             transaction.commit()
     except Exception as exc:  # noqa: BLE001
         return _transaction_error(exc)
-    message = f"已解除「{canonical_key}」借用"
+    message = f"已解除「{canonical_key}」的关联"
     log_fn(message)
     return _ok("ok", message, {"module_key": canonical_key, "undo_token": token})
 
@@ -650,13 +650,13 @@ def undo_clear_shared_module(
     *,
     log_fn: Callable[[str], None] = print,
 ) -> ServiceResult:
-    """D10.1a：仅在 postimage 未被改变时恢复已解除的借用。"""
+    """D10.1a：仅在 postimage 未被改变时恢复已解除的关联。"""
     gate = check_reference_gate(configured_root, workspace_root)
     if gate is not None:
         return gate
     undo = _CLEAR_UNDOS.pop(str(undo_token or ""), None)
     if undo is None or undo.expires_at < time.monotonic():
-        return _error("undo_conflict", "解除借用后的内容已失效或已被修改，不能撤销")
+        return _error("undo_conflict", "解除关联后的内容已失效或已被修改，不能撤销")
     ws = Path(workspace_root).resolve()
     try:
         assert_within_workspace(undo.target_root, ws)
@@ -678,6 +678,6 @@ def undo_clear_shared_module(
         return _error("out_of_workspace", f"撤销目标不在当前工作区内：{exc}")
     except Exception as exc:  # noqa: BLE001
         return _transaction_error(exc)
-    message = f"已恢复「{undo.module_key}」借用"
+    message = f"已恢复「{undo.module_key}」的关联"
     log_fn(message)
     return _ok("ok", message, {"module_key": undo.module_key})

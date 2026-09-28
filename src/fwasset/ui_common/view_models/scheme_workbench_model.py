@@ -945,11 +945,13 @@ class SchemeWorkbenchModel:
         格式:
         {
             "common": {"主板程序": 6, "手控UI": 17, ...},
-            "custom": ["以色列-Royal-Z9", "葡萄牙-小明", ...]
+            "custom": ["以色列-Royal-Z9", "葡萄牙-小明", ...],
+            "custom_counts": {"以色列-Royal-Z9": 3, ...},  # 方案专属程序数
+            "total": 42,  # 该型号物理存在的程序数
         }
         """
         if not model_name:
-            return {"common": {}, "custom": []}
+            return {"common": {}, "custom": [], "custom_counts": {}, "total": 0}
 
         assets = (
             self._all_assets
@@ -960,6 +962,7 @@ class SchemeWorkbenchModel:
         model_assets = [a for a in assets if self._belongs_to_model(a, model_name)]
 
         common_counts: dict[str, int] = {}
+        custom_counts: dict[str, int] = {}
         custom_schemes: set[str] = set()
         model_root = self._model_root_path_for_name(model_name)
         if model_root is not None:
@@ -978,6 +981,7 @@ class SchemeWorkbenchModel:
                 scheme = str(a.get("scheme_name", ""))
                 if scheme:
                     custom_schemes.add(scheme)
+                    custom_counts[scheme] = custom_counts.get(scheme, 0) + 1
 
         # 只登记了借用的模块也要在侧栏出现，否则点不进去
         present = {canonical_module_dir(label) for label in common_counts}
@@ -986,7 +990,12 @@ class SchemeWorkbenchModel:
                 common_counts[ref.module_key] = 1
                 present.add(ref.module_key)
 
-        return {"common": common_counts, "custom": sorted(list(custom_schemes))}
+        return {
+            "common": common_counts,
+            "custom": sorted(list(custom_schemes)),
+            "custom_counts": custom_counts,
+            "total": len(model_assets),
+        }
 
     def _shared_source_assets(
         self, resolution: SharedModuleResolution
