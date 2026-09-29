@@ -20,7 +20,7 @@ uv run python -m pytest -q      # 覆盖率门槛 80%，范围以 pyproject.toml
 - 用中文回复，先说结果，再补必要的验证、阻塞和下一步。
 - 修改前检查工作区，保留用户已有改动。不读 `config.toml`、`.env`、`.runtime/` 和 Agent 本地状态；配置参考 `config.example.toml`。场景脚本与人工验证用测试副本，不碰真实用户数据。
 - 小改动直接做；跨模块、多阶段或需跨会话接手的任务才在 `specs/active/` 建 Task。
-- 高风险改动（写语义、schema、扫描索引、USB、可能丢数据）提交前请 Codex 只读审查，用法见[跨工具审查](docs/agent-workflow.md#跨工具审查)。
+- 高风险改动（写语义、schema、扫描索引、USB、可能丢数据）提交前请独立 Codex 只读审查，用法见[独立审查](docs/agent-workflow.md#独立审查)。
 - 同一事实只写一处，其他地方引用；不写会话流水账、废弃方案或重复验证记录。
 
 ## 代码约束

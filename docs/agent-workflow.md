@@ -2,9 +2,9 @@
 
 补充 `AGENTS.md` 的协作、留档与提交细节，按需读取。
 
-## 跨工具审查
+## 独立审查
 
-写语义、schema、扫描索引、USB 或可能丢数据的改动，由 Claude Code 实现后请 Codex 只读审查（`/codex-review`）；其他改动靠必需检查和人工验证，不审。
+写语义、schema、扫描索引、USB 或可能丢数据的改动，提交前请独立 Codex 只读审查；其他改动靠必需检查和人工验证，不审。由 Claude Code 等其他工具实现时，使用 `/codex-review` 或下面的跨工具脚本；实现者已在 Codex 中时，派只读子 Agent 审查，不运行跨工具脚本。
 
 ```bash
 uv run python scripts/cross_review.py
