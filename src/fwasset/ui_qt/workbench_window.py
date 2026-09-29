@@ -893,7 +893,7 @@ class WorkbenchInterface(QWidget):
         self._nav_entries.append(("all", ""))
 
         if tree_data["common"]:
-            add_nav_section(self.nav, "通用模块")
+            add_nav_section(self.nav, "通用程序")
             self._nav_entries.append(("section", ""))
             for fw_label, count in tree_data["common"].items():
                 if search_kw and search_kw not in fw_label.lower():
@@ -901,7 +901,7 @@ class WorkbenchInterface(QWidget):
                 add_nav_entry(self.nav, fw_label, count)
                 self._nav_entries.append(("common_type", fw_label))
 
-        section = add_nav_section(self.nav, "定制方案")
+        section = add_nav_section(self.nav, "定制程序")
         self._nav_entries.append(("section", ""))
         self.nav.setItemWidget(section, self._scheme_section_widget())
         custom_counts = tree_data.get("custom_counts") or {}
@@ -924,7 +924,7 @@ class WorkbenchInterface(QWidget):
         self._apply_nav_selection_highlight()
 
     def _scheme_section_widget(self) -> QWidget:
-        """「定制方案」节标题右侧的新建按钮（标题文字由委托绘制）。"""
+        """「定制程序」节标题右侧的新建方案按钮（标题文字由委托绘制）。"""
         box = QWidget(self.nav)
         row = QHBoxLayout(box)
         row.setContentsMargins(0, 0, SPACE_XS, 0)

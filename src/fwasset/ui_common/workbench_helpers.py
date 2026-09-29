@@ -64,9 +64,9 @@ def usb_copy_notice(payload: Mapping[str, Any]) -> tuple[str, str, str] | None:
 def breadcrumb_text(node_type: str, common_type: str = "", scheme_name: str = "") -> str:
     """主区标题的分类部分（型号名另行显示）。"""
     if node_type == "common_type":
-        return f"通用模块 › {common_type}"
+        return f"通用程序 › {common_type}"
     if node_type == "custom_scheme":
-        return f"定制方案 › {scheme_name}"
+        return f"定制程序 › {scheme_name}"
     if node_type == "all":
         return "全部程序"
     return ""

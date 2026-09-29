@@ -23,6 +23,7 @@ PlatformConfigStatus = Literal[
 ]
 
 PLATFORM_CONFIG_FILENAME = "平台配置.toml"
+PLATFORM_CONFIG_HEADER = "# 本文件由 fwasset 管理。用户无需手写。"
 
 _MODULE_KEY_ALIASES = {
     "快捷键": "快捷键程序",
@@ -176,10 +177,7 @@ def _toml_str(value: str) -> str:
 
 def serialize_platform_config(platforms: list[PlatformDefaults]) -> str:
     """平台配置规范格式序列化（R8 级联改写计划用）：只输出头注释 + 平台块。"""
-    lines: list[str] = [
-        "# 本文件由 fwasset 管理（工作台「设为平台默认」会改写它）。",
-        "# defaults 键 = 通用区模块目录名，值 = 默认变体子目录名（空串表示该模块唯一）。",
-    ]
+    lines: list[str] = [PLATFORM_CONFIG_HEADER]
     for p in platforms:
         lines.append("")
         lines.append("[[platform]]")

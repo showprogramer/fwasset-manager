@@ -46,8 +46,8 @@ def test_relative_time_and_breadcrumb_texts() -> None:
     assert relative_time_text(7200) == "2 小时前"
     assert relative_time_text(3 * 86400) == "3 天前"
     assert breadcrumb_text("all") == "全部程序"
-    assert breadcrumb_text("common_type", common_type="手控UI") == "通用模块 › 手控UI"
-    assert breadcrumb_text("custom_scheme", scheme_name="客户A") == "定制方案 › 客户A"
+    assert breadcrumb_text("common_type", common_type="手控UI") == "通用程序 › 手控UI"
+    assert breadcrumb_text("custom_scheme", scheme_name="客户A") == "定制程序 › 客户A"
     assert breadcrumb_text("") == ""
 
 

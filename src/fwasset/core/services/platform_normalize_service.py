@@ -23,6 +23,7 @@ from fwasset.core.path_guard import (
 )
 from fwasset.core.platform_config import (
     PLATFORM_CONFIG_FILENAME,
+    PLATFORM_CONFIG_HEADER,
     PlatformConfigStatus,
     PlatformDefaults,
     canonical_module_dir,
@@ -65,8 +66,9 @@ __all__ = [
 
 _CHASSIS_TYPES: set[str] = set(get_args(ChassisType))
 
-#: ``serialize_platform_config`` 输出的固定文件头（按顺序、独占整行时不计入丢弃）。
-_APP_HEADER_COMMENTS = (
+#: 当前与历史应用文件头；仅出现在文件起始、按顺序独占整行时不计入丢弃。
+_APP_HEADER_COMMENTS = (PLATFORM_CONFIG_HEADER,)
+_LEGACY_APP_HEADER_COMMENTS = (
     "# 本文件由 fwasset 管理（工作台「设为平台默认」会改写它）。",
     "# defaults 键 = 通用区模块目录名，值 = 默认变体子目录名（空串表示该模块唯一）。",
 )
@@ -276,15 +278,17 @@ def _discarded_content(preimage: bytes, data: dict[str, Any]) -> list[str]:
     except UnicodeDecodeError:  # pragma: no cover - 解析阶段已拦住
         text = ""
     comments = _comment_lines(text)
-    # 排除应用自己的文件头：两行必须**同时**满足——是文件中的第 1、2 处注释、
-    # 按该顺序整行精确相等、且各自独占整行。只匹配到第一行不算：那一行可能是
-    # 用户自己复制来的，整体重写会删掉它，必须计入告知。
-    header = comments[: len(_APP_HEADER_COMMENTS)]
-    is_app_header = len(header) == len(_APP_HEADER_COMMENTS) and all(
-        whole_line and raw.rstrip() == expected
-        for (_lineno, raw, whole_line), expected in zip(header, _APP_HEADER_COMMENTS)
-    )
-    count = len(comments) - (len(_APP_HEADER_COMMENTS) if is_app_header else 0)
+    # 仅排除文件起始的完整应用文件头；历史两行头必须同时匹配。
+    header_len = 0
+    for expected_lines in (_LEGACY_APP_HEADER_COMMENTS, _APP_HEADER_COMMENTS):
+        header = comments[: len(expected_lines)]
+        if len(header) == len(expected_lines) and all(
+            whole_line and raw.rstrip() == expected
+            for (_lineno, raw, whole_line), expected in zip(header, expected_lines)
+        ):
+            header_len = len(expected_lines)
+            break
+    count = len(comments) - header_len
     if count > 0:
         summary.append(f"注释 {count} 处")
 

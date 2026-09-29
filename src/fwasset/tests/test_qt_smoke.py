@@ -15,6 +15,7 @@ import pytest
 pytest.importorskip("PySide6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtGui import QAction  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -591,6 +592,24 @@ def test_single_variant_collapses_with_directory_name_and_badge(qapp) -> None:
         "归属",
     ]
     assert grid.variant_count() == 1
+
+
+def test_grid_rows_align_with_headers(qapp) -> None:
+    grid = DataGrid(lambda _m: None)
+    grid.populate_tree([
+        ModuleRow(
+            label="主板程序",
+            source_kind="common",
+            source_label="通用",
+            variants=[_variant("甲"), _variant("乙")],
+        )
+    ])
+    left = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    assert grid.tree.header().defaultAlignment() == left
+    parent = grid.tree.topLevelItem(0)
+    for item in (parent, parent.child(0)):
+        for column in range(grid.tree.columnCount()):
+            assert item.textAlignment(column) == left
 
 
 def test_img_handcontrol_is_rendered_in_common_qt_grid(qapp, tmp_path) -> None:

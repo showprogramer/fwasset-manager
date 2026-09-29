@@ -221,8 +221,28 @@ class TestDiscardedContent:
         model = _model(tmp_path, "L36程序")
         _write_blocks(model, [("默认", {"主板": "甲"})])
 
+        content = _config(model).read_text(encoding="utf-8")
+        assert content.startswith("# 本文件由 fwasset 管理。用户无需手写。\n")
+        assert "设为平台默认" not in content
+        assert "# defaults 键" not in content
+
         preview = _preview(tmp_path, model)
 
+        assert not any("注释" in item for item in preview["discarded_content"])
+
+    def test_legacy_app_header_at_file_start_is_not_counted(self, tmp_path: Path) -> None:
+        model = _model(tmp_path, "L36程序")
+        _config(model).write_text(
+            "# 本文件由 fwasset 管理（工作台「设为平台默认」会改写它）。\n"
+            "# defaults 键 = 通用区模块目录名，值 = 默认变体子目录名（空串表示该模块唯一）。\n"
+            "[[platform]]\n"
+            'name = "默认"\n'
+            "[platform.defaults]\n"
+            '"主板" = "甲"\n',
+            encoding="utf-8",
+        )
+
+        preview = _preview(tmp_path, model)
         assert not any("注释" in item for item in preview["discarded_content"])
 
     def test_similar_but_unequal_header_is_counted(self, tmp_path: Path) -> None:

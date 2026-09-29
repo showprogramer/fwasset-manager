@@ -14,6 +14,7 @@ from qfluentwidgets import (
     TreeWidget,
     getFont,
     isDarkTheme,
+    setCustomStyleSheet,
     themeColor,
 )
 
@@ -36,6 +37,7 @@ _VARIANT_ROLE = Qt.ItemDataRole.UserRole
 _TAG_KIND_ROLE = Qt.ItemDataRole.UserRole + 1
 TAG_COLUMN = 3
 COLUMNS = ["类型", "程序名称", "版本", "归属"]
+_CELL_ALIGNMENT = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
 
 
 def tag_colors(kind: str) -> tuple[QColor, QColor]:
@@ -117,12 +119,16 @@ class DataGrid(QWidget):
         for col, width in enumerate(GRID_COL_WIDTHS):
             self.tree.setColumnWidth(col, width)
         header.setStretchLastSection(True)
-        header.setDefaultAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        header.setDefaultAlignment(_CELL_ALIGNMENT)
+        # Fluent 树项默认左内边距 20px，首列还包含展开箭头的层级缩进。
+        # 缩小单元格留白，并让首列表头与层级文字对齐；保留 Fluent 选中样式。
+        grid_qss = (
+            f"QTreeView {{ border-radius: {GRID_BORDER_RADIUS}px; }}"
+            "QTreeView::item { padding-left: 4px; }"
+            "QHeaderView::section:first { padding-left: 40px; }"
         )
-        # 行高由委托给出；不覆盖 Fluent 样式表，否则选中行退回系统默认外观。
+        setCustomStyleSheet(self.tree, grid_qss, grid_qss)
         self.tree.setBorderVisible(False)
-        self.tree.setBorderRadius(GRID_BORDER_RADIUS)
         self.tree.setUniformRowHeights(True)
         layout.addWidget(self.tree)
 
@@ -159,6 +165,8 @@ class DataGrid(QWidget):
             variant.shared_source_label,
         )
         item = QTreeWidgetItem([first, name, variant.version or "-", text])
+        for column in range(len(COLUMNS)):
+            item.setTextAlignment(column, _CELL_ALIGNMENT)
         item.setData(TAG_COLUMN, _TAG_KIND_ROLE, kind)
         item.setData(0, _VARIANT_ROLE, variant)
         if variant.shared_source_label:
@@ -187,6 +195,8 @@ class DataGrid(QWidget):
                         self._source_text(row.source_label, row.source_kind),
                     ]
                 )
+                for column in range(len(COLUMNS)):
+                    parent.setTextAlignment(column, _CELL_ALIGNMENT)
                 parent.setData(TAG_COLUMN, _TAG_KIND_ROLE, "accent")
                 self.tree.addTopLevelItem(parent)
                 for variant in row.variants:
