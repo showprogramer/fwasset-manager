@@ -179,7 +179,8 @@ def test_defaults_come_from_current_program(env) -> None:
         assert ui.vendors.currentText() == "摩众"
         assert ui.scope.scheme() == ""
         assert ui.name.text() == "dad"
-        assert ui.radios["留作备用副本"].isChecked()
+        assert list(ui.radios) == ["删除旧程序", "留作备用副本"]
+        assert ui.radios["删除旧程序"].isChecked()
         assert not ui.update.isEnabled()
         assert "请选择新的程序文件" in ui.hint.text()
 
@@ -199,7 +200,7 @@ def test_only_new_files_updates_with_prefilled_name(env) -> None:
     [call] = env.calls["update"]
     assert call["source_name"] == "V68"
     assert call["files"] == ["V68.bin", "V68.hex"]
-    assert call["retire_mode"] == "retire_to_backup"
+    assert call["retire_mode"] == "retire_to_trash"
     assert not call["source"].exists(), "临时来源目录应在调用后删除"
     assert not env.calls["change"]
     assert env.calls["vendor"] == [
@@ -208,17 +209,17 @@ def test_only_new_files_updates_with_prefilled_name(env) -> None:
     assert env.host.refreshed == 1
 
 
-def test_rename_takes_effect_and_delete_option(env) -> None:
+def test_rename_takes_effect_and_backup_option(env) -> None:
     def drive(ui) -> None:
         ui.drop.files_chosen.emit(env.files)
         ui.name.setText("量产V2")
-        ui.radios["删除旧程序"].setChecked(True)
+        ui.radios["留作备用副本"].setChecked(True)
         ui.update.click()
 
     _run(env, drive)
     [call] = env.calls["update"]
     assert call["source_name"] == "量产V2"
-    assert call["retire_mode"] == "retire_to_trash"
+    assert call["retire_mode"] == "retire_to_backup"
 
 
 def test_same_name_as_old_blocks_plain_update(env) -> None:
