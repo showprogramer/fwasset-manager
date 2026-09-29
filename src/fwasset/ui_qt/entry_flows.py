@@ -23,10 +23,14 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QVBoxLayout,
+    QWidget,
 )
 
 from fwasset.core.firmware_catalog import enabled_firmware_types
-from fwasset.core.platform_config import canonical_module_dir
+from fwasset.core.platform_config import (
+    canonical_module_dir,
+    load_platform_config_with_status,
+)
 from fwasset.core.reference_lookup import find_references_to
 from fwasset.core.services.asset_service import create_asset, delete_asset
 from fwasset.core.services.layout_update_service import (
@@ -36,6 +40,7 @@ from fwasset.core.services.layout_update_service import (
     update_asset,
 )
 from fwasset.core.services.model_scheme_service import (
+    change_chassis_type,
     create_model,
     create_scheme,
     delete_model,
@@ -64,15 +69,24 @@ from fwasset.ui_common.asset_name_prefill import (
 from fwasset.ui_common.workbench_helpers import module_label_from_asset
 from fwasset.ui_common.workspace_actions import (
     ProgramUpdatePlan,
+    compose_model_dir_name,
     direct_scheme_dir_names,
     effect_for_result,
     plan_program_update,
+    retarget_model_dir_name,
     stage_files_as_named_dir,
 )
-from fwasset.ui_qt.design_tokens import SPACE_LG
+from fwasset.ui_qt.design_tokens import (
+    SPACE_LG,
+    SPACE_MD,
+    SPACE_SM,
+    SPACE_XS,
+    SPACE_XXS,
+)
 from fwasset.ui_qt.program_form import FileDropZone, ScopeCombo
 
 _CHASSIS: tuple[ChassisType, ...] = ("单3D", "单2D", "双2D", "上3D下2D")
+_DIALOG_MARGIN = 24
 
 
 def present_result(host: Any, result: dict[str, Any], entry: str) -> str:
@@ -162,24 +176,40 @@ def open_create_model(host: Any) -> None:
         return
     dialog = QDialog(host)
     dialog.setWindowTitle("新增型号")
-    layout = QVBoxLayout(dialog)
-    layout.setContentsMargins(SPACE_LG, SPACE_LG, SPACE_LG, SPACE_LG)
+    layout = _setup_dialog(dialog, 440)
     name = QLineEdit(dialog)
     name.setPlaceholderText("型号名称")
     chassis = QComboBox(dialog)
     chassis.addItem("请选择机芯类型", "")
     for item in _CHASSIS:
         chassis.addItem(item, item)
-    layout.addWidget(QLabel("名称"))
-    layout.addWidget(name)
-    layout.addWidget(QLabel("机芯类型"))
-    layout.addWidget(chassis)
+    _add_field(layout, "名称", name)
+    _add_field(layout, "机芯类型", chassis)
+    preview = QLabel("", dialog)
+    preview.setWordWrap(True)
+    preview.setMinimumHeight(48)
+    preview.setAlignment(Qt.AlignmentFlag.AlignTop)
+    layout.addWidget(preview)
     buttons = _button_row(dialog, "创建")
     layout.addLayout(buttons[0])
 
+    def sync_preview() -> None:
+        shown = compose_model_dir_name(name.text(), str(chassis.currentData() or ""))
+        if shown:
+            preview.setText(
+                f"将创建型号：{shown}\n同一型号的不同机芯请分别新增，名称会自动带上机芯类型。"
+            )
+        else:
+            preview.setText("名称会自动带上机芯类型，便于区分同一型号的不同机芯。")
+
+    sync_preview()
+
+    name.textChanged.connect(lambda _t: sync_preview())
+    chassis.currentIndexChanged.connect(lambda _i: sync_preview())
+
     def submit() -> None:
-        model_name = name.text().strip()
         chosen = str(chassis.currentData() or "")
+        model_name = compose_model_dir_name(name.text(), chosen)
         if not model_name or not chosen:
             QMessageBox.information(host, "新增型号", "请填写名称并选择机芯类型。")
             return
@@ -202,6 +232,51 @@ def open_create_model(host: Any) -> None:
 
     buttons[1].clicked.connect(submit)
     dialog.exec()
+
+
+def open_change_chassis(host: Any) -> None:
+    target = _selected_model_root(host)
+    if target is None or not host._write_gate(target):
+        return
+    platforms, _status, _detail = load_platform_config_with_status(target)
+    current = platforms[0].platform_name if len(platforms) == 1 else ""
+    items = [item for item in _CHASSIS if item != current]
+    chosen, accepted = QInputDialog.getItem(
+        host,
+        "修改机芯类型",
+        f"「{target.name}」当前机芯类型：{current or '未设置'}\n改为：",
+        items,
+        0,
+        False,
+    )
+    if not accepted or not chosen:
+        return
+
+    def after_rename(result: dict[str, Any], new_name: str) -> None:
+        if present_result(host, result, "rename_model") in {"toast", "rescan_hint"}:
+            host.refresh_model_chips(new_name)
+        else:
+            host.refresh_model_chips(target.name)
+
+    def done(result: dict[str, Any]) -> None:
+        action = present_result(host, result, "change_chassis_type")
+        if action not in {"toast", "rescan_hint"}:
+            return
+        new_name = retarget_model_dir_name(target.name, current, chosen)
+        if new_name is None:
+            host.refresh_model_chips(target.name)
+            return
+        host.run_write(
+            "重命名型号",
+            lambda log: rename_model(host.root_dir, host.root_dir, target, new_name, log_fn=log),
+            lambda res: after_rename(res, new_name),
+        )
+
+    host.run_write(
+        "修改机芯类型",
+        lambda log: change_chassis_type(host.root_dir, host.root_dir, target, chosen, log_fn=log),
+        done,
+    )
 
 
 def _selected_model_root(host: Any) -> Path | None:
@@ -348,9 +423,9 @@ def open_create_asset(host: Any) -> None:
         return
     dialog = QDialog(host)
     dialog.setWindowTitle("新建程序")
-    layout = QVBoxLayout(dialog)
-    layout.setContentsMargins(SPACE_LG, SPACE_LG, SPACE_LG, SPACE_LG)
+    layout = _setup_dialog(dialog, 480)
     source_label = QLabel("尚未选择来源", dialog)
+    source_label.setWordWrap(True)
     modules = QComboBox(dialog)
     modules.setObjectName("module_combo")
     for item in enabled_firmware_types():
@@ -369,38 +444,38 @@ def open_create_asset(host: Any) -> None:
     hint = QLabel("", dialog)
     hint.setWordWrap(True)
 
-    layout.addWidget(QLabel("来源"))
-    layout.addWidget(source_label)
     source_row = QHBoxLayout()
+    source_row.setSpacing(SPACE_MD)
     file_button = QPushButton("选择文件", dialog)
     borrow_button = QPushButton("使用其他型号的程序", dialog)
     source_row.addWidget(file_button)
     source_row.addWidget(borrow_button)
-    layout.addLayout(source_row)
+    source_row.addStretch(1)
+    source_box = QWidget(dialog)
+    source_layout = QVBoxLayout(source_box)
+    source_layout.setContentsMargins(0, 0, 0, 0)
+    source_layout.setSpacing(SPACE_SM)
+    source_layout.addLayout(source_row)
+    source_layout.addWidget(source_label)
+    _add_field(layout, "来源", source_box)
 
-    layout.addWidget(QLabel("程序类型"))
-    layout.addWidget(modules)
+    _add_field(layout, "程序类型", modules)
 
     # 借用只跟随来源程序的后续更新，不再选择固定版本。
     borrow_source = QComboBox(dialog)
     borrow_source.setObjectName("borrow_source_combo")
-    borrow_source_label = QLabel("源程序", dialog)
-    layout.addWidget(borrow_source_label)
-    layout.addWidget(borrow_source)
+    borrow_source_label = _add_field(layout, "源程序", borrow_source)
 
-    layout.addWidget(QLabel("程序名"))
-    layout.addWidget(asset_name)
-    layout.addWidget(QLabel("厂商"))
-    layout.addWidget(vendors)
+    _add_field(layout, "程序名", asset_name)
+    _add_field(layout, "厂商", vendors)
 
     # 范围：通用 / 各方案 / + 新建定制方案…
-    layout.addWidget(QLabel("通用/定制"))
     scope = ScopeCombo(
         dialog,
         model_root=Path(model_root),
         on_create=_scheme_creator(host, Path(model_root)),
     )
-    layout.addWidget(scope)
+    _add_field(layout, "通用/定制", scope)
 
     layout.addWidget(hint)
     chosen: dict[str, Any] = {"kind": "", "source": None, "files": []}
@@ -721,19 +796,15 @@ def open_update_program(host: Any) -> None:
 
     dialog = QDialog(host)
     dialog.setWindowTitle("更新程序")
-    dialog.resize(560, 0)
-    layout = QVBoxLayout(dialog)
-    layout.setContentsMargins(SPACE_LG, SPACE_LG, SPACE_LG, SPACE_LG)
+    layout = _setup_dialog(dialog, 560)
     scope_text = old_scheme or "通用"
-    layout.addWidget(
-        QLabel(f"正在更新：<b>{old_path.name} · {old_module} · {scope_text}</b>", dialog)
-    )
+    current_label = QLabel(f"正在更新：<b>{old_path.name} · {old_module} · {scope_text}</b>", dialog)
+    current_label.setWordWrap(True)
+    layout.addWidget(current_label)
 
-    layout.addWidget(QLabel("新的程序", dialog))
     drop = FileDropZone(dialog)
-    layout.addWidget(drop)
+    _add_field(layout, "新的程序", drop)
 
-    layout.addWidget(QLabel("程序类型", dialog))
     modules = QComboBox(dialog)
     modules.setObjectName("module_combo")
     for item in enabled_firmware_types():
@@ -743,9 +814,8 @@ def open_update_program(host: Any) -> None:
         if canonical_module_dir(label) == canonical_module_dir(old_module):
             modules.setCurrentIndex(i)
             break
-    layout.addWidget(modules)
+    _add_field(layout, "程序类型", modules)
 
-    layout.addWidget(QLabel("归属厂商", dialog))
     vendors = QComboBox(dialog)
     vendors.setObjectName("vendor_combo")
     vendors.setEditable(True)
@@ -757,21 +827,21 @@ def open_update_program(host: Any) -> None:
         vendors.addItem(item)
     if current_vendor:
         vendors.setCurrentText(current_vendor)
-    layout.addWidget(vendors)
+    _add_field(layout, "归属厂商", vendors)
 
-    layout.addWidget(QLabel("通用/定制", dialog))
     scope = ScopeCombo(
         dialog, model_root=model_root, on_create=_scheme_creator(host, model_root)
     )
     scope.set_scheme(old_scheme)
-    layout.addWidget(scope)
+    _add_field(layout, "通用/定制", scope)
 
-    layout.addWidget(QLabel("程序名称", dialog))
     program_name = QLineEdit(old_path.name, dialog)
-    layout.addWidget(program_name)
+    program_name.setObjectName("program_name_edit")
+    _add_field(layout, "程序名称", program_name)
 
     retire_row = QHBoxLayout()
-    retire_row.addWidget(QLabel("旧程序", dialog))
+    retire_row.setSpacing(SPACE_LG)
+    retire_row.addWidget(QLabel("旧程序处理", dialog))
     backup = QRadioButton("留作备用副本", dialog)
     trash = QRadioButton("删除旧程序", dialog)
     backup.setChecked(True)
@@ -962,9 +1032,8 @@ def open_retired_versions(host: Any) -> None:
 
     dialog = QDialog(host)
     dialog.setWindowTitle(f"备用版本 · {current_path.name}")
-    dialog.resize(660, 400)
-    layout = QVBoxLayout(dialog)
-    layout.setContentsMargins(SPACE_LG, SPACE_LG, SPACE_LG, SPACE_LG)
+    dialog.resize(620, 420)
+    layout = _setup_dialog(dialog, 520)
     explanation = QLabel(
         "恢复会把选中的旧程序重新放回原位置，当前程序会留作备用副本。"
         "不同程序类型或方案的副本暂不能直接恢复。",
@@ -975,7 +1044,8 @@ def open_retired_versions(host: Any) -> None:
 
     version_list = QListWidget(dialog)
     version_list.setObjectName("retired_versions_list")
-    layout.addWidget(version_list)
+    version_list.setStyleSheet("QListWidget::item { padding: 8px 6px; }")
+    layout.addWidget(version_list, 1)
     if versions:
         for index, entry in enumerate(versions):
             original_name = Path(entry["retired_from"]).name if entry["retired_from"] else "?"
@@ -989,16 +1059,10 @@ def open_retired_versions(host: Any) -> None:
         empty = QListWidgetItem("当前程序没有备用版本", version_list)
         empty.setFlags(Qt.ItemFlag.NoItemFlags)
 
-    row = QHBoxLayout()
-    row.addStretch(1)
-    close_button = QPushButton("关闭", dialog)
-    restore_button = QPushButton("恢复选中版本", dialog)
+    row, restore_button = _button_row(dialog, "恢复选中版本")
     restore_button.setObjectName("restore_retired_button")
     restore_button.setEnabled(False)
-    row.addWidget(close_button)
-    row.addWidget(restore_button)
     layout.addLayout(row)
-    close_button.clicked.connect(dialog.reject)
 
     def selected_version() -> RetiredVersionView | None:
         item = version_list.currentItem()
@@ -1068,14 +1132,48 @@ def _format_hits(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _setup_dialog(dialog: QDialog, min_width: int = 460) -> QVBoxLayout:
+    """录入类对话框统一版式：最小宽度、外边距与分组间距。"""
+    dialog.setMinimumWidth(min_width)
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(_DIALOG_MARGIN, _DIALOG_MARGIN, _DIALOG_MARGIN, _DIALOG_MARGIN)
+    layout.setSpacing(SPACE_LG)
+    return layout
+
+
+def _add_field(layout: QVBoxLayout, text: str, *widgets: QWidget) -> QWidget:
+    """一组「小标题 + 控件」，组内紧凑、组间留白。返回整组容器以便按需隐藏。"""
+    box = QWidget()
+    group = QVBoxLayout(box)
+    group.setContentsMargins(0, 0, 0, 0)
+    group.setSpacing(SPACE_XS + SPACE_XXS)
+    caption = QLabel(text)
+    caption.setStyleSheet("font-size: 12px;")
+    group.addWidget(caption)
+    for widget in widgets:
+        group.addWidget(widget)
+    layout.addWidget(box)
+    return box
+
+
+def _style_buttons(cancel: QPushButton, confirm: QPushButton) -> None:
+    """确认键为默认键（主色强调），取消键不抢默认。"""
+    for button in (cancel, confirm):
+        button.setMinimumWidth(96)
+    cancel.setAutoDefault(False)
+    confirm.setDefault(True)
+
+
 def _button_row(dialog: QDialog, confirm_text: str) -> tuple[QHBoxLayout, QPushButton]:
     row = QHBoxLayout()
+    row.setSpacing(SPACE_MD)
     row.addStretch(1)
     cancel = QPushButton("取消", dialog)
     confirm = QPushButton(confirm_text, dialog)
     row.addWidget(cancel)
     row.addWidget(confirm)
     cancel.clicked.connect(dialog.reject)
+    _style_buttons(cancel, confirm)
     return row, confirm
 
 

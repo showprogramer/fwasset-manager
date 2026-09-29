@@ -116,6 +116,7 @@ from fwasset.ui_qt.design_tokens import (
 )
 from fwasset.ui_qt.detail_pane import DetailPane
 from fwasset.ui_qt.entry_flows import (
+    open_change_chassis,
     open_change_vendor,
     open_create_asset,
     open_create_model,
@@ -782,6 +783,7 @@ class WorkbenchInterface(QWidget):
         for icon, text, flow, enabled in (
             (FluentIcon.ADD, "新增型号", open_create_model, True),
             (FluentIcon.EDIT, "重命名当前型号", open_rename_model, has_model),
+            (FluentIcon.SETTING, "修改机芯类型", open_change_chassis, has_model),
             (FluentIcon.DELETE, "删除当前型号", open_delete_model, has_model),
         ):
             action = Action(icon, text, menu)

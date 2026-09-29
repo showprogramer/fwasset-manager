@@ -151,7 +151,7 @@ def _parts(dialog):
         modules=_named(dialog, QComboBox, "module_combo"),
         vendors=_named(dialog, QComboBox, "vendor_combo"),
         scope=_named(dialog, QComboBox, "scope_combo"),
-        name=dialog.findChild(QLineEdit),
+        name=_named(dialog, QLineEdit, "program_name_edit"),
         hint=_named(dialog, QLabel, "update_hint"),
         update={b.text(): b for b in dialog.findChildren(QPushButton)}["更新"],
         radios={r.text(): r for r in dialog.findChildren(QRadioButton)},

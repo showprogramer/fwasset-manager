@@ -105,6 +105,22 @@ class RepairRow:
         raise KeyError(key)
 
 
+def compose_model_dir_name(name: str, chassis: str) -> str:
+    """型号目录名 = 名称 + 机芯类型，使同型号不同机芯并列时能区分。"""
+    base = name.strip()
+    if not base or not chassis or base.endswith(chassis):
+        return base
+    return f"{base} {chassis}"
+
+
+def retarget_model_dir_name(dir_name: str, old: str, new: str) -> str | None:
+    """改机芯类型后同步目录名后缀；目录名不以旧类型结尾则返回 None（不动名字）。"""
+    if not old or old == new or not dir_name.endswith(old):
+        return None
+    stem = dir_name[: -len(old)].rstrip(" -_·")
+    return f"{stem} {new}" if stem else None
+
+
 def resume_function_name(operation: str | None) -> str | None:
     """操作日志名 → 续跑函数名。没有续跑入口的操作返回 None。"""
     if not operation:

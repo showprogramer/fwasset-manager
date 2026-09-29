@@ -13,8 +13,14 @@ import pytest
 
 from fwasset.core.managed_paths import detect_workspace_layout
 from fwasset.core.model_config import load_model_config
+from fwasset.core.platform_config import (
+    PlatformDefaults,
+    load_platform_config_with_status,
+    save_platform_config,
+)
 from fwasset.core.reference_lookup import enumerate_model_roots
 from fwasset.core.services.model_scheme_service import (
+    change_chassis_type,
     create_model,
     create_scheme,
     delete_model,
@@ -28,6 +34,55 @@ from fwasset.core.workspace_transaction import load_workspace_status
 
 def _create_model(ws: Path, name: str = "L99程序", chassis: str = "单3D") -> dict:
     return create_model(str(ws), str(ws), name, chassis)  # type: ignore[arg-type]
+
+
+def test_same_model_two_chassis_coexist_as_separate_models(tmp_path: Path) -> None:
+    assert _create_model(tmp_path, "L36 单3D", "单3D")["ok"] is True
+    assert _create_model(tmp_path, "L36 双2D", "双2D")["ok"] is True
+    names = sorted(p.name for p in enumerate_model_roots(tmp_path))
+    assert names == ["L36 单3D", "L36 双2D"]
+
+
+def test_change_chassis_type_keeps_defaults(tmp_path: Path) -> None:
+    _create_model(tmp_path, "L36", "单3D")
+    root = tmp_path / "L36"
+    save_platform_config(root, [PlatformDefaults("单3D", {"蓝牙": "v1"})])
+    result = change_chassis_type(str(tmp_path), str(tmp_path), root, "双2D")  # type: ignore[arg-type]
+    assert result["ok"] is True
+    platforms, status, _err = load_platform_config_with_status(root)
+    assert status == "ok"
+    assert [(p.platform_name, p.defaults) for p in platforms] == [("双2D", {"蓝牙": "v1"})]
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_change_chassis_type_same_value_is_unchanged(tmp_path: Path) -> None:
+    _create_model(tmp_path, "L36", "单3D")
+    result = change_chassis_type(str(tmp_path), str(tmp_path), tmp_path / "L36", "单3D")
+    assert result["ok"] is True
+    assert result["code"] == "unchanged"
+
+
+def test_change_chassis_type_rejects_invalid_and_multi_block(tmp_path: Path) -> None:
+    _create_model(tmp_path, "L36", "单3D")
+    root = tmp_path / "L36"
+    bad = change_chassis_type(str(tmp_path), str(tmp_path), root, "乱写")  # type: ignore[arg-type]
+    assert bad["code"] == "invalid_chassis_type"
+    save_platform_config(root, [PlatformDefaults("A"), PlatformDefaults("B")])
+    multi = change_chassis_type(str(tmp_path), str(tmp_path), root, "双2D")
+    assert multi["code"] == "platform_not_normalized"
+    assert load_workspace_status(tmp_path).state == "clean"
+
+
+def test_dir_name_helpers() -> None:
+    from fwasset.ui_common.workspace_actions import (
+        compose_model_dir_name,
+        retarget_model_dir_name,
+    )
+
+    assert compose_model_dir_name(" L36 ", "单3D") == "L36 单3D"
+    assert compose_model_dir_name("L36 单3D", "单3D") == "L36 单3D"
+    assert retarget_model_dir_name("L36 单3D", "单3D", "双2D") == "L36 双2D"
+    assert retarget_model_dir_name("L36", "单3D", "双2D") is None
 
 
 # ---------------------------------------------------------------------------

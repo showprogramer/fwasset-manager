@@ -28,7 +28,11 @@ from fwasset.core.managed_paths import _has_model_marker, detect_workspace_layou
 from fwasset.core.manifest import ManifestError, directory_manifest, manifest_hash
 from fwasset.core.model_config import load_model_config, save_model_id, slugify_model_id
 from fwasset.core.path_guard import same_path_identity
-from fwasset.core.platform_config import PlatformDefaults, save_platform_config
+from fwasset.core.platform_config import (
+    PlatformDefaults,
+    load_platform_config_with_status,
+    save_platform_config,
+)
 from fwasset.core.quarantine import (
     QuarantineError,
     UndoConflictError,
@@ -57,6 +61,7 @@ from fwasset.core.workspace_transaction import WorkspaceTransaction
 
 __all__ = [
     "create_model",
+    "change_chassis_type",
     "create_scheme",
     "rename_model",
     "rename_scheme",
@@ -182,6 +187,61 @@ def create_model(
             code,
             message,
             {"model_root": str(target), "model_id": model_id, "chassis_type": chassis_type},
+        )
+
+
+def change_chassis_type(
+    configured_root: str | Path | None,
+    workspace_root: str | Path,
+    model_root: str | Path,
+    chassis_type: ChassisType,
+    log_fn: Callable[..., None] = print,
+) -> ServiceResult:
+    """修改型号的机芯类型：只改 `平台配置.toml` 的单块名，保留模块默认。"""
+    gate = check_reference_gate(configured_root, workspace_root)
+    if gate is not None:
+        return gate
+    if chassis_type not in _CHASSIS_TYPES:
+        return _error("invalid_chassis_type", f"非法的机芯类型：{chassis_type!r}")
+
+    ws = Path(workspace_root)
+    root = Path(model_root)
+    if not _has_model_marker(root) or same_path_identity(root, ws):
+        return _error("invalid_target", f"目标不是型号根：{root}")
+
+    with WorkspaceTransaction(ws, operation="change_chassis_type") as transaction:
+        platforms, status, detail = load_platform_config_with_status(root)
+        if status in ("parse_error", "parser_missing"):
+            transaction.commit()
+            return _error("config_parse_error", "平台配置读取失败，已停止修改", {"detail": detail})
+        if len(platforms) > 1:
+            transaction.commit()
+            return _error("platform_not_normalized", "该型号有多个平台配置块，无法直接修改机芯类型")
+
+        previous = platforms[0].platform_name if platforms else ""
+        if previous == chassis_type:
+            transaction.commit()
+            return _ok("unchanged", f"机芯类型已经是「{chassis_type}」", {"previous": previous})
+
+        transaction.begin_product_write()
+        block = platforms[0] if platforms else PlatformDefaults(chassis_type, {})
+        block.platform_name = chassis_type
+        try:
+            save_platform_config(root, [block])
+        except OSError as exc:
+            transaction.commit()
+            return _error("write_failed", f"写入平台配置失败：{exc}")
+
+        try:
+            reconcile_subtree(str(ws), str(root))
+        except Exception as exc:  # noqa: BLE001
+            log_fn(f"机芯类型修改后索引对账失败，需重新读取程序列表：{exc}")
+
+        transaction.commit()
+        return _ok(
+            "ok",
+            f"「{root.name}」的机芯类型已改为「{chassis_type}」",
+            {"model_root": str(root), "previous": previous, "chassis_type": chassis_type},
         )
 
 
