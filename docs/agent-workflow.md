@@ -4,13 +4,9 @@
 
 ## 独立审查
 
-写语义、schema、扫描索引、USB 或可能丢数据的改动，提交前请独立 Codex 只读审查；其他改动靠必需检查和人工验证，不审。由 Claude Code 等其他工具实现时，使用 `/codex-review` 或下面的跨工具脚本；实现者已在 Codex 中时，派只读子 Agent 审查，不运行跨工具脚本。
+写语义、schema、扫描索引、USB 或可能丢数据的改动，提交前请独立 Codex 只读审查；其他改动靠必需检查和人工验证，不审。由 Claude Code 等其他工具实现时，使用 `/codex-review` 技能；实现者已在 Codex 中时，派只读子 Agent 审查。
 
-```bash
-uv run python scripts/cross_review.py
-```
-
-可加 `--spec <规格>`、`--focus "<重点>"`、`--base <基线>`、`--model <模型>`。审查指令在 [review-prompt.md](review-prompt.md)，结果写入系统临时目录。审查者只报问题；实现者逐条核实，修复成立的问题，并向用户说明不成立的理由。同类问题连续两轮出现，就停下来请用户裁决。
+审查指令见 [review-prompt.md](review-prompt.md)。审查者只报问题；实现者逐条核实，修复成立的问题，并向用户说明不成立的理由。同类问题连续两轮出现，就停下来请用户裁决。
 
 ## 子 Agent 协作
 
