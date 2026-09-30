@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QWidget,
 )
 
@@ -110,25 +111,42 @@ class FileDropZone(QFrame):
 
     files_chosen = Signal(list)
 
-    def __init__(self, parent: QWidget | None, *, hint: str = "拖到这里，或点选择") -> None:
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        hint: str = "拖到这里，或点选择",
+        pick_text: str = "选择…",
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("dropZone")
         self.setAcceptDrops(True)
         self.setStyleSheet(
             "QFrame#dropZone { border: 1px dashed #b8c4cc; border-radius: 6px; }"
         )
+        self.setMinimumHeight(68)
         row = QHBoxLayout(self)
+        row.setContentsMargins(10, 8, 10, 8)
         self.label = QLabel(hint, self)
-        self.label.setWordWrap(True)
-        self.button = QPushButton("选择…", self)
+        self.label.setWordWrap(False)
+        self.label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.label.setToolTip(hint)
+        self.button = QPushButton(pick_text, self)
+        self.button.setMinimumWidth(112)
+        self.button.setMinimumHeight(36)
+        self.button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         row.addWidget(self.label, stretch=1)
         row.addWidget(self.button)
         self.button.clicked.connect(self._pick)
 
     def show_files(self, files: list[str]) -> None:
-        names = "、".join(Path(item).name for item in files[:3])
-        more = f" 等 {len(files)} 个" if len(files) > 3 else ""
-        self.label.setText(f"已选择：{names}{more}")
+        self.label.setText(f"已选择 {len(files)} 个文件")
+        self.label.setToolTip("\n".join(Path(item).name for item in files))
+
+    def show_current_files(self, files: list[str]) -> None:
+        """更新对话框的默认来源；完整文件名放在悬停提示中。"""
+        self.label.setText(f"沿用原文件（{len(files)} 个）")
+        self.label.setToolTip("\n".join(files) if files else "当前程序目录中的文件")
 
     def _pick(self) -> None:
         paths, _selected = QFileDialog.getOpenFileNames(self, "选择新的程序文件")

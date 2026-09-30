@@ -5,6 +5,7 @@
 
 | 文件 | 日期 | 主题 | 处置 |
 |------|------|------|------|
+| [REVIEW-20260929-asset-in-place.md](./REVIEW-20260929-asset-in-place.md) | 2026-09-29 | 沿用原文件编辑程序 | 两条意见已修复；对话框人工验收通过 |
 | [REVIEW-20260927-handcontrol-usb-copy.md](./REVIEW-20260927-handcontrol-usb-copy.md) | 2026-09-27 | 手控复制到 U 盘 | 无阻断问题；用户验收通过。残留 HC-USB-001–004 保持接受 |
 | [REVIEW-20260927-retired-version-ui.md](./REVIEW-20260927-retired-version-ui.md) | 2026-09-27 | 备用版本列表与恢复入口 | 阻断问题已修复；自动化及用户人工验收通过 |
 | [REVIEW-20260803-default-module-key-canonicalization.md](./REVIEW-20260803-default-module-key-canonicalization.md) | 2026-08-03 | 默认模块键一致性 | 人工验证通过；快捷键短键与规范键归一、默认键合并已闭环 |

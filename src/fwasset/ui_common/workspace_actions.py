@@ -195,7 +195,7 @@ def effect_for_result(result: dict[str, Any], *, entry: str) -> WriteEffect:
     """按 code 选择界面动作。message 由调用方原样展示。"""
     code = str(result.get("code") or "")
     ok = bool(result.get("ok"))
-    if code in {"index_pending", "reindex_failed"}:
+    if code in {"index_pending", "reindex_failed", "partial_update"}:
         return WriteEffect("rescan_hint")
     if code == "index_update_failed":
         return WriteEffect("rescan_hint")
@@ -376,6 +376,16 @@ def plan_program_update(
     if not module:
         return ProgramUpdatePlan("", None, "请选择程序类型。")
     old = Path(old_path)
+    try:
+        old_parts = old.relative_to(Path(model_root)).parts
+    except ValueError:
+        return ProgramUpdatePlan("", None, "原程序不属于当前型号。")
+    if not old_parts:
+        return ProgramUpdatePlan("", None, "原程序路径无效。")
+    if (old_parts[0] == "通用" and len(old_parts) == 2) or (
+        old_parts[0] == "定制" and len(old_parts) == 3
+    ):
+        return ProgramUpdatePlan("", None, "旧布局程序请先在软件修复页执行布局归一。")
     scheme = new_scheme.strip()
     previous_scheme = old_scheme.strip()
     same_module = canonical_module_dir(old_module) == canonical_module_dir(module)

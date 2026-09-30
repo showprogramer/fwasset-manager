@@ -5,8 +5,11 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
@@ -59,7 +62,7 @@ def env(tmp_path: Path, monkeypatch):
     for name in ("V68.bin", "V68.hex"):
         (incoming / name).write_bytes(b"x")
 
-    calls: dict[str, list] = {"update": [], "change": [], "vendor": [], "questions": []}
+    calls: dict[str, list] = {"update": [], "change": [], "move": [], "vendor": [], "questions": []}
     hits: list[object] = []
 
     def fake_update(*args, **kwargs):
@@ -88,6 +91,15 @@ def env(tmp_path: Path, monkeypatch):
         calls["vendor"].append({"asset": args[2], "vendor": args[3]})
         return {"ok": True, "code": "ok", "message": "", "payload": {}}
 
+    def fake_move(*args, **kwargs):
+        calls["move"].append({"old": args[2], "new": args[3]})
+        return {
+            "ok": True,
+            "code": "ok",
+            "message": "已移动",
+            "payload": {"replacement": str(args[3])},
+        }
+
     def fake_lookup(*args, **kwargs):
         return {
             "ok": True,
@@ -99,6 +111,7 @@ def env(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("fwasset.ui_qt.entry_flows.update_asset", fake_update)
     monkeypatch.setattr("fwasset.ui_qt.entry_flows.change_asset_semantics", fake_change)
     monkeypatch.setattr("fwasset.ui_qt.entry_flows.update_asset_vendor", fake_vendor)
+    monkeypatch.setattr("fwasset.ui_qt.entry_flows.move_asset_in_place", fake_move)
     monkeypatch.setattr("fwasset.ui_qt.entry_flows.find_references_to", fake_lookup)
     monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
     monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)
@@ -142,11 +155,13 @@ def _parts(dialog):
         QLineEdit,
         QPushButton,
         QRadioButton,
+        QWidget,
     )
 
     from fwasset.ui_qt.program_form import FileDropZone
 
     return SimpleNamespace(
+        dialog=dialog,
         drop=dialog.findChild(FileDropZone),
         modules=_named(dialog, QComboBox, "module_combo"),
         vendors=_named(dialog, QComboBox, "vendor_combo"),
@@ -154,6 +169,8 @@ def _parts(dialog):
         name=_named(dialog, QLineEdit, "program_name_edit"),
         hint=_named(dialog, QLabel, "update_hint"),
         update={b.text(): b for b in dialog.findChildren(QPushButton)}["更新"],
+        keep=_named(dialog, QPushButton, "keep_original_files"),
+        retire=_named(dialog, QWidget, "retire_options"),
         radios={r.text(): r for r in dialog.findChildren(QRadioButton)},
     )
 
@@ -182,9 +199,146 @@ def test_defaults_come_from_current_program(env) -> None:
         assert list(ui.radios) == ["删除旧程序", "留作备用副本"]
         assert ui.radios["删除旧程序"].isChecked()
         assert not ui.update.isEnabled()
-        assert "请选择新的程序文件" in ui.hint.text()
+        assert "尚未修改程序信息" in ui.hint.text()
+        assert ui.retire.isHidden()
 
     _run(env, drive)
+
+
+def test_long_current_filename_is_available_without_wrapping(env) -> None:
+    name = "YJ_3DMain_Foot_16_MA82G5C64_V40-221223-32023.0710.bin"
+    (env.old / name).write_bytes(b"firmware")
+
+    def drive(ui) -> None:
+        assert ui.drop.label.text() == "沿用原文件（1 个）"
+        assert name in ui.drop.label.toolTip()
+        assert not ui.drop.label.wordWrap()
+        assert ui.drop.button.text() == "选择新程序"
+        assert ui.drop.button.minimumWidth() >= 112
+        assert ui.keep.minimumWidth() >= 112
+        ui.drop.resize(760, ui.drop.minimumHeight())
+        ui.drop.layout().activate()
+        assert ui.drop.rect().contains(ui.drop.button.geometry())
+        assert ui.drop.rect().contains(ui.keep.geometry())
+        ui.drop.files_chosen.emit(env.files)
+        assert ui.drop.button.minimumWidth() >= 112
+
+    _run(env, drive)
+
+
+def test_name_change_keeps_current_files(env) -> None:
+    def drive(ui) -> None:
+        ui.name.setText("修正名称")
+        assert ui.update.isEnabled()
+        ui.update.click()
+
+    _run(env, drive)
+    assert env.calls["move"] == [
+        {"old": env.old, "new": env.old.parent / "修正名称"}
+    ]
+    assert not env.calls["update"]
+    assert not env.calls["change"]
+
+
+def _drop_bottom_is_inside_dialog(ui) -> None:
+    """虚线框底边必须落在字段和窗口里，不能被换行提示挤出父控件。"""
+    from PySide6.QtCore import QPoint
+
+    field = ui.drop.parentWidget()
+    assert field is not None
+    layout = ui.dialog.layout()
+    assert layout is not None
+    layout.activate()
+    assert ui.drop.y() + ui.drop.height() <= field.height()
+    bottom = ui.drop.mapTo(ui.dialog, QPoint(0, ui.drop.height() - 1))
+    assert bottom.y() < ui.dialog.height()
+    assert ui.dialog.height() >= layout.heightForWidth(ui.dialog.width())
+
+
+def test_can_return_to_original_files_after_picking_new_ones(env) -> None:
+    def drive(ui) -> None:
+        ui.dialog.show()
+        initial_height = ui.dialog.height()
+        ui.drop.files_chosen.emit(env.files)
+        ui.name.setText("很长的程序名" * 12)
+        assert ui.keep.isEnabled()
+        assert not ui.retire.isHidden()
+        assert ui.dialog.height() > initial_height
+        _drop_bottom_is_inside_dialog(ui)
+        ui.keep.click()
+        _drop_bottom_is_inside_dialog(ui)
+        assert ui.name.text() == "dad"
+        assert ui.drop.label.text() == "沿用原文件（0 个）"
+        assert ui.retire.isHidden()
+        ui.name.setText("修正名称")
+        ui.update.click()
+
+    _run(env, drive)
+    assert len(env.calls["move"]) == 1
+    assert not env.calls["update"]
+
+
+def test_scope_change_without_new_files_moves_current_program(env) -> None:
+    def drive(ui) -> None:
+        index = ui.scope.findData("葡萄牙")
+        ui.scope.setCurrentIndex(index)
+        ui.scope.activated.emit(index)
+        assert ui.update.isEnabled()
+        ui.update.click()
+
+    _run(env, drive)
+    assert env.calls["move"][0]["new"] == (
+        env.model / "定制" / "葡萄牙" / "主板程序" / "dad"
+    )
+
+
+def test_type_change_without_new_files_moves_current_program(env) -> None:
+    def drive(ui) -> None:
+        ui.modules.setCurrentIndex(ui.modules.findData("蓝牙程序"))
+        assert ui.update.isEnabled()
+        ui.update.click()
+
+    _run(env, drive)
+    assert env.calls["move"][0]["new"] == env.model / "通用" / "蓝牙程序" / "dad"
+
+
+def test_vendor_only_updates_metadata_without_moving(env) -> None:
+    def drive(ui) -> None:
+        ui.vendors.setCurrentText("新厂商")
+        assert ui.update.isEnabled()
+        ui.update.click()
+
+    _run(env, drive)
+    assert env.calls["vendor"] == [{"asset": env.variant.asset, "vendor": "新厂商"}]
+    assert not env.calls["move"]
+
+
+def test_empty_vendor_does_not_select_first_candidate(env) -> None:
+    env.variant.asset["vendor"] = ""
+
+    def drive(ui) -> None:
+        assert ui.vendors.currentText() == ""
+        assert not ui.update.isEnabled()
+
+    _run(env, drive)
+
+
+def test_legacy_module_leaf_allows_vendor_only(env) -> None:
+    leaf = env.old.parent
+    env.old.rmdir()
+    (leaf / "firmware.bin").write_bytes(b"legacy firmware")
+    env.variant.asset["path"] = str(leaf)
+
+    def drive(ui) -> None:
+        assert not ui.update.isEnabled()
+        assert "布局归一" in ui.hint.text()
+        ui.vendors.setCurrentText("新厂商")
+        assert ui.update.isEnabled()
+        ui.update.click()
+
+    _run(env, drive)
+    assert env.calls["vendor"] == [{"asset": env.variant.asset, "vendor": "新厂商"}]
+    assert not env.calls["move"]
 
 
 def test_only_new_files_updates_with_prefilled_name(env) -> None:

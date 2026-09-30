@@ -807,6 +807,14 @@ def test_plan_program_update_rejects_bad_names(tmp_path: Path) -> None:
     ).kind == "change_type"
 
 
+def test_plan_program_update_requires_normalized_asset_path(tmp_path: Path) -> None:
+    model = tmp_path / "L36"
+    leaf = model / "通用" / "主板程序"
+    plan = plan_program_update(model, leaf, "主板程序", "", "主板程序", "", "新名称")
+    assert plan.kind == ""
+    assert "布局归一" in plan.error
+
+
 def test_stage_files_as_named_dir_copies_into_named_folder(tmp_path: Path) -> None:
     import shutil
 

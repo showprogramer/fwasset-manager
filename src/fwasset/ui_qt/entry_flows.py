@@ -32,6 +32,7 @@ from fwasset.core.platform_config import (
     load_platform_config_with_status,
 )
 from fwasset.core.reference_lookup import find_references_to
+from fwasset.core.services.asset_move_service import move_asset_in_place
 from fwasset.core.services.asset_service import create_asset, delete_asset
 from fwasset.core.services.layout_update_service import (
     change_asset_semantics,
@@ -802,8 +803,27 @@ def open_update_program(host: Any) -> None:
     current_label.setWordWrap(True)
     layout.addWidget(current_label)
 
-    drop = FileDropZone(dialog)
-    _add_field(layout, "新的程序", drop)
+    drop = FileDropZone(
+        dialog,
+        hint="沿用原程序文件；如需替换，可拖入或选择新文件",
+        pick_text="选择新程序",
+    )
+    try:
+        current_files = sorted(
+            path.name
+            for path in old_path.iterdir()
+            if path.is_file() and path.name != "程序信息.toml"
+        )
+    except OSError:
+        current_files = []
+    drop.show_current_files(current_files)
+    keep_files = QPushButton("沿用原文件", drop)
+    keep_files.setObjectName("keep_original_files")
+    keep_files.setFixedWidth(112)
+    keep_files.setMinimumHeight(36)
+    keep_files.setEnabled(False)
+    cast(QHBoxLayout, drop.layout()).addWidget(keep_files)
+    _add_field(layout, "程序文件", drop)
 
     modules = QComboBox(dialog)
     modules.setObjectName("module_combo")
@@ -825,8 +845,7 @@ def open_update_program(host: Any) -> None:
         options.insert(0, current_vendor)
     for item in options:
         vendors.addItem(item)
-    if current_vendor:
-        vendors.setCurrentText(current_vendor)
+    vendors.setCurrentText(current_vendor)
     _add_field(layout, "归属厂商", vendors)
 
     scope = ScopeCombo(
@@ -839,7 +858,10 @@ def open_update_program(host: Any) -> None:
     program_name.setObjectName("program_name_edit")
     _add_field(layout, "程序名称", program_name)
 
-    retire_row = QHBoxLayout()
+    retire_box = QWidget(dialog)
+    retire_box.setObjectName("retire_options")
+    retire_row = QHBoxLayout(retire_box)
+    retire_row.setContentsMargins(0, 0, 0, 0)
     retire_row.setSpacing(SPACE_LG)
     retire_row.addWidget(QLabel("旧程序处理", dialog))
     trash = QRadioButton("删除旧程序", dialog)
@@ -851,7 +873,7 @@ def open_update_program(host: Any) -> None:
     retire_row.addWidget(trash)
     retire_row.addWidget(backup)
     retire_row.addStretch(1)
-    layout.addLayout(retire_row)
+    layout.addWidget(retire_box)
 
     hint = QLabel("", dialog)
     hint.setObjectName("update_hint")
@@ -872,15 +894,33 @@ def open_update_program(host: Any) -> None:
             program_name.text(),
         )
 
+    def vendor_only_change() -> bool:
+        return (
+            not chosen["files"]
+            and vendors.currentText().strip() != current_vendor
+            and program_name.text().strip() == old_path.name
+            and canonical_module_dir(str(modules.currentData() or modules.currentText()))
+            == canonical_module_dir(old_module)
+            and scope.scheme() == old_scheme
+        )
+
     def refresh() -> None:
         plan = current_plan()
-        if not chosen["files"]:
-            hint.setText("请选择新的程序文件。")
-        elif not plan.kind:
-            hint.setText(plan.error)
+        has_files = bool(chosen["files"])
+        keep_files.setEnabled(has_files)
+        vendor_only = vendor_only_change()
+        retire_box.setHidden(not has_files)
+        if plan.kind:
+            action = _UPDATE_KIND_TEXT[plan.kind] if has_files else "移动原程序"
+            hint.setText(f"将{action}：{plan.new_path}")
+        elif vendor_only:
+            hint.setText("将更新原程序的归属厂商。")
+        elif not has_files and "不能和旧程序相同" in plan.error:
+            hint.setText("尚未修改程序信息。")
         else:
-            hint.setText(f"将{_UPDATE_KIND_TEXT[plan.kind]}：{plan.new_path}")
-        buttons[1].setEnabled(bool(chosen["files"]) and bool(plan.kind))
+            hint.setText(plan.error)
+        buttons[1].setEnabled(bool(plan.kind) or vendor_only)
+        _fit_dialog_height(dialog)
 
     def on_files(paths: list[str]) -> None:
         picked = classify_create_source(files=list(paths))
@@ -895,8 +935,16 @@ def open_update_program(host: Any) -> None:
             program_name.setText(prefilled)
         refresh()
 
+    def on_keep_files() -> None:
+        chosen["files"] = []
+        drop.show_current_files(current_files)
+        program_name.setText(old_path.name)
+        refresh()
+
     drop.files_chosen.connect(on_files)
+    keep_files.clicked.connect(on_keep_files)
     modules.currentIndexChanged.connect(lambda _i: refresh())
+    vendors.currentTextChanged.connect(lambda _text: refresh())
     scope.scope_changed.connect(refresh)
     program_name.textChanged.connect(lambda _t: refresh())
     refresh()
@@ -908,6 +956,33 @@ def open_update_program(host: Any) -> None:
         mode: RetireMode = "retire_to_trash" if trash.isChecked() else "retire_to_backup"
 
         def run(log: Any) -> dict[str, Any]:
+            if not files:
+                if plan.new_path is None:
+                    result = update_asset_vendor(
+                        host.root_dir, host.root_dir, asset, vendor, log_fn=log
+                    )
+                    return dict(result)
+                result = move_asset_in_place(
+                    host.root_dir, host.root_dir, old_path, plan.new_path, log_fn=log
+                )
+                payload = dict(result.get("payload") or {})
+                replacement = str(payload.get("replacement") or "")
+                if result.get("ok") and vendor != current_vendor and replacement:
+                    written = update_asset_vendor(
+                        host.root_dir,
+                        host.root_dir,
+                        cast(FirmwareAsset, {"path": replacement}),
+                        vendor,
+                        log_fn=log,
+                    )
+                    if not written.get("ok"):
+                        return {
+                            "ok": True,
+                            "code": "partial_update",
+                            "message": f"程序已移动；厂商处理结果：{written.get('message')}",
+                            "payload": payload,
+                        }
+                return dict(result)
             try:
                 temp_root, source = stage_files_as_named_dir(files, name)
             except OSError as exc:
@@ -974,9 +1049,13 @@ def open_update_program(host: Any) -> None:
 
     def submit() -> None:
         plan = current_plan()
-        if not chosen["files"] or not plan.kind:
+        vendor_only = vendor_only_change()
+        if not plan.kind and not vendor_only:
             return
         buttons[1].setEnabled(False)
+        if vendor_only:
+            execute(plan)
+            return
 
         def lookup(log: Any) -> dict[str, Any]:
             del log
@@ -1130,6 +1209,26 @@ def _format_hits(result: dict[str, Any]) -> str:
     for hit in hits:
         lines.append(f"{hit.kind} · {hit.module_key} · {hit.owner_root}")
     return "\n".join(lines)
+
+
+def _fit_dialog_height(dialog: QDialog) -> None:
+    """按当前宽度把窗口高度收到内容。
+
+    提示按宽度换行。若窗口停在布局最小高度，垂直布局会为了这段换行
+    去压「程序文件」字段，虚线框底边就被父控件裁掉。
+    """
+    layout = dialog.layout()
+    if not isinstance(layout, QVBoxLayout):
+        return
+    width = dialog.width() if dialog.isVisible() else dialog.minimumWidth()
+    width = max(width, dialog.minimumWidth())
+    layout.activate()
+    height = layout.heightForWidth(width) if layout.hasHeightForWidth() else layout.sizeHint().height()
+    if height <= 0:
+        return
+    dialog.setMinimumHeight(height)
+    if dialog.width() != width or dialog.height() != height:
+        dialog.resize(width, height)
 
 
 def _setup_dialog(dialog: QDialog, min_width: int = 460) -> QVBoxLayout:
